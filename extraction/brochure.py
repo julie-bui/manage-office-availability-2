@@ -119,9 +119,39 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
         node.decompose()
     candidates = []
     for image in soup.find_all("img"):
-        src = urljoin(source_document, image.get("src") or image.get("data-src") or "")
-        if src:
-            candidates.append(AssetCandidate(src, source_document, mime_type="image/*", alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1]))
+        # Marketing platforms commonly keep the real image in a lazy-load
+        # attribute or expose several responsive variants in srcset.  Keep
+        # every distinct full asset URL; the shared asset layer performs
+        # exact URL/content deduplication later.
+        image_urls = []
+        for attribute in ("src", "data-src", "data-lazy-src", "data-original", "data-image"):
+            if image.get(attribute):
+                image_urls.append(image.get(attribute))
+        for attribute in ("srcset", "data-srcset", "data-lazy-srcset"):
+            image_urls.extend(_srcset_urls(image.get(attribute) or ""))
+        for raw_url in image_urls:
+            src = urljoin(source_document, raw_url)
+            if src:
+                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1]))
+    for source in soup.find_all("source"):
+        for raw_url in _srcset_urls(source.get("srcset") or source.get("data-srcset") or ""):
+            src = urljoin(source_document, raw_url)
+            candidates.append(AssetCandidate(src, source_document, mime_type=source.get("type") or "image/*", filename=urlparse(src).path.rsplit("/", 1)[-1]))
+    for meta in soup.find_all("meta"):
+        if (meta.get("property") or meta.get("name") or "").lower() in {"og:image", "twitter:image", "twitter:image:src"}:
+            src = urljoin(source_document, meta.get("content") or "")
+            if src:
+                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", anchor_text="page preview image", filename=urlparse(src).path.rsplit("/", 1)[-1]))
+    hosted_documents = _hosted_document_candidates(soup, source_document)
+    if hosted_documents:
+        # Viewer thumbnails are document previews, not independent property
+        # photographs. The downloaded document below supplies the real,
+        # hashable page assets and avoids duplicating its cover/first page.
+        for candidate in candidates:
+            if candidate.anchor_text == "page preview image":
+                candidate.classification = AssetType.DECORATIVE
+                candidate.confidence = 0.95
+    candidates.extend(hosted_documents)
     for link in soup.find_all("a", href=True):
         href = urljoin(source_document, link.get("href"))
         candidates.append(AssetCandidate(href, source_document, anchor_text=link.get_text(" ", strip=True), filename=urlparse(href).path.rsplit("/", 1)[-1]))
@@ -130,6 +160,33 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
         link.decompose()
     text = soup.get_text("\n", strip=True)
     return BrochureExtraction(source_document, _extract_fields(text, source_document), classify_candidates(candidates))
+
+
+def _srcset_urls(value: str) -> List[str]:
+    """Return every URL from an HTML srcset without choosing one rendition."""
+    return [part.strip().split()[0] for part in value.split(",") if part.strip()]
+
+
+def _hosted_document_candidates(soup, source_document: str) -> List[AssetCandidate]:
+    """Resolve public document-viewer pages to their downloadable document.
+
+    This is based on the hosting platform, never the property provider.  A
+    Google Drive viewer deliberately exposes only a single preview bitmap in
+    its HTML; the actual public PDF is required for multi-page media discovery.
+    """
+    parsed = urlparse(source_document)
+    if parsed.hostname not in {"drive.google.com", "docs.google.com"}:
+        return []
+    match = re.search(r"/file/d/([\w-]+)", parsed.path)
+    if not match:
+        return []
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    page_text = str(soup)
+    if ".pdf" not in title.lower() and '"docs-dm":"application/pdf"' not in page_text:
+        return []
+    file_id = match.group(1)
+    url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
+    return [AssetCandidate(url, source_document, mime_type="application/pdf", filename=f"{file_id}.pdf", anchor_text="Download brochure")]
 
 
 def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[str]) -> List[AssetCandidate]:
@@ -295,15 +352,23 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     property_images = [a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url]
     floorplans = [a.url for a in prop.assets if a.classification == AssetType.FLOORPLAN and a.url]
     existing_images = str(prop.values.get("High Res Images") or "")
-    existing_is_direct_image = bool(re.search(r"\.(?:png|jpe?g|gif|webp)(?:[?#]|$)", existing_images, re.I))
     if not existing_images and property_images:
         _apply(prop, "High Res Images", _evidence(property_images[0], extraction.source_document, 0.82))
         # The web layer turns 2+ externally hosted candidates into its
         # existing gallery page; direct/library callers still receive the
         # safe first photo in the public spreadsheet field above.
         prop.values["_high_res_candidates"] = property_images
-    elif existing_is_direct_image and property_images:
-        prop.values["_high_res_candidates"] = list(dict.fromkeys([existing_images] + property_images))
+    elif property_images:
+        # The primary parser may provide an extensionless CDN/tracking URL,
+        # so extension checks are not a safe way to decide whether it is an
+        # image.  It is already in the image field and therefore joins the
+        # brochure photos before exact-identity deduplication.  Generated
+        # HTML galleries are excluded because they are containers, not
+        # candidate images.
+        existing_candidates = list(prop.values.get("_high_res_candidates") or [])
+        if existing_images and not re.search(r"\.html(?:[?#]|$)", existing_images, re.I):
+            existing_candidates.insert(0, existing_images)
+        prop.values["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + property_images))
     if not prop.values.get("Floor Plan") and floorplans:
         _apply(prop, "Floor Plan", _evidence(floorplans[0], extraction.source_document, 0.9))
     for field, evidence in extraction.fields.items():

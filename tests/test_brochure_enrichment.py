@@ -60,6 +60,22 @@ def test_brochure_adds_deduplicated_property_images():
     assert enriched.values["High Res Images"] == photos[0]
 
 
+def test_multiple_images_from_same_brochure_remain_gallery_candidates():
+    images = [
+        AssetCandidate(f"https://img.example.test/office-{number}.jpg", BROCHURE, alt_text=f"Office {number}")
+        for number in range(1, 6)
+    ]
+    enriched = run(prop(), extraction(assets=images))
+    assert enriched.values["_high_res_candidates"] == [image.url for image in images]
+
+
+def test_existing_and_brochure_images_merge_even_for_extensionless_cdn_url():
+    existing = "https://cdn.example.test/image/hero-token"
+    added = AssetCandidate("https://img.example.test/terrace.jpg", BROCHURE, alt_text="Terrace")
+    enriched = run(prop(**{"High Res Images": existing}), extraction(assets=[added]))
+    assert enriched.values["_high_res_candidates"] == [existing, added.url]
+
+
 def test_brochure_adds_photos_to_existing_direct_property_image():
     existing = "https://img.example.test/existing.jpg"
     added = AssetCandidate("https://img.example.test/terrace.jpg", BROCHURE, alt_text="Terrace")
@@ -134,6 +150,33 @@ def test_html_brochure_extracts_and_classifies_links_and_images():
     assert classes["company-logo.png"] == AssetType.LOGO
     assert classes["social-icon.png"] == AssetType.DECORATIVE
     assert classes["brochure.pdf"] == AssetType.BROCHURE
+
+
+def test_html_brochure_discovers_lazy_responsive_and_preview_images():
+    html = b"""<html><head><meta property='og:image' content='/preview.jpg'></head><body>
+      <img data-src='/reception.jpg' data-srcset='/reception-small.jpg 480w, /reception-large.jpg 1200w' alt='Reception'>
+      <picture><source srcset='/terrace.webp 1x, /terrace@2x.webp 2x'></picture>
+      </body></html>"""
+    result = extract_brochure(html, "text/html", "https://property.example.test/listing/1")
+    urls = {asset.url for asset in result.assets if asset.classification == AssetType.PROPERTY_IMAGE}
+    assert urls == {
+        "https://property.example.test/preview.jpg",
+        "https://property.example.test/reception.jpg",
+        "https://property.example.test/reception-small.jpg",
+        "https://property.example.test/reception-large.jpg",
+        "https://property.example.test/terrace.webp",
+        "https://property.example.test/terrace@2x.webp",
+    }
+
+
+def test_public_google_drive_pdf_viewer_exposes_downloadable_brochure_candidate():
+    viewer = b"""<html><head><title>Example House Brochure.pdf - Google Drive</title></head>
+      <body><script>window.config={\"docs-dm\":\"application/pdf\"}</script></body></html>"""
+    result = extract_brochure(viewer, "text/html", "https://drive.google.com/file/d/public_file_id/view?usp=sharing")
+    brochure_assets = [asset for asset in result.assets if asset.classification == AssetType.BROCHURE]
+    assert [asset.url for asset in brochure_assets] == [
+        "https://drive.usercontent.google.com/download?id=public_file_id&export=download"
+    ]
 
 
 def test_direct_pdf_brochure_extracts_text_and_embedded_photo():
@@ -249,6 +292,41 @@ def test_embedded_brochure_assets_are_hosted_by_classification(tmp_path):
     assert record["Floor Plan"].endswith(".png")
     assert len(record["_high_res_candidates"]) == 1
     assert "logo" not in " ".join(path.name for _, path in jobs)
+
+
+def test_gallery_generator_renders_every_candidate_including_after_broken_url(tmp_path):
+    candidates = [f"https://img.example.test/{number}.jpg" for number in range(1, 6)]
+    candidates[2] = "https://img.example.test/broken.jpg"
+    record = {"Building": "Five Photo House", "High Res Images": candidates[0], "_high_res_candidates": candidates}
+    with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
+        jobs = app_module._finalize_high_res_images([record], tmp_path, "batch", "Example")
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("<img ") == 5
+    assert all(url in gallery for url in candidates)
+
+
+def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorplan_separate(tmp_path):
+    photo_a = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-a", content_hash="photo-a", extension="jpg")
+    photo_b = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-b", content_hash="photo-b", extension="jpg")
+    duplicate = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-a", content_hash="photo-a", extension="jpg")
+    floorplan = AssetCandidate("", BROCHURE, classification=AssetType.FLOORPLAN, confidence=0.9, content=b"plan", content_hash="plan", extension="png")
+    record = {
+        "Building": "Example House",
+        "Floor Plan": "",
+        "High Res Images": "https://cdn.example.test/source-image",
+        "_high_res_candidates": ["https://cdn.example.test/source-image"],
+        "_brochure_embedded_assets": [photo_a, photo_b, duplicate, floorplan],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
+        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
+        app_module._finalize_high_res_images([record], tmp_path, "batch", "Example")
+    assert len(jobs) == 3
+    assert record["Floor Plan"].endswith(".png")
+    gallery_path = next(tmp_path.glob("*_photos*.html"))
+    gallery = gallery_path.read_text(encoding="utf-8")
+    assert gallery.count("<img ") == 3
+    assert record["Floor Plan"] not in gallery
 
 
 def test_brochure_postcode_survives_disagreeing_geocoder(monkeypatch):

@@ -241,6 +241,28 @@ The implemented provider-neutral flow is:
 
 `brochure asset → bounded retrieval/redirect resolution → PDF or HTML extraction → optional downloadable-PDF follow → typed text evidence + visual candidates → URL/content deduplication → classification → confidence-aware merge → final validation`
 
+Brochure media is collection-oriented: every relevant HTML image (including
+lazy-load, responsive `srcset`, and social-preview attributes) and every
+meaningful embedded image on all inspected PDF pages becomes a separate typed
+candidate. Candidates are deduplicated only by their complete canonical URL or
+exact content hash, never by host, filename pattern, brochure, or page. Existing
+source photographs and classified brochure photographs are combined before the
+application performs one final gallery pass. Classified floorplans remain on a
+separate path to `Floor Plan`; they are never passed to the photo gallery.
+
+The application materialises embedded brochure assets before gallery
+generation. This ordering is important: the gallery therefore receives the
+complete deduplicated list, and its HTML emits one image element for every
+candidate supplied. A broken remote image can fail independently in the
+browser without preventing the remaining gallery entries from rendering.
+
+Public document-viewer pages are resolved at the hosting-platform layer. For
+example, a public Google Drive PDF viewer is converted to its public document
+download and the PDF itself is inspected; the viewer's single preview bitmap
+is not mistaken for the complete brochure. This resolver is provider-neutral
+and applies equally to dedicated parsers, generic extraction, and future
+unknown providers.
+
 It runs for deterministic provider records and LLM/generic records alike because
 the trigger is a valid `Brochure PDF` value. Retrieved destinations are cached
 within the batch so several rows sharing one brochure do not refetch/reparse it.

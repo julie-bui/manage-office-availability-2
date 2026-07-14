@@ -690,7 +690,10 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
             continue
         existing_candidates = list(record.get("_high_res_candidates") or [])
         existing = str(record.get("High Res Images") or "")
-        if existing and Path(existing.split("?", 1)[0]).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        # CDN and redirect image URLs frequently have no useful extension.
+        # A non-gallery value already assigned to this field is an image
+        # candidate and must survive the brochure merge.
+        if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
             existing_candidates.insert(0, existing)
         combined = list(dict.fromkeys(existing_candidates + photo_urls))
         if not existing or existing_candidates:
