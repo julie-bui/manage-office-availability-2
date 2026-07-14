@@ -33,6 +33,40 @@ no longer cross final validation without being converted into a canonical model.
 - Export order comes from one named schema, never scattered positional indexes.
 - External requests remain bounded by existing caches, quotas and the batch deadline.
 
+## Address resolution
+
+Address resolution is shared by every provider through
+`extraction.address_resolution`; provider rules must not invent their own
+geocoder acceptance rules. The staged priority is:
+
+1. Preserve a valid address/postcode explicitly present in the uploaded source.
+2. Use validated secondary evidence already associated with that property,
+   including brochures, landlord/property pages, and agent listings.
+3. Generate deterministic exact-address query variants only for components
+   that remain missing.
+4. Parse every returned candidate into building number, building name, street,
+   locality, and postcode; compare multiple candidates using transparent
+   weighted agreement.
+5. Use geocoding as supporting/fallback evidence, never as automatic truth.
+6. Require manual review only after all safe variants and evidence sources have
+   been exhausted.
+
+An explicit building-number mismatch or clearly different street is a hard
+rejection, regardless of geographic proximity. Exact building number and street
+agreement carry the highest score; building name, locality, and postcode are
+supporting signals. Independent sources agreeing on the same property/postcode
+increase confidence. Credible disagreement is retained as a conflict rather
+than guessed away, and a weaker lookup never overwrites a valid source or
+brochure postcode.
+
+Resolution diagnostics retain the original address/postcode, attempted query
+variants, considered and rejected candidates with reasons, selected candidate,
+agreeing evidence sources, confidence/status, and final address/postcode source.
+Normal spreadsheet rows receive only the selected values; unresolved or
+conflicting outcomes are summarized in `QA Review`. Candidate lookup results
+continue to use the versioned on-disk/durable cache, so a repeated address is
+not queried repeatedly within a batch or across runs.
+
 ## Adding a provider
 
 Implement `detect(content)` and `parse(content)` in `extraction/rules/`, return

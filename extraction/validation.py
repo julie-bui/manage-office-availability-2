@@ -92,6 +92,23 @@ def validate_property(prop: Property) -> Property:
             )
         )
 
+    resolution = values.get("_address_resolution") or {}
+    if resolution.get("status") in {"CONFLICTING_CANDIDATES", "NO_VALID_CANDIDATE", "MANUAL_REVIEW_REQUIRED"}:
+        values_summary = "; ".join(
+            f"{item.get('address')} ({', '.join(item.get('reasons') or []) or 'score ' + str(item.get('score'))})"
+            for item in (resolution.get("candidates_considered") or [])[:3]
+        )
+        prop.add_issue(
+            ValidationIssue(
+                "Property Postcode",
+                f"Address resolution ended as {resolution.get('status')}; no conflicting property was accepted.",
+                Severity.WARNING,
+                values_summary or postcode_value,
+                "Review the source, brochure, and linked property pages.",
+                "address_resolution",
+            )
+        )
+
     brochure = values.get("Brochure PDF")
     floorplan = values.get("Floor Plan")
     images = values.get("High Res Images")

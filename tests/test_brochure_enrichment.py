@@ -124,3 +124,11 @@ def test_pipeline_runs_brochure_enrichment_before_final_validation(monkeypatch, 
     assert result["records"][0]["Special Features"] == "Showers"
     stages = [stage["stage"] for stage in result["processing_report"]["stages"]]
     assert stages.index("BROCHURE_ENRICHMENT") < stages.index("FINAL_VALIDATION")
+
+
+def test_brochure_postcode_survives_disagreeing_geocoder(monkeypatch):
+    enriched = run(prop(), extraction([evidence("Property Postcode", "SE1 9HH", 0.9)]))
+    monkeypatch.setattr(pipeline, "geocode", lambda *args, **kwargs: (51.5, -0.1, "SE1 0DG", None))
+    pipeline._geocode_records([enriched.values], "future-provider.pdf", "Unknown Provider", float("inf"))
+    assert enriched.values["Property Postcode"] == "SE1 9HH"
+    assert enriched.provenance["Property Postcode"].source == "brochure"

@@ -12,12 +12,13 @@ from pathlib import Path
 import requests
 
 from .address import extract_postcode
+from .address_resolution import AddressCandidate, AddressComponents, rank_candidates
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "manage-office-availability/1.0 (contact: team@spacepoint.co.uk)"
 MIN_INTERVAL_SECONDS = 1.0
 REQUEST_TIMEOUT = 10
-CACHE_LOGIC_VERSION = 2
+CACHE_LOGIC_VERSION = 3
 
 # Confirmed empirically (2026-07, Crown Estate) that a common London street
 # name with no distinguishing context can return a *confident-looking* top
@@ -63,6 +64,7 @@ CACHE_PATH = Path(__file__).resolve().parent.parent / ".geocode_cache.json"
 
 _cache = None
 _last_request_at = 0.0
+_last_fetch_diagnostics = None
 
 
 def geocode(address, confident=True):
@@ -114,7 +116,7 @@ def geocode(address, confident=True):
         # don't trust it, fall through to a fresh fetch below.
 
     lat, lng, postcode, error = _fetch(address)
-    cache[key] = {"lat": lat, "lng": lng, "postcode": postcode, "error": error, "logic_version": CACHE_LOGIC_VERSION}
+    cache[key] = {"lat": lat, "lng": lng, "postcode": postcode, "error": error, "logic_version": CACHE_LOGIC_VERSION, "resolution": _last_fetch_diagnostics}
     if not confident:
         cache[key]["low_confidence"] = True
     _save_cache(cache)
@@ -122,6 +124,17 @@ def geocode(address, confident=True):
 
 
 def _fetch(address):
+    global _last_fetch_diagnostics
+    _last_fetch_diagnostics = {
+        "original_address": address,
+        "candidates_considered": [],
+        "selected_candidate": None,
+        "status": "MANUAL_REVIEW_REQUIRED",
+        "resolution_reason": "NO_VALID_CANDIDATE",
+        "confidence": 0.0,
+        "final_address_source": "",
+        "final_postcode_source": "",
+    }
     _throttle()
     try:
         resp = requests.get(
@@ -144,14 +157,45 @@ def _fetch(address):
     if not results:
         return None, None, "", "No geocoding match found for this address"
 
-    requested_number = _requested_house_number(address)
-    if requested_number:
-        matching = [result for result in results if _candidate_matches_house_number(result, requested_number)]
-        if not matching:
-            return None, None, "", (
-                f"No candidate matched requested house number {requested_number}; refusing to use a neighbouring unit"
-            )
-        results = matching
+    candidates = [_address_candidate(result) for result in results]
+    assessments = rank_candidates(address, candidates)
+    _last_fetch_diagnostics = {
+        "original_address": address,
+        "candidates_considered": [
+            {
+                "address": item.candidate.address,
+                "source": item.candidate.source,
+                "score": item.score,
+                "rejected": item.rejected,
+                "reasons": item.reasons,
+            }
+            for item in assessments
+        ],
+    }
+    valid = [assessment for assessment in assessments if not assessment.rejected]
+    if not valid:
+        reasons = "; ".join(reason for assessment in assessments for reason in assessment.reasons)
+        _last_fetch_diagnostics.update(
+            {
+                "selected_candidate": None,
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "resolution_reason": "NO_VALID_CANDIDATE",
+                "confidence": 0.0,
+                "final_address_source": "",
+                "final_postcode_source": "",
+            }
+        )
+        return None, None, "", f"No candidate matched address identity; {reasons or 'all candidates rejected'}"
+    results = [assessment.candidate.raw for assessment in valid]
+    _last_fetch_diagnostics.update(
+        {
+            "selected_candidate": valid[0].candidate.address,
+            "status": "RESOLVED_FROM_VALIDATED_LOOKUP",
+            "confidence": min(1.0, valid[0].score / 100),
+            "final_address_source": "nominatim",
+            "final_postcode_source": "nominatim",
+        }
+    )
 
     try:
         lat = float(results[0]["lat"])
@@ -179,6 +223,33 @@ def _fetch(address):
         return None, None, "", ambiguity_error
 
     return lat, lng, postcode, None
+
+
+def get_resolution_diagnostics(address):
+    """Compact cached diagnostics for pipeline provenance/QA."""
+    hit = _load_cache().get(_cache_key(address), {})
+    return hit.get("resolution") or (_last_fetch_diagnostics if (_last_fetch_diagnostics or {}).get("original_address") == address else None)
+
+
+def _address_candidate(result):
+    details = result.get("address") or {}
+    number = str(details.get("house_number") or "").upper().replace(" ", "")
+    street = details.get("road") or details.get("pedestrian") or details.get("residential") or ""
+    locality = details.get("city") or details.get("town") or details.get("borough") or ""
+    postcode = extract_postcode(details.get("postcode") or "")
+    display = result.get("display_name") or ", ".join(filter(None, [number, street, locality, postcode]))
+    return AddressCandidate(
+        display,
+        "nominatim",
+        AddressComponents(number, "", _normalize_candidate_street(street), str(locality).lower(), postcode),
+        raw=result,
+    )
+
+
+def _normalize_candidate_street(value):
+    from .address_resolution import parse_address
+    parsed = parse_address(f"1 {value}")
+    return parsed.street
 
 
 def _requested_house_number(query):

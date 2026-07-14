@@ -10,6 +10,7 @@ from typing import Callable, Iterable, List
 import requests
 
 from .assets import classify_candidates, normalize_url
+from .address import extract_postcode
 from .models import (
     AssetCandidate,
     AssetType,
@@ -99,6 +100,12 @@ def _extract_fields(text: str, source_document: str):
     size = _SIZE_RE.search(text)
     if size:
         fields["Size (sq ft)"] = _evidence(float(size.group(1).replace(",", "")), source_document, 0.76)
+    postcodes = sorted(set(filter(None, (extract_postcode(line) for line in text.splitlines()))))
+    # One brochure belongs to one Property at this stage.  A single
+    # unambiguous postcode is reliable secondary evidence; multiple
+    # postcodes are deliberately left unresolved for conflict review.
+    if len(postcodes) == 1:
+        fields["Property Postcode"] = _evidence(postcodes[0], source_document, 0.84)
     return fields
 
 

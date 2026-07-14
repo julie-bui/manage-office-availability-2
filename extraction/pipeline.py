@@ -13,9 +13,9 @@ from . import brochure, html_images, memlog, quota, xlsx_links
 from .address import extract_postcode, spelled_number_to_digits
 from .address_lookup import find_address as find_address_via_web_search
 from .file_readers import read_file
-from .geocode import geocode
+from .geocode import geocode, get_resolution_diagnostics
 from .llm_fallback import LLMExtractionError, extract_with_llm
-from .models import ProcessingReport, Property, RawDocument
+from .models import FieldProvenance, ProcessingReport, Property, RawDocument
 from .naming import area_from_records, extract_area_hint, resolve_provider_name, resolve_source_date
 from .rules import try_rules
 from .schema import normalize_record, street_address_only
@@ -304,6 +304,32 @@ def process_files(
         # web-search fallback can pass it along as disambiguating context
         # (e.g. "Elsley GPE Fully Managed" instead of just "Elsley").
         provider_name = resolve_provider_name(rule_name, filename, llm_source_name)
+
+        # Create the canonical properties before secondary-source address
+        # enrichment.  A brochure postcode can therefore prevent a weaker
+        # geocoder result from ever overwriting it.
+        properties = [
+            Property.from_record(
+                record,
+                document.source_file_name,
+                provider_name,
+                result["method"] or "unknown",
+                document.source_file_url,
+                source_url_expected,
+            )
+            for record in normalized
+        ]
+        if brochure_enrichment:
+            kwargs = {}
+            if brochure_fetcher is not None:
+                kwargs["fetcher"] = brochure_fetcher
+            if brochure_extractor is not None:
+                kwargs["extractor"] = brochure_extractor
+            properties = brochure.enrich_properties(properties, **kwargs)
+            brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith("brochure_")]
+            report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} brochure issue(s)" if brochure_issues else "Brochure enrichment complete", len(properties))
+        normalized = [prop.values for prop in properties]
+
         quota_exhausted, deadline_hit = _geocode_records(normalized, filename, provider_name, deadline)
         report.record(
             "ENRICHMENT",
@@ -324,36 +350,19 @@ def process_files(
         # spreadsheet output — Building itself is never touched.
         for record in normalized:
             record["Property Address 1"] = street_address_only(record.get("Building"))
+        for prop, record in zip(properties, normalized):
+            diagnostics = record.get("_address_resolution") or {}
+            if diagnostics and "not in source text" in str(record.get("Property Postcode") or "").lower():
+                source = diagnostics.get("final_postcode_source") or "validated_lookup"
+                confidence = float(diagnostics.get("confidence") or 0)
+                prop.provenance["Property Postcode"] = FieldProvenance(
+                    source=source,
+                    method="address_resolution",
+                    confidence=confidence,
+                    original_value=record.get("Property Postcode"),
+                    source_document=diagnostics.get("selected_candidate"),
+                )
 
-        properties = [
-            Property.from_record(
-                record,
-                document.source_file_name,
-                provider_name,
-                result["method"] or "unknown",
-                document.source_file_url,
-                source_url_expected,
-            )
-            for record in normalized
-        ]
-
-        if brochure_enrichment:
-            kwargs = {}
-            if brochure_fetcher is not None:
-                kwargs["fetcher"] = brochure_fetcher
-            if brochure_extractor is not None:
-                kwargs["extractor"] = brochure_extractor
-            properties = brochure.enrich_properties(properties, **kwargs)
-            brochure_issues = [
-                issue for prop in properties for issue in prop.issues
-                if issue.stage.startswith("brochure_")
-            ]
-            report.record(
-                "BROCHURE_ENRICHMENT",
-                "WARNING" if brochure_issues else "PASS",
-                f"{len(brochure_issues)} brochure issue(s)" if brochure_issues else "Brochure enrichment complete",
-                len(properties),
-            )
         properties = validate_properties(properties)
         report.issues.extend(issue for prop in properties for issue in prop.issues)
         report.record(
@@ -567,6 +576,7 @@ def _geocode_records(records, filename, provider_name, deadline):
                 query_source = {**record, "Property Address 1": richer}
 
         query = _geocode_query(query_source)
+        attempted_queries = [query] if query else []
         derived_note = False
         sources = []
 
@@ -591,6 +601,7 @@ def _geocode_records(records, filename, provider_name, deadline):
                     daily_quota_hit = True
             if web_address:
                 web_query = _geocode_query({"Property Address 1": web_address})
+                attempted_queries.append(web_query)
                 lat, lng, geo_postcode, error = geocode(web_query)
                 if lat is not None:
                     query = web_query
@@ -629,6 +640,7 @@ def _geocode_records(records, filename, provider_name, deadline):
                     retry_query = _geocode_query({**record, "Property Address 1": candidate_address})
                     if retry_query == query:
                         continue
+                    attempted_queries.append(retry_query)
                     retry_lat, retry_lng, retry_postcode, retry_error = geocode(retry_query)
                     if retry_lat is not None:
                         query, lat, lng, geo_postcode, error = retry_query, retry_lat, retry_lng, retry_postcode, retry_error
@@ -647,6 +659,7 @@ def _geocode_records(records, filename, provider_name, deadline):
                     daily_quota_hit = True
                 if web_address:
                     web_query = _geocode_query({"Property Address 1": web_address})
+                    attempted_queries.append(web_query)
                     web_lat, web_lng, web_postcode, web_error = geocode(web_query)
                     if web_lat is not None:
                         query, lat, lng, error = web_query, web_lat, web_lng, web_error
@@ -658,6 +671,10 @@ def _geocode_records(records, filename, provider_name, deadline):
         if not record.get("Property Postcode") and geo_postcode:
             record["Property Postcode"] = geo_postcode
             postcode_from_geocode = True
+
+        diagnostics = get_resolution_diagnostics(query)
+        if diagnostics:
+            record["_address_resolution"] = {**diagnostics, "query_variants": list(dict.fromkeys(attempted_queries))}
 
         if lat is not None:
             if derived_note:
@@ -682,7 +699,6 @@ def _geocode_records(records, filename, provider_name, deadline):
             else:
                 record["Lat"] = lat
                 record["Lng"] = lng
-
             # Property Postcode's own provenance is a DIFFERENT question
             # from Lat/Lng's (derived_note above): a numbered street
             # address can geocode confidently enough that Lat/Lng need no
