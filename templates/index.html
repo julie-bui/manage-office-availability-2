@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Office Availability Consolidator</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>Office Availability Consolidator</h1>
+  <p class="sub">Drop broker files below — each one is extracted into its own spreadsheet, named after its source.</p>
+
+  <div id="dropzone" class="dropzone">
+    <p>Drag &amp; drop files here, or click to browse</p>
+    <p class="hint">PDF · DOCX · XLSX · CSV · EML · HTML</p>
+    <input type="file" id="fileInput" multiple hidden
+           accept=".pdf,.docx,.xlsx,.xls,.csv,.eml,.html,.htm">
+  </div>
+
+  <ul id="fileList" class="file-list"></ul>
+
+  <div class="actions">
+    <button id="processBtn" disabled>Process Files</button>
+  </div>
+
+  <div id="status" class="status"></div>
+  <div id="statusExtra" class="status-extra"></div>
+  <div id="results" class="results"></div>
+</div>
+<script>window.ACCESS_TOKEN = {{ access_token|tojson }};</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

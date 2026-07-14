@@ -1,0 +1,9 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+output/
+*.extracted.html
+.geocode_cache.json
+.address_lookup_cache.json

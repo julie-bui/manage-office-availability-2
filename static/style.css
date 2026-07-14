@@ -1,0 +1,67 @@
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+  background: #0f1115;
+  color: #e6e6e6;
+  margin: 0;
+  padding: 40px 20px;
+}
+.wrap { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 22px; margin-bottom: 4px; }
+.sub { color: #9aa0a6; margin-top: 0; margin-bottom: 24px; font-size: 14px; }
+
+.dropzone {
+  border: 2px dashed #3a3f4b;
+  border-radius: 10px;
+  padding: 40px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: #6b7cff;
+  background: #171a22;
+}
+.dropzone p { margin: 4px 0; }
+.dropzone .hint { color: #6b7280; font-size: 12px; }
+
+.file-list { list-style: none; padding: 0; margin: 16px 0; }
+.file-list li {
+  display: flex; justify-content: space-between; align-items: center;
+  background: #171a22; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px;
+  font-size: 13px;
+}
+.file-list button {
+  background: none; border: none; color: #9aa0a6; cursor: pointer; font-size: 16px;
+}
+.file-list button:hover { color: #ff6b6b; }
+
+.actions { display: flex; gap: 10px; margin: 20px 0; }
+button#processBtn {
+  padding: 10px 18px; border-radius: 6px; border: none; font-weight: 600;
+  cursor: pointer; font-size: 14px;
+  background: #6b7cff; color: white;
+}
+button#processBtn:disabled { background: #2a2d36; color: #6b7280; cursor: not-allowed; }
+
+.status { font-size: 13px; color: #9aa0a6; min-height: 18px; }
+.status.error { color: #ff8a8a; }
+.status-extra { font-size: 12px; color: #9aa0a6; margin-top: 2px; max-width: 480px; line-height: 1.5; }
+
+.results { margin-top: 16px; }
+.results table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.results th, .results td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #262a33; }
+.results th { color: #9aa0a6; font-weight: 600; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge.ok { background: #16351f; color: #4ade80; }
+.badge.error { background: #3a1f1f; color: #ff6b6b; }
+.method { color: #9aa0a6; font-size: 12px; }
+.summary-line { margin: 10px 0; font-size: 14px; }
+.quota-notice {
+  font-size: 12px; color: #8ab4ff; background: #131a2b; border: 1px solid #223055;
+  border-radius: 6px; padding: 8px 12px; margin: 0 0 14px; line-height: 1.5;
+}
+.error-text { color: #ff8a8a; font-size: 12px; }
+.warning-text { color: #f5c563; font-size: 12px; }
+.download-link { color: #8ab4ff; text-decoration: none; font-weight: 600; }
+.download-link:hover { text-decoration: underline; }
