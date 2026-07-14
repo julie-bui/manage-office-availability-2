@@ -67,6 +67,7 @@ from the same batch.
 | Normalisation | `extraction.schema.normalize_record` | Raw dictionaries → named `COLUMNS` records | Missing fields become empty values; numeric fields are coerced and established derived fields are calculated. No usable building/area rows is fatal for that file. |
 | Generic link discovery | `extraction.html_images`, `extraction.xlsx_links` | HTML items or spreadsheet hyperlinks → semantic link/image candidates on records | Best effort and currently applied to applicable LLM-fallback inputs. Failure does not replace primary extraction. |
 | Canonical property boundary | `extraction.models.Property` | Normalised records → typed properties with provenance and source-file identity | All successfully extracted records enter this boundary before address enrichment and final validation. |
+| Brochure enrichment | `extraction.brochure` | Valid brochure URL → resolved PDF/HTML content, typed field evidence, and classified media | Provider-neutral and triggered by the asset, not provider name. Redirects are followed; HTML pages may lead to downloadable PDFs. Retrieval/parsing failure adds an informational diagnostic and preserves primary extraction. |
 | Address enrichment | `extraction.pipeline._geocode_records`, `address_resolution`, `address_lookup`, `geocode` | Existing address/postcode → coordinates, optional postcode, diagnostics | Existing valid postcodes are preserved. Rejected or unavailable candidates lead to explicit uncertainty/manual lookup; the property remains. Deadline/quota degradation becomes a file warning. |
 | Application media finalisation | `app.py`, `pdf_images`, `html_images` | Embedded or hosted candidates → floorplan/image links or gallery pages | Best effort. Missing or ambiguous media remains blank rather than being guessed. |
 | Final validation | `extraction.validation` | Typed properties → properties plus `ValidationIssue` objects | Validation retains source values, marks review requirements, and does not abort the batch. |
@@ -92,7 +93,13 @@ field name rather than positional column index.
   source document. It describes why a value exists without changing the public
   spreadsheet schema.
 - `AssetCandidate`: URL and discovery context (source, MIME type, filename,
-  anchor/alt text, page), plus classification and confidence.
+  anchor/alt text, page), classification/confidence, and optional embedded
+  content/hash/extension for brochure visuals awaiting application hosting.
+- `BrochureResource`: retrieved bytes, response content type, and final URL
+  after redirects.
+- `ExtractedValue` and `BrochureExtraction`: typed secondary field evidence
+  (value, source document, method, confidence) and the combined field/media
+  result for one resolved brochure destination.
 - `ValidationIssue`: field, message, severity, value, suggested action, and
   producing stage.
 - `StageResult`: stage name, status, message, and item count.
@@ -185,12 +192,21 @@ known tracking parameters/fragments, and rejects malformed or unsafe schemes.
 Candidates are deduplicated on the normalised URL. Validation checks URL syntax
 for source links, brochure links, floorplans, and property images.
 
-Current brochure handling documented here is limited to the brochure URL as a
-semantic asset: validation rejects invalid URLs and image URLs placed in the
-brochure-document field. Brochure URLs are kept distinct from floorplans,
-property photographs, and the original source file. Brochure-content extraction
-or use as a secondary property-data source is intentionally outside this
-document's scope.
+Brochure links are resolved through redirects and may represent direct PDFs,
+HTML property/brochure pages, or pages linking to downloadable PDFs. Extracted
+text can supply reliable missing Special Features, floor/unit availability,
+size, minimum-term information, postcode, and descriptive specification,
+amenity, pricing/service-charge/rates, lease, or sustainability notes where the
+implemented deterministic signals find them. These values are typed secondary
+evidence: blanks may be filled, weak lower-confidence values may be improved,
+and strong conflicts retain the primary value and create a QA issue.
+
+HTML images/links and PDF annotations/embedded images become `AssetCandidate`
+objects before assignment. Embedded PDF visuals are conservatively classified
+using page labels, pixel characteristics, dimensions, and repeated-content
+signals. Repeated/small decorative graphics, logos, maps, and unknown assets are
+not assigned as property photographs. The application persists accepted
+embedded images only after a batch download namespace exists.
 
 Floorplans and ordinary photographs remain separate scalar spreadsheet fields.
 Validation flags a brochure URL duplicated into either media field and flags a
@@ -218,6 +234,27 @@ generic HTML/XLSX/PDF helpers filter known low-trust or non-content assets.
 Semantic conflicts become validation issues rather than silent category reuse.
 Classification is deterministic but heuristic; ambiguous assets can still
 require review.
+
+### Brochure enrichment flow
+
+The implemented provider-neutral flow is:
+
+`brochure asset → bounded retrieval/redirect resolution → PDF or HTML extraction → optional downloadable-PDF follow → typed text evidence + visual candidates → URL/content deduplication → classification → confidence-aware merge → final validation`
+
+It runs for deterministic provider records and LLM/generic records alike because
+the trigger is a valid `Brochure PDF` value. Retrieved destinations are cached
+within the batch so several rows sharing one brochure do not refetch/reparse it.
+At most two linked document assets are followed from one HTML page, and each
+retrieval is subject to a six-second request timeout and 20MB brochure limit.
+The pipeline also caps the brochure stage to approximately 20 seconds per batch
+and preserves an informational diagnostic for rows skipped after that budget.
+
+External property-image URLs and embedded photo bytes are added to the
+property's media candidates. Existing direct property photos are retained and
+combined into the application's gallery candidate list; an existing opaque
+gallery URL is not blindly replaced. Floorplans are assigned only to `Floor
+Plan`, while logos, maps, decorative assets, and unknowns remain excluded from
+`High Res Images`.
 
 ## 9. Source-file provenance and `Link to File`
 
@@ -406,7 +443,7 @@ yet all expose granular confidence.
 The latest completed local verification on this branch was:
 
 ```text
-34 passed
+42 passed
 All example files extracted successfully.
 ```
 
@@ -415,8 +452,10 @@ query generation, wrong-building-number/street rejection, the `49 Southwark
 Bridge Road` candidate regression, preservation of source evidence, address
 resolution statuses/confidence, asset classification, URL normalisation and
 deduplication, semantic media separation, source-file provenance, `Link to
-File`, named spreadsheet mapping, hyperlink output, validation issues, QA, and
-recoverable enrichment failures.
+File`, named spreadsheet mapping, hyperlink output, validation issues, QA,
+redirected HTML/downloadable-PDF brochure handling, brochure text provenance,
+embedded/external brochure media classification, unknown-provider brochure
+enrichment, and recoverable enrichment failures.
 
 The real-example script pins deterministic provider behaviour and record counts,
 address/postcode flags, asset separation, link matching, provider sanity
@@ -448,6 +487,11 @@ or avoided.
 - Scanned/image-only PDFs without extractable text are rejected; no general OCR
   stage is implemented.
 - Asset classification is heuristic and ambiguous assets may need review.
+- HTML pages rendered entirely by client-side JavaScript may expose little
+  usable server-returned text/media; the brochure stage does not run a browser.
+- Embedded PDF visual classification is conservative. Small or repeated genuine
+  photographs may be withheld as decorative rather than risk exporting logos or
+  boilerplate as property images.
 - The public Listings schema expects scalar values; arbitrary list
   serialisation is not implemented. Application-created image galleries provide
   one URL for multi-photo sets.
@@ -455,9 +499,6 @@ or avoided.
   populate a public `Link to File` target without fabricating one.
 - Optional object storage is required for source/gallery links to survive
   ephemeral storage cleanup and redeployment.
-
-Brochure-content enrichment is intentionally not documented here; it is handled
-as a separate architecture/documentation task.
 
 ## 20. Extension guide
 

@@ -325,6 +325,7 @@ def process_files(
                 kwargs["fetcher"] = brochure_fetcher
             if brochure_extractor is not None:
                 kwargs["extractor"] = brochure_extractor
+            kwargs["deadline"] = min(deadline - 15, time.monotonic() + 20)
             properties = brochure.enrich_properties(properties, **kwargs)
             brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith("brochure_")]
             report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} brochure issue(s)" if brochure_issues else "Brochure enrichment complete", len(properties))

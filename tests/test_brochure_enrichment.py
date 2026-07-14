@@ -1,4 +1,4 @@
-from extraction.brochure import enrich_properties
+from extraction.brochure import enrich_properties, extract_brochure
 from extraction import pipeline
 from extraction.models import (
     AssetCandidate,
@@ -7,8 +7,13 @@ from extraction.models import (
     ExtractedValue,
     FieldProvenance,
     Property,
+    BrochureResource,
 )
 from extraction.schema import normalize_record
+from spreadsheet import write_xlsx
+from openpyxl import load_workbook
+import app as app_module
+from io import BytesIO
 
 
 BROCHURE = "https://files.example.test/example-brochure.pdf"
@@ -55,6 +60,14 @@ def test_brochure_adds_deduplicated_property_images():
     assert enriched.values["High Res Images"] == photos[0]
 
 
+def test_brochure_adds_photos_to_existing_direct_property_image():
+    existing = "https://img.example.test/existing.jpg"
+    added = AssetCandidate("https://img.example.test/terrace.jpg", BROCHURE, alt_text="Terrace")
+    enriched = run(prop(**{"High Res Images": existing}), extraction(assets=[added]))
+    assert enriched.values["High Res Images"] == existing
+    assert enriched.values["_high_res_candidates"] == [existing, added.url]
+
+
 def test_brochure_floorplan_is_never_assigned_as_property_photo():
     floorplan = AssetCandidate("https://img.example.test/third-floor-plan.png", BROCHURE, alt_text="Floor plan")
     photo = AssetCandidate("https://img.example.test/reception.jpg", BROCHURE, alt_text="Reception")
@@ -70,6 +83,14 @@ def test_brochure_does_not_overwrite_stronger_primary_value_and_flags_conflict()
     assert enriched.values["Special Features"] == "Primary roof terrace"
     assert any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
     assert enriched.review_required
+
+
+def test_brochure_conflict_is_written_to_qa_review(tmp_path):
+    enriched = run(prop(**{"Special Features": "Primary roof terrace"}), extraction([evidence("Special Features", "Brochure gym")]))
+    output = tmp_path / "conflict.xlsx"
+    write_xlsx(output, [enriched.to_record()])
+    qa = load_workbook(output)["QA Review"]
+    assert any("Brochure value conflicts" in str(cell.value) for cell in qa["D"])
 
 
 def test_higher_confidence_brochure_replaces_low_confidence_primary():
@@ -95,6 +116,77 @@ def test_brochure_failure_does_not_fail_property_extraction():
     assert enriched.values["Building"] == "Example House"
     assert enriched.values["Special Features"] == "Primary value"
     assert any(issue.stage == "brochure_enrichment" for issue in enriched.issues)
+    assert not enriched.review_required
+
+
+def test_html_brochure_extracts_and_classifies_links_and_images():
+    html = b"""<html><body><h2>Amenities</h2><p>Showers; Bike storage</p>
+      <img src='/reception.jpg' alt='Reception'>
+      <img src='/third-floor-plan.png' alt='Floor plan'>
+      <img src='/company-logo.png' alt='Company logo'>
+      <img src='/social-icon.png' alt='Social icon'>
+      <a href='/downloads/brochure.pdf'>Download brochure</a></body></html>"""
+    result = extract_brochure(html, "text/html", "https://property.example.test/listing/1")
+    classes = {asset.filename: asset.classification for asset in result.assets}
+    assert result.fields["Special Features"].value == "Showers; Bike storage"
+    assert classes["reception.jpg"] == AssetType.PROPERTY_IMAGE
+    assert classes["third-floor-plan.png"] == AssetType.FLOORPLAN
+    assert classes["company-logo.png"] == AssetType.LOGO
+    assert classes["social-icon.png"] == AssetType.DECORATIVE
+    assert classes["brochure.pdf"] == AssetType.BROCHURE
+
+
+def test_direct_pdf_brochure_extracts_text_and_embedded_photo():
+    import fitz
+    from PIL import Image
+
+    bitmap = Image.effect_noise((500, 400), 80).convert("RGB")
+    image_bytes = BytesIO()
+    bitmap.save(image_bytes, format="JPEG", quality=90)
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((50, 50), "Amenities\nShowers and cycle storage")
+    page.insert_image(fitz.Rect(50, 90, 450, 390), stream=image_bytes.getvalue())
+    payload = document.tobytes()
+    document.close()
+
+    result = extract_brochure(payload, "application/pdf", BROCHURE)
+    assert "Showers and cycle storage" in result.fields["Special Features"].value
+    assert any(asset.classification == AssetType.PROPERTY_IMAGE and asset.content for asset in result.assets)
+
+
+def test_redirect_final_page_and_downloadable_pdf_are_followed():
+    calls = []
+    page_url = "https://property.example.test/final-listing"
+    pdf_url = "https://property.example.test/files/details.pdf"
+
+    def fetch(url):
+        calls.append(url)
+        if url == BROCHURE:
+            return BrochureResource(f"<a href='{pdf_url}'>Download brochure</a>".encode(), "text/html", page_url)
+        return BrochureResource(b"%PDF fake", "application/pdf", pdf_url)
+
+    def parse(payload, content_type, source):
+        if "html" in content_type:
+            return extract_brochure(payload, content_type, source)
+        return extraction([evidence("Special Features", "From downloadable PDF")])
+
+    enriched = enrich_properties([prop()], fetcher=fetch, extractor=parse)[0]
+    assert calls == [BROCHURE, pdf_url]
+    assert enriched.values["Special Features"] == "From downloadable PDF"
+
+
+def test_failed_linked_download_preserves_html_page_enrichment():
+    page = b"<h2>Amenities</h2><p>Showers</p><a href='/broken.pdf'>Download brochure</a>"
+
+    def fetch(url):
+        if url == BROCHURE:
+            return BrochureResource(page, "text/html", "https://property.example.test/listing")
+        raise TimeoutError("download timed out")
+
+    enriched = enrich_properties([prop()], fetcher=fetch)[0]
+    assert enriched.values["Special Features"] == "Showers"
+    assert any("Linked brochure document" in issue.message for issue in enriched.issues)
     assert not enriched.review_required
 
 
@@ -124,6 +216,39 @@ def test_pipeline_runs_brochure_enrichment_before_final_validation(monkeypatch, 
     assert result["records"][0]["Special Features"] == "Showers"
     stages = [stage["stage"] for stage in result["processing_report"]["stages"]]
     assert stages.index("BROCHURE_ENRICHMENT") < stages.index("FINAL_VALIDATION")
+
+
+def test_unknown_provider_llm_record_uses_same_brochure_stage(monkeypatch, tmp_path):
+    source = tmp_path / "future-provider.html"
+    source.write_text("<html><body>Unknown office listing</body></html>", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "try_rules", lambda content: (None, None))
+    monkeypatch.setattr(
+        pipeline,
+        "extract_with_llm",
+        lambda text, source_hint=None: ([{"Building": "1 Future Street, EC1A 1AA", "Brochure PDF": BROCHURE}], "Future Provider"),
+    )
+    monkeypatch.setattr(pipeline, "geocode", lambda *args, **kwargs: (51.5, -0.1, "EC1A 1AA", None))
+    result = pipeline.process_files(
+        [source],
+        brochure_enrichment=True,
+        brochure_fetcher=lambda url: (b"brochure", "application/pdf"),
+        brochure_extractor=lambda *args: extraction([evidence("Special Features", "Future-ready")]),
+    )[0]
+    assert result["method"] == "llm"
+    assert result["records"][0]["Special Features"] == "Future-ready"
+
+
+def test_embedded_brochure_assets_are_hosted_by_classification(tmp_path):
+    photo = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-bytes", content_hash="photo", extension="jpg")
+    floorplan = AssetCandidate("", BROCHURE, classification=AssetType.FLOORPLAN, confidence=0.9, content=b"plan-bytes", content_hash="plan", extension="png")
+    logo = AssetCandidate("", BROCHURE, classification=AssetType.LOGO, confidence=0.99, content=b"logo-bytes", content_hash="logo", extension="png")
+    record = {"Building": "Example House", "Floor Plan": "", "High Res Images": "", "_brochure_embedded_assets": [photo, floorplan, logo]}
+    with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
+        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
+    assert len(jobs) == 2
+    assert record["Floor Plan"].endswith(".png")
+    assert len(record["_high_res_candidates"]) == 1
+    assert "logo" not in " ".join(path.name for _, path in jobs)
 
 
 def test_brochure_postcode_survives_disagreeing_geocoder(monkeypatch):

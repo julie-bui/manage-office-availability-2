@@ -51,6 +51,14 @@ class BrochureExtraction:
     source_document: str
     fields: Dict[str, ExtractedValue] = field(default_factory=dict)
     assets: List["AssetCandidate"] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BrochureResource:
+    payload: bytes
+    content_type: str
+    final_url: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,9 @@ class AssetCandidate:
     page_number: Optional[int] = None
     classification: AssetType = AssetType.UNKNOWN
     confidence: float = 0.0
+    content: Optional[bytes] = None
+    content_hash: Optional[str] = None
+    extension: Optional[str] = None
 
 
 @dataclass

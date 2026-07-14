@@ -1,5 +1,6 @@
 """Deterministic asset discovery, normalization, classification and assignment."""
 import re
+import hashlib
 from pathlib import PurePosixPath
 from typing import Iterable, List, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -10,7 +11,7 @@ _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx"}
 _TRACKING_KEYS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "mc_cid", "mc_eid"}
 _FLOORPLAN_RE = re.compile(r"floor[\s_-]*plan|floorplan|layout", re.I)
-_BROCHURE_RE = re.compile(r"brochure|particulars|marketing[\s_-]*details", re.I)
+_BROCHURE_RE = re.compile(r"brochure|particulars|marketing[\s_-]*details|download\s*(?:pdf|details|document)", re.I)
 _LOGO_RE = re.compile(r"logo|brandmark|signature|avatar|headshot", re.I)
 _MAP_RE = re.compile(r"map|location[\s_-]*plan|streetview", re.I)
 _DECORATIVE_RE = re.compile(r"pixel|tracking|spacer|social|icon|divider|transparent", re.I)
@@ -35,15 +36,20 @@ def deduplicate_candidates(candidates: Iterable[AssetCandidate]) -> List[AssetCa
     seen = set()
     for candidate in candidates:
         normalized = normalize_url(candidate.url)
-        if not normalized or normalized in seen:
+        content_key = candidate.content_hash or (hashlib.sha256(candidate.content).hexdigest() if candidate.content else "")
+        key = normalized or (f"embedded:{content_key}" if content_key else "")
+        if not key or key in seen:
             continue
         candidate.url = normalized
-        seen.add(normalized)
+        candidate.content_hash = content_key or None
+        seen.add(key)
         unique.append(candidate)
     return unique
 
 
 def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
+    if candidate.classification != AssetType.UNKNOWN and candidate.confidence > 0:
+        return candidate
     parsed = urlparse(candidate.url)
     filename = candidate.filename or PurePosixPath(parsed.path).name
     context = " ".join(filter(None, [filename, candidate.anchor_text, candidate.alt_text])).lower()

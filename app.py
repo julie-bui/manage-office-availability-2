@@ -19,6 +19,7 @@ load_dotenv()
 import storage
 from extraction import address_lookup, geocode as geocode_module, html_images, memlog, pdf_images, xlsx_links
 from extraction.naming import make_unique_names
+from extraction.models import AssetType
 from extraction.pipeline import BATCH_DEADLINE_SECONDS, process_files
 from spreadsheet import write_xlsx
 
@@ -55,6 +56,8 @@ CONTENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
 }
 # Extensions a browser can render natively — served as `inline` so
 # clicking Link to File opens it directly in-browser instead of
@@ -67,7 +70,7 @@ CONTENT_TYPES = {
 # a PDF, rather than force a download. DOCX/XLSX/CSV have no reliable
 # native in-browser renderer, so they're deliberately left out — normal
 # downloads for those.
-INLINE_EXTENSIONS = {".pdf", ".html", ".htm", ".jpg", ".jpeg", ".png"}
+INLINE_EXTENSIONS = {".pdf", ".html", ".htm", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 # Set in the hosting platform's environment variables (never committed). If
 # unset, the app runs "open" with no path/token gating — fine for local dev,
@@ -338,6 +341,7 @@ def process():
             # photos, one from a promotional blurb and one from its own
             # listing card). Turns 2+ into a small gallery page, 1 into a
             # direct link, same as the PDF path above.
+            upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
             upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name))
 
             memlog.log("before spreadsheet write", r["filename"])
@@ -654,6 +658,43 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name):
 
         record["High Res Images"] = gallery_url_by_candidates[key]
 
+    return jobs
+
+
+def _materialize_brochure_assets(records, batch_dir, batch_id, name):
+    """Persist classified embedded brochure visuals after batch URLs exist."""
+    jobs = []
+    saved = {}
+    for record_index, record in enumerate(records, start=1):
+        candidates = record.pop("_brochure_embedded_assets", None) or []
+        photo_urls = []
+        for candidate in candidates:
+            if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
+                continue
+            digest = candidate.content_hash or hashlib.sha256(candidate.content).hexdigest()
+            if digest not in saved:
+                extension = (candidate.extension or "png").lower().lstrip(".")
+                filename = f"{name}_brochure_r{record_index}_{digest[:10]}.{extension}"
+                path = batch_dir / filename
+                path.write_bytes(candidate.content)
+                jobs.append((f"{batch_id}/{filename}", path))
+                saved[digest] = _download_url(batch_id, filename)
+            url = saved[digest]
+            if candidate.classification == AssetType.FLOORPLAN:
+                if not record.get("Floor Plan"):
+                    record["Floor Plan"] = url
+            elif url not in photo_urls:
+                photo_urls.append(url)
+
+        if not photo_urls:
+            continue
+        existing_candidates = list(record.get("_high_res_candidates") or [])
+        existing = str(record.get("High Res Images") or "")
+        if existing and Path(existing.split("?", 1)[0]).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            existing_candidates.insert(0, existing)
+        combined = list(dict.fromkeys(existing_candidates + photo_urls))
+        if not existing or existing_candidates:
+            record["_high_res_candidates"] = combined
     return jobs
 
 
