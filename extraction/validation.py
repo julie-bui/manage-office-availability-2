@@ -36,10 +36,42 @@ def validate_property(prop: Property) -> Property:
         prop.add_issue(ValidationIssue("Building", "Building/property name is missing.", Severity.ERROR, building))
     if not address:
         prop.add_issue(ValidationIssue("Property Address 1", "Address is missing.", Severity.ERROR, address))
+    if values.get("Size (sq ft)") in (None, ""):
+        prop.add_issue(
+            ValidationIssue(
+                "Size (sq ft)",
+                "Size was not present in the source record.",
+                Severity.WARNING,
+                values.get("Size (sq ft)"),
+                "Confirm the size from the brochure or provider before upload.",
+            )
+        )
     if postcode_value and "manual lookup" not in postcode_value.lower() and not postcode:
         prop.add_issue(ValidationIssue("Property Postcode", "Postcode is not a valid UK postcode.", Severity.ERROR, postcode_value))
+    if "manual lookup" in postcode_value.lower():
+        prop.add_issue(
+            ValidationIssue(
+                "Property Postcode",
+                "Address enrichment could not determine a trustworthy postcode.",
+                Severity.WARNING,
+                postcode_value,
+                "Confirm the postcode against the brochure or provider website.",
+                "address_validation",
+            )
+        )
     elif postcode and not _POSTCODE_RE.match(postcode):
         prop.add_issue(ValidationIssue("Property Postcode", "Postcode could not be normalized confidently.", Severity.WARNING, postcode_value))
+    if "not in source text" in postcode_value.lower():
+        prop.add_issue(
+            ValidationIssue(
+                "Property Postcode",
+                "Postcode was derived during enrichment and was not present in the source.",
+                Severity.WARNING,
+                postcode_value,
+                "Verify the postcode against the brochure or provider website.",
+                "address_validation",
+            )
+        )
 
     brochure = values.get("Brochure PDF")
     floorplan = values.get("Floor Plan")

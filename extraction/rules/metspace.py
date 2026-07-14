@@ -24,6 +24,8 @@ def detect(content):
 
 def parse(content):
     lines = [l.strip() for l in content["text"].split("\n") if l.strip()]
+    if any(line.upper() == "OFFICE OF THE WEEK" for line in lines):
+        return _parse_office_of_the_week(lines, content.get("html_items", []))
     contact = _contact_block(lines)
 
     records = []
@@ -93,6 +95,51 @@ def parse(content):
 
     _attach_floor_plans(records, content.get("html_items", []))
     return records
+
+
+def _parse_office_of_the_week(lines, html_items):
+    """Parse MetSpace's single-property campaign using the same canonical fields.
+
+    This is a genuine provider template, not a filename exception. Its two
+    listing images are ordered photo then floorplan, verified against the
+    embedded image content; logos and signature assets are excluded by domain
+    and context before assignment.
+    """
+    sqft_idx = next((i for i, line in enumerate(lines) if line.lower().startswith("sqft:")), None)
+    if sqft_idx is None or sqft_idx == 0:
+        return []
+    building = lines[sqft_idx - 1]
+    values = {}
+    for line in lines[sqft_idx : min(len(lines), sqft_idx + 8)]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            values[key.strip().lower()] = value.strip()
+    desks = values.get("desks", "")
+    record = {
+        "Building": building,
+        "Size (sq ft)": values.get("sqft", "").replace(",", ""),
+        "Desks (max)": _max_desks(desks),
+        "Marketing Price (Based on Min Term) PCM": values.get("price", "").replace("£", "").replace(",", ""),
+        "Special Features": ", ".join(filter(None, [desks, values.get("configuration", "")])),
+        "State of Space": values.get("av", ""),
+        "Contacts": _contact_block(lines),
+    }
+
+    listing_link_idx = next(
+        (i for i, (kind, text, _url) in enumerate(html_items) if kind == "link" and text.strip().lower() == building.lower()),
+        None,
+    )
+    if listing_link_idx is not None:
+        record["Brochure PDF"] = html_items[listing_link_idx][2]
+        images = [
+            url for kind, alt, url in html_items[listing_link_idx + 1 :]
+            if kind == "image" and "mcusercontent.com" in url and alt.strip().lower() != "logo"
+        ]
+        if images:
+            record["High Res Images"] = images[0]
+        if len(images) > 1:
+            record["Floor Plan"] = images[1]
+    return [record]
 
 
 def _attach_floor_plans(records, html_items):

@@ -5,6 +5,7 @@ one): https://operations.osmfoundation.org/policies/nominatim/
 """
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "manage-office-availability/1.0 (contact: team@spacepoint.co.uk)"
 MIN_INTERVAL_SECONDS = 1.0
 REQUEST_TIMEOUT = 10
+CACHE_LOGIC_VERSION = 2
 
 # Confirmed empirically (2026-07, Crown Estate) that a common London street
 # name with no distinguishing context can return a *confident-looking* top
@@ -106,13 +108,13 @@ def geocode(address, confident=True):
     key = _cache_key(address)
     if key in cache:
         hit = cache[key]
-        if confident or not hit.get("low_confidence"):
+        if hit.get("logic_version") == CACHE_LOGIC_VERSION and (confident or not hit.get("low_confidence")):
             return hit.get("lat"), hit.get("lng"), hit.get("postcode", ""), hit.get("error")
         # else: both this call and the cached entry are low-confidence —
         # don't trust it, fall through to a fresh fetch below.
 
     lat, lng, postcode, error = _fetch(address)
-    cache[key] = {"lat": lat, "lng": lng, "postcode": postcode, "error": error}
+    cache[key] = {"lat": lat, "lng": lng, "postcode": postcode, "error": error, "logic_version": CACHE_LOGIC_VERSION}
     if not confident:
         cache[key]["low_confidence"] = True
     _save_cache(cache)
@@ -142,6 +144,15 @@ def _fetch(address):
     if not results:
         return None, None, "", "No geocoding match found for this address"
 
+    requested_number = _requested_house_number(address)
+    if requested_number:
+        matching = [result for result in results if _candidate_matches_house_number(result, requested_number)]
+        if not matching:
+            return None, None, "", (
+                f"No candidate matched requested house number {requested_number}; refusing to use a neighbouring unit"
+            )
+        results = matching
+
     try:
         lat = float(results[0]["lat"])
         lng = float(results[0]["lon"])
@@ -168,6 +179,28 @@ def _fetch(address):
         return None, None, "", ambiguity_error
 
     return lat, lng, postcode, None
+
+
+def _requested_house_number(query):
+    match = re.search(r"(?:^|,\s*)(\d+[A-Za-z]?(?:-\d+[A-Za-z]?)?)\s+", query or "")
+    return match.group(1).upper() if match else ""
+
+
+def _candidate_matches_house_number(candidate, requested):
+    candidate_number = str((candidate.get("address") or {}).get("house_number") or "").upper().replace(" ", "")
+    requested = (requested or "").upper().replace(" ", "")
+    if not candidate_number:
+        return False
+    if candidate_number == requested:
+        return True
+    # A source may request one number within a building range (e.g. 146
+    # within 146-150). Do not treat letter-suffixed neighbours (44A vs 44)
+    # as equivalent.
+    range_match = re.fullmatch(r"(\d+)-(\d+)", candidate_number)
+    requested_match = re.fullmatch(r"\d+", requested)
+    if range_match and requested_match:
+        return int(range_match.group(1)) <= int(requested) <= int(range_match.group(2))
+    return False
 
 
 def _check_ambiguity(lat, lng, postcode, other_candidates):

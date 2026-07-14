@@ -860,10 +860,9 @@ def check_rule_sanity_check_fallback(failures):
     record and a genuinely normal one (must NOT false-positive on real
     data); (2) extraction.rules.try_rules against the REAL "Office Of
     The Week" fixture end to end — confirms the whole rule (not just
-    parse(), which still "succeeds") is now correctly rejected,
-    returning (None, None) so process_files falls back to the LLM
-    instead of accepting the garbage, the same way an entirely
-    unrecognized new provider already does. The normal-file
+    parse(), which previously "succeeded" with garbage) now returns the
+    dedicated, validated single-listing template result rather than
+    accepting boilerplate or requiring the LLM. The normal-file
     non-false-positive counterpart to this (MetSpace's OWN usual
     template still matching and returning real records) is already
     covered by main()'s own EXPECTATIONS loop, run every time this
@@ -897,17 +896,17 @@ def check_rule_sanity_check_fallback(failures):
     else:
         content = read_file(path)
         rule_name, records = try_rules(content)
-        if rule_name is not None or records is not None:
+        if rule_name != "MetSpace" or not records or len(records) != 1 or records[0].get("Building") != "44 Pentonville Road":
             local_failures.append(
-                f"{filename}: expected try_rules to reject this (rule_name=None, records=None) since MetSpace's "
-                f"own rule's output for it is implausible, got rule_name={rule_name!r} with "
+                f"{filename}: expected the corrected MetSpace template parser to return one clean 44 Pentonville Road record, "
+                f"got rule_name={rule_name!r} with "
                 f"{len(records) if records else 0} record(s)"
             )
 
     if not local_failures:
         print(
             "OK  rule sanity check: 4 plausibility cases (1 normal, 3 implausible) spot-checked, real "
-            "'Office Of The Week' fixture correctly rejected by try_rules (falls back to the LLM)"
+            "'Office Of The Week' fixture now returns one clean deterministic record"
         )
     failures.extend(local_failures)
 

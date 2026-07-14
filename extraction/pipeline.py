@@ -576,6 +576,26 @@ def _geocode_records(records, filename, provider_name, deadline):
                     if retry_lat is not None:
                         query, lat, lng, geo_postcode, error = retry_query, retry_lat, retry_lng, retry_postcode, retry_error
                         break
+            # A numbered address can still be ambiguous when the source
+            # omits its postcode (44 vs 44A Pentonville Road is the real
+            # regression). If deterministic geocoding rejects every
+            # house-number-consistent candidate, use the existing grounded
+            # lookup tier rather than accepting a neighbour or silently
+            # leaving a blank. This remains bounded by the same quota and
+            # batch deadline as bare-name enrichment.
+            if lat is None and not record.get("Property Postcode") and not daily_quota_hit:
+                web_address, web_sources, hit_quota = find_address_via_web_search(building, provider_name)
+                if hit_quota:
+                    quota_exhausted = True
+                    daily_quota_hit = True
+                if web_address:
+                    web_query = _geocode_query({"Property Address 1": web_address})
+                    web_lat, web_lng, web_postcode, web_error = geocode(web_query)
+                    if web_lat is not None:
+                        query, lat, lng, error = web_query, web_lat, web_lng, web_error
+                        geo_postcode = extract_postcode(web_address) or web_postcode
+                        derived_note = True
+                        sources = web_sources
 
         postcode_from_geocode = False
         if not record.get("Property Postcode") and geo_postcode:

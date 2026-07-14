@@ -8,7 +8,7 @@ from pathlib import Path
 # Rules tied to a specific, known sender — the rule name itself IS the
 # provider name. The generic "Grid/Tabular" rule matches any tabular input
 # and isn't tied to a sender, so it doesn't count as a confident identification.
-NAMED_RULES = {"Knotel", "MetSpace", "GPE", "BC", "Breezblok"}
+NAMED_RULES = {"Knotel", "MetSpace", "Workplace Plus", "GPE", "BC", "Breezblok"}
 
 ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 LEADING_REPLY_PREFIX = re.compile(r"^(fw|fwd|re)[:_\-\s]+", re.IGNORECASE)
