@@ -9,7 +9,7 @@ import re
 import time
 from datetime import date
 
-from . import memlog, quota
+from . import brochure, html_images, memlog, quota, xlsx_links
 from .address import extract_postcode, spelled_number_to_digits
 from .address_lookup import find_address as find_address_via_web_search
 from .file_readers import read_file
@@ -118,7 +118,15 @@ def _address_retry_candidates(building, digit_address):
     return candidates
 
 
-def process_files(paths, deadline=None, source_urls=None, source_url_expected=False):
+def process_files(
+    paths,
+    deadline=None,
+    source_urls=None,
+    source_url_expected=False,
+    brochure_enrichment=False,
+    brochure_fetcher=None,
+    brochure_extractor=None,
+):
     """Returns a list of per-file dicts:
     {filename, status: "ok"|"error", method: "rule:<Name>"|"llm"|None,
      records, record_count, error, warning, provider_name, date}
@@ -284,6 +292,14 @@ def process_files(paths, deadline=None, source_urls=None, source_url_expected=Fa
             results.append(result)
             continue
 
+        # Generic asset/brochure discovery belongs in the pipeline, before
+        # typed properties and validation.  These helpers only fill blanks,
+        # so dedicated provider rules retain priority.
+        if result["method"] == "llm" and content.get("html_items"):
+            html_images.enrich_records(normalized, content["html_items"])
+        if result["method"] == "llm" and content.get("row_links"):
+            xlsx_links.enrich_records(normalized, content["row_links"])
+
         # Resolved before geocoding (rather than after, as before) so the
         # web-search fallback can pass it along as disambiguating context
         # (e.g. "Elsley GPE Fully Managed" instead of just "Elsley").
@@ -320,6 +336,24 @@ def process_files(paths, deadline=None, source_urls=None, source_url_expected=Fa
             )
             for record in normalized
         ]
+
+        if brochure_enrichment:
+            kwargs = {}
+            if brochure_fetcher is not None:
+                kwargs["fetcher"] = brochure_fetcher
+            if brochure_extractor is not None:
+                kwargs["extractor"] = brochure_extractor
+            properties = brochure.enrich_properties(properties, **kwargs)
+            brochure_issues = [
+                issue for prop in properties for issue in prop.issues
+                if issue.stage.startswith("brochure_")
+            ]
+            report.record(
+                "BROCHURE_ENRICHMENT",
+                "WARNING" if brochure_issues else "PASS",
+                f"{len(brochure_issues)} brochure issue(s)" if brochure_issues else "Brochure enrichment complete",
+                len(properties),
+            )
         properties = validate_properties(properties)
         report.issues.extend(issue for prop in properties for issue in prop.issues)
         report.record(

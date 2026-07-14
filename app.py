@@ -215,7 +215,7 @@ def process():
             f.save(dest)
             saved_paths.append(dest)
 
-        processed_results = process_files(saved_paths, deadline=batch_deadline)
+        processed_results = process_files(saved_paths, deadline=batch_deadline, brochure_enrichment=True)
         # process_files() returns exactly one result per input path, in the
         # same order — pair each back up with its saved original so the
         # "ok" ones below can copy it into the persistent batch dir (the

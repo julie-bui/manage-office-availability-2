@@ -21,6 +21,7 @@ class AssetType(str, Enum):
     PROPERTY_IMAGE = "property_image"
     LOGO = "logo"
     MAP = "map"
+    DECORATIVE = "decorative"
     TRACKING_OR_DECORATIVE = "tracking_or_decorative"
     UNKNOWN = "unknown"
 
@@ -31,6 +32,25 @@ class FieldProvenance:
     method: str
     confidence: float = 1.0
     original_value: Any = None
+    source_document: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExtractedValue:
+    """A typed value offered by a secondary source such as a brochure."""
+
+    value: Any
+    source: str
+    source_document: str
+    extraction_method: str
+    confidence: float
+
+
+@dataclass
+class BrochureExtraction:
+    source_document: str
+    fields: Dict[str, ExtractedValue] = field(default_factory=dict)
+    assets: List["AssetCandidate"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

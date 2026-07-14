@@ -40,7 +40,7 @@ def test_asset_classification_and_tracking_parameter_deduplication():
         AssetType.FLOORPLAN,
         AssetType.PROPERTY_IMAGE,
         AssetType.LOGO,
-        AssetType.TRACKING_OR_DECORATIVE,
+        AssetType.DECORATIVE,
     ]
     assert normalize_url("javascript:alert(1)") == ""
 

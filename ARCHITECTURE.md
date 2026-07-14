@@ -8,16 +8,18 @@ but each batch now follows explicit stage contracts:
 1. **Read** — `file_readers.read_file` produces document content and structural metadata.
 2. **Extract** — a provider parser is tried through the common rule interface; implausible or unsupported layouts use the LLM fallback.
 3. **Normalize** — `schema.normalize_record` maps values by semantic column name and derives only established Kato fields.
-4. **Enrich** — address/geocode lookup runs with a batch deadline and retains source-derived values when lookup fails.
-5. **Validate** — dictionary records are wrapped in the canonical `Property` model, preserving field provenance and accumulating typed `ValidationIssue` objects.
-6. **Discover/classify assets** — `assets.py` provides the common candidate pipeline: URL normalization, deduplication, deterministic classification, then later assignment. Provider-specific parsers may supply stronger context where their layout is known.
-7. **Export** — `spreadsheet.write_xlsx` uses the centralized `COLUMNS` mapping and writes hyperlinks by field name. A `QA Review` sheet lists validation problems without changing the established Listings layout.
-8. **Report** — every file result includes `processing_report`, containing PASS/WARNING/FAIL stage entries and review issues.
+4. **Discover assets and brochures** — generic HTML/spreadsheet link discovery supplements provider rules without replacing their stronger layout knowledge.
+5. **Enrich** — address lookup runs with a batch deadline. When enabled by the application, `brochure.py` reads valid brochure PDFs as secondary evidence, classifies their media, and merges only reliable values using confidence-aware conflict rules. A brochure failure never aborts primary extraction.
+6. **Resolve conflicts** — blank or weak values can be filled or improved; strong conflicting primary values are retained and produce a review issue.
+7. **Validate** — records use the canonical `Property` model, preserving primary and brochure provenance and accumulating typed `ValidationIssue` objects.
+8. **Export** — `spreadsheet.write_xlsx` uses the centralized `COLUMNS` mapping and writes hyperlinks by field name. A `QA Review` sheet lists validation problems without changing the established Listings layout.
+9. **Report** — every file result includes `processing_report`, containing PASS/WARNING/FAIL stage entries and review issues.
 
 ## Typed contracts
 
-`extraction.models` defines `RawDocument`, `Property`, `FieldProvenance`,
-`AssetCandidate`, `ValidationIssue`, `ProcessingReport`, and stage results. Provider
+`extraction.models` defines `RawDocument`, `Property`, `ExtractedValue`,
+`BrochureExtraction`, `FieldProvenance`, `AssetCandidate`, `ValidationIssue`,
+`ProcessingReport`, and stage results. Provider
 rules remain compatible with their existing dictionary output, but dictionaries
 no longer cross final validation without being converted into a canonical model.
 

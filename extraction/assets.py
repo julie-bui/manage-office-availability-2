@@ -51,7 +51,7 @@ def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
     mime = (candidate.mime_type or "").lower()
 
     if _DECORATIVE_RE.search(context):
-        classification, confidence = AssetType.TRACKING_OR_DECORATIVE, 0.98
+        classification, confidence = AssetType.DECORATIVE, 0.98
     elif _LOGO_RE.search(context):
         classification, confidence = AssetType.LOGO, 0.98
     elif _MAP_RE.search(context):
