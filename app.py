@@ -277,8 +277,18 @@ def process():
                 shutil.copy2(source_path, batch_dir / source_filename)
             r["source_file"] = source_filename
             source_url = _download_url(batch_id, source_filename)
-            for record in r["records"]:
-                record["Link to File"] = source_url
+            # The hosted URL only exists after this source artifact has a
+            # collision-safe batch filename. Update the canonical typed
+            # properties, then serialize them; never patch Link to File
+            # from an unrelated brochure/image field.
+            for prop in r.get("properties") or []:
+                # Display the user's original uploaded filename for audit
+                # traceability.  The URL may target a collision-safe stored
+                # copy (or an HTML rendering of an email), but that storage
+                # implementation detail must not replace source identity.
+                prop.set_source_reference(r["filename"], source_url)
+            if r.get("properties"):
+                r["records"] = [prop.to_record() for prop in r["properties"]]
 
             # Floor Plan/High Res Images for a PDF source whose own rule (or
             # the LLM fallback) doesn't already supply them from its own

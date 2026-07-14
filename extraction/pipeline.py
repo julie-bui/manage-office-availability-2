@@ -15,7 +15,7 @@ from .address_lookup import find_address as find_address_via_web_search
 from .file_readers import read_file
 from .geocode import geocode
 from .llm_fallback import LLMExtractionError, extract_with_llm
-from .models import ProcessingReport, Property
+from .models import ProcessingReport, Property, RawDocument
 from .naming import area_from_records, extract_area_hint, resolve_provider_name, resolve_source_date
 from .rules import try_rules
 from .schema import normalize_record, street_address_only
@@ -118,7 +118,7 @@ def _address_retry_candidates(building, digit_address):
     return candidates
 
 
-def process_files(paths, deadline=None):
+def process_files(paths, deadline=None, source_urls=None, source_url_expected=False):
     """Returns a list of per-file dicts:
     {filename, status: "ok"|"error", method: "rule:<Name>"|"llm"|None,
      records, record_count, error, warning, provider_name, date}
@@ -155,6 +155,7 @@ def process_files(paths, deadline=None):
 
     for path in paths:
         filename = path.name if hasattr(path, "name") else str(path)
+        source_url = _source_url_for(path, filename, source_urls)
         report = ProcessingReport(filename)
         result = {
             "filename": filename,
@@ -171,10 +172,12 @@ def process_files(paths, deadline=None):
             "html_items": None,
             "row_links": None,
             "processing_report": None,
+            "properties": [],
         }
         memlog.log("before file parsing", filename)
         try:
             content = read_file(path)
+            document = RawDocument(filename, content, source_url)
             report.record("READ", "PASS", item_count=1)
         except ValueError as e:
             report.record("READ", "FAIL", str(e))
@@ -307,7 +310,14 @@ def process_files(paths, deadline=None):
             record["Property Address 1"] = street_address_only(record.get("Building"))
 
         properties = [
-            Property.from_record(record, filename, provider_name, result["method"] or "unknown")
+            Property.from_record(
+                record,
+                document.source_file_name,
+                provider_name,
+                result["method"] or "unknown",
+                document.source_file_url,
+                source_url_expected,
+            )
             for record in normalized
         ]
         properties = validate_properties(properties)
@@ -357,8 +367,12 @@ def process_files(paths, deadline=None):
         # run this batch. Only falls back to today when neither is available.
         ref_date = resolve_source_date(content) or date.today().strftime("%Y-%m-%d")
         external_ref = f"{provider_name}_{ref_date}"
-        for record in normalized:
+        for prop, record in zip(properties, normalized):
             record["External Ref"] = external_ref
+            # Keep the typed model authoritative.  The web application may
+            # attach the durable source URL after persistence and serialize
+            # the properties again; late export fields must survive that.
+            prop.values["External Ref"] = external_ref
 
         # The output spreadsheet's own display name — same provider_name,
         # same ref_date as External Ref above (one consistent date across
@@ -381,6 +395,7 @@ def process_files(paths, deadline=None):
         result["display_name"] = f"{display_name}_{ref_date}"
 
         result["records"] = normalized
+        result["properties"] = properties
         result["record_count"] = len(normalized)
         result["provider_name"] = provider_name
         report.record("EXPORT_READY", "PASS", item_count=len(normalized))
@@ -399,6 +414,14 @@ def process_files(paths, deadline=None):
     # returns) so it can never block the HTTP response or contribute to a
     # worker timeout.
     return results
+
+
+def _source_url_for(path, filename, source_urls):
+    if not source_urls:
+        return None
+    if callable(source_urls):
+        return source_urls(path)
+    return source_urls.get(path) or source_urls.get(str(path)) or source_urls.get(filename)
 
 
 def _geocode_records(records, filename, provider_name, deadline):

@@ -84,7 +84,7 @@ def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=True):
                 # link still goes to the real address via cell.hyperlink,
                 # only the displayed text changes.
                 actual_url = val
-                cell.value = LINK_LABELS[col_name]
+                cell.value = record.get("_source_file_name") if col_name == "Link to File" else LINK_LABELS[col_name]
                 cell.hyperlink = actual_url
                 cell.font = Font(color="FF0563C1", underline="single")
                 val = cell.value

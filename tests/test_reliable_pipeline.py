@@ -78,3 +78,42 @@ def test_spreadsheet_named_mapping_hyperlinks_and_qa_sheet(tmp_path: Path):
     brochure_cell = listings.cell(2, COLUMNS.index("Brochure PDF") + 1)
     assert brochure_cell.hyperlink.target == "https://example.com/brochure.pdf"
     assert [cell.value for cell in workbook["QA Review"][1]] == QA_COLUMNS
+
+
+def test_source_reference_survives_model_validation_and_spreadsheet_export(tmp_path: Path):
+    source_url = "https://files.example.test/batches/42/source.eml"
+    record = normalize_record(
+        {
+            "Building": "Example House",
+            "Brochure PDF": "https://assets.example.test/brochure.pdf",
+            "Floor Plan": "https://assets.example.test/floorplan.png",
+            "High Res Images": "https://assets.example.test/reception.jpg",
+        }
+    )
+    prop = validate_property(
+        Property.from_record(record, "source.eml", "Example", "rule:test", source_url, True)
+    )
+    exported = prop.to_record()
+    assert prop.source_file_name == "source.eml"
+    assert prop.source_file_url == source_url
+    assert exported["Link to File"] == source_url
+    assert exported["_source_file_name"] == "source.eml"
+    assert exported["Link to File"] not in {
+        exported["Brochure PDF"], exported["Floor Plan"], exported["High Res Images"]
+    }
+
+    path = tmp_path / "source-link.xlsx"
+    write_xlsx(path, [exported])
+    cell = load_workbook(path)["Listings"].cell(2, COLUMNS.index("Link to File") + 1)
+    assert cell.value == "source.eml"
+    assert cell.hyperlink.target == source_url
+
+
+def test_missing_source_url_only_warns_when_one_was_expected():
+    record = normalize_record({"Building": "Example House"})
+    local = validate_property(Property.from_record(record, "local.pdf", "Example", "rule:test"))
+    expected = validate_property(
+        Property.from_record(record, "hosted.pdf", "Example", "rule:test", source_url_expected=True)
+    )
+    assert not any(issue.field == "Link to File" for issue in local.issues)
+    assert any(issue.field == "Link to File" for issue in expected.issues)

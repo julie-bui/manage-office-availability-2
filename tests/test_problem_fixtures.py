@@ -69,10 +69,28 @@ def test_exact_fixtures_run_through_orchestrator_and_qa(monkeypatch, tmp_path):
         return (51.5, -0.1, postcode, None) if postcode else (None, None, None, "not found")
 
     monkeypatch.setattr(pipeline, "geocode", fake_geocode)
-    results = pipeline.process_files([METSPACE, WORKPLACE])
+    source_urls = {
+        METSPACE.name: "https://files.example.test/regression/metspace.eml",
+        WORKPLACE.name: "https://files.example.test/regression/workplace-plus.eml",
+    }
+    results = pipeline.process_files([METSPACE, WORKPLACE], source_urls=source_urls, source_url_expected=True)
     assert [result["status"] for result in results] == ["ok", "ok"]
     assert [result["record_count"] for result in results] == [1, 4]
     assert results[0]["records"][0]["Property Postcode"] == "N1 9HJ (Not in source text)"
+
+    # One-row and one-to-many extraction both retain exactly the originating
+    # file reference; no listing asset can be substituted for provenance.
+    for result, source in zip(results, (METSPACE, WORKPLACE)):
+        expected_url = source_urls[source.name]
+        assert all(prop.source_file_name == source.name for prop in result["properties"])
+        assert all(prop.source_file_url == expected_url for prop in result["properties"])
+        assert all(record["Link to File"] == expected_url for record in result["records"])
+        assert all(record["_source_file_name"] == source.name for record in result["records"])
+        assert all(
+            record["Link to File"]
+            not in {record["Brochure PDF"], record["Floor Plan"], record["High Res Images"]}
+            for record in result["records"]
+        )
 
     for result in results:
         path = tmp_path / f"{result['provider_name']}.xlsx"
@@ -83,6 +101,11 @@ def test_exact_fixtures_run_through_orchestrator_and_qa(monkeypatch, tmp_path):
         assert listings.max_column == len(COLUMNS)
         assert listings.max_row == result["record_count"] + 1
         assert "QA Review" in workbook.sheetnames
+        link_column = COLUMNS.index("Link to File") + 1
+        source_name = METSPACE.name if result["provider_name"] == "MetSpace" else WORKPLACE.name
+        for row in range(2, listings.max_row + 1):
+            assert listings.cell(row, link_column).value == source_name
+            assert listings.cell(row, link_column).hyperlink is not None
 
     metspace_qa = load_workbook(tmp_path / "MetSpace.xlsx")["QA Review"]
     metspace_issues = [cell.value for cell in metspace_qa["D"]]

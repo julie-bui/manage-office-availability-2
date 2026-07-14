@@ -58,8 +58,9 @@ class AssetCandidate:
 
 @dataclass
 class RawDocument:
-    source_file: str
+    source_file_name: str
     content: Dict[str, Any]
+    source_file_url: Optional[str] = None
     provider: Optional[str] = None
 
 
@@ -67,22 +68,44 @@ class RawDocument:
 class Property:
     """Canonical property wrapper without changing the public XLSX schema."""
 
-    source_file: str
+    source_file_name: str
     provider: str
     values: Dict[str, Any]
+    source_file_url: Optional[str] = None
+    source_url_expected: bool = False
     provenance: Dict[str, FieldProvenance] = field(default_factory=dict)
     assets: List[AssetCandidate] = field(default_factory=list)
     issues: List[ValidationIssue] = field(default_factory=list)
     review_required: bool = False
 
     @classmethod
-    def from_record(cls, record: Dict[str, Any], source_file: str, provider: str, method: str) -> "Property":
+    def from_record(
+        cls,
+        record: Dict[str, Any],
+        source_file_name: str,
+        provider: str,
+        method: str,
+        source_file_url: Optional[str] = None,
+        source_url_expected: bool = False,
+    ) -> "Property":
         provenance = {
-            key: FieldProvenance(source=source_file, method=method, original_value=value)
+            key: FieldProvenance(source=source_file_name, method=method, original_value=value)
             for key, value in record.items()
             if value not in (None, "") and not key.startswith("_")
         }
-        return cls(source_file=source_file, provider=provider, values=dict(record), provenance=provenance)
+        return cls(
+            source_file_name=source_file_name,
+            source_file_url=source_file_url,
+            source_url_expected=source_url_expected,
+            provider=provider,
+            values=dict(record),
+            provenance=provenance,
+        )
+
+    def set_source_reference(self, source_file_name: str, source_file_url: Optional[str]) -> None:
+        self.source_file_name = source_file_name
+        self.source_file_url = source_file_url
+        self.source_url_expected = True
 
     def add_issue(self, issue: ValidationIssue) -> None:
         self.issues.append(issue)
@@ -91,7 +114,11 @@ class Property:
 
     def to_record(self) -> Dict[str, Any]:
         record = dict(self.values)
-        record["_source_file"] = self.source_file
+        record["_source_file"] = self.source_file_name
+        record["_source_file_name"] = self.source_file_name
+        record["_source_file_url"] = self.source_file_url
+        if self.source_file_url:
+            record["Link to File"] = self.source_file_url
         record["_provenance"] = self.provenance
         record["_validation_issues"] = list(self.issues)
         record["_review_required"] = self.review_required
