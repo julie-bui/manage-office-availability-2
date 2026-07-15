@@ -22,6 +22,7 @@ class AssetType(str, Enum):
     LOGO = "logo"
     MAP = "map"
     DECORATIVE = "decorative"
+    DOCUMENT_PREVIEW = "document_preview"
     TRACKING_OR_DECORATIVE = "tracking_or_decorative"
     UNKNOWN = "unknown"
 
@@ -68,10 +69,13 @@ class BrochureResource:
 @dataclass(frozen=True)
 class LinkDiagnostic:
     status: str
-    original_url: str
+    original_url: str = ""
     final_url: Optional[str] = None
     resource_type: Optional[str] = None
     detail: str = ""
+    property_key: str = ""
+    identity_result: str = ""
+    source_context: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,12 +93,31 @@ class AssetCandidate:
     url: str
     source: str
     mime_type: Optional[str] = None
+    original_url: Optional[str] = None
+    final_url: Optional[str] = None
+    source_file: Optional[str] = None
+    provider: Optional[str] = None
+    source_section: Optional[str] = None
+    source_block: Optional[str] = None
+    nearest_property: Optional[str] = None
+    source_row: Optional[int] = None
+    source_cell: Optional[str] = None
+    html_container: Optional[str] = None
     filename: Optional[str] = None
     anchor_text: Optional[str] = None
     alt_text: Optional[str] = None
     page_number: Optional[int] = None
     classification: AssetType = AssetType.UNKNOWN
     confidence: float = 0.0
+    surrounding_text: Optional[str] = None
+    discovery_method: Optional[str] = None
+    associated_property_key: Optional[str] = None
+    association_confidence: float = 0.0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    occurrence_count: int = 1
+    validation_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
     content: Optional[bytes] = None
     content_hash: Optional[str] = None
     extension: Optional[str] = None

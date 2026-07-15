@@ -50,17 +50,40 @@ def parse(content):
 
 
 def _listing_assets(html_items):
-    """Return one (brochure, property photo) pair per building in DOM order."""
-    photos = []
-    for kind, alt, url in html_items:
+    """Associate each photo with the brochure in its own HTML card.
+
+    Workplace Plus repeats the same tracked href on the card's wrapping
+    image link and its visible Brochure link.  That shared href is structural
+    identity; independently collecting two global lists and zipping them can
+    shift every later property when one optional asset is absent.
+    """
+    pairs = []
+    for index, (kind, alt, url) in enumerate(html_items):
         decoded = unquote(url)
-        if (
+        if not (
             kind == "image"
             and "gallery.eocampaign1.com" in decoded
             and "/019" in decoded
             and "logo" not in (alt or "").lower()
             and "tentacles/icons" not in decoded
         ):
-            photos.append(url)
-    brochures = [url for kind, text, url in html_items if kind == "link" and text.strip().lower() == "brochure"]
-    return list(zip(brochures, photos))
+            continue
+        nearby = html_items[max(0, index - 2) : min(len(html_items), index + 3)]
+        wrapping_urls = {
+            candidate_url
+            for candidate_kind, text, candidate_url in nearby
+            if candidate_kind == "link" and not text.strip()
+        }
+        brochure = next(
+            (
+                candidate_url
+                for candidate_kind, text, candidate_url in nearby
+                if candidate_kind == "link"
+                and text.strip().lower() == "brochure"
+                and candidate_url in wrapping_urls
+            ),
+            "",
+        )
+        if brochure:
+            pairs.append((brochure, url))
+    return pairs

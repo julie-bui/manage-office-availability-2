@@ -153,6 +153,33 @@ def _write_qa_sheet(workbook, records):
                     get("action"),
                 ]
             )
+        qa_diagnostic_statuses = {
+            "LINK_IDENTITY_MATCH", "LINK_IDENTITY_PROBABLE_MATCH",
+            "LINK_IDENTITY_AMBIGUOUS", "LINK_IDENTITY_HARD_CONFLICT",
+            "NO_IMAGES_DISCOVERED", "IMAGES_DISCOVERED_BUT_REJECTED", "GALLERY_CREATION_FAILED",
+            "LINK_EXPIRED_OR_INACCESSIBLE", "IMAGE_CANDIDATES_CLASSIFIED", "GALLERY_CREATED", "DIRECT_IMAGE_ASSIGNED",
+        }
+        for diagnostic in record.get("_link_diagnostics") or []:
+            if isinstance(diagnostic, dict):
+                get = diagnostic.get
+            else:
+                get = lambda key, default="": getattr(diagnostic, key, default)
+            status = get("status", "LINK_DIAGNOSTIC")
+            if status not in qa_diagnostic_statuses:
+                continue
+            detail = get("detail", "")
+            identity = get("identity_result", "")
+            qa.append(
+                [
+                    record.get("_source_file", ""),
+                    record.get("Building", ""),
+                    "Linked Media",
+                    f"{status}: {detail}".rstrip(": "),
+                    "WARNING" if status in {"LINK_IDENTITY_AMBIGUOUS", "LINK_IDENTITY_HARD_CONFLICT", "IMAGES_DISCOVERED_BUT_REJECTED", "GALLERY_CREATION_FAILED", "LINK_EXPIRED_OR_INACCESSIBLE"} else "INFO",
+                    get("final_url", "") or get("original_url", ""),
+                    f"Identity: {identity}" if identity else "No action required unless the linked media is missing or incorrect.",
+                ]
+            )
 
     if qa.max_row == 1:
         qa.append(["", "", "", "No validation issues detected", "INFO", "", "No action required"])

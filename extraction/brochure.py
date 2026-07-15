@@ -7,16 +7,18 @@ from collections import Counter
 from copy import deepcopy
 import hashlib
 import ipaddress
+import json
 from io import BytesIO
 import re
 import time
 from typing import Callable, Iterable, List
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 
 from .assets import classify_candidate, classify_candidates, normalize_url
 from .address import extract_postcode
+from .identity import IdentityDecision, compare_property_identity, property_key
 from .models import (
     AssetCandidate,
     AssetType,
@@ -67,6 +69,10 @@ class LinkedResourceError(Exception):
 def fetch_brochure(url: str, timeout: float = 6.0) -> BrochureResource:
     current = url
     redirects = []
+    embedded_target = _embedded_http_target(url)
+    if embedded_target and normalize_url(embedded_target) != normalize_url(url):
+        current = embedded_target
+        redirects.append(embedded_target)
     for _ in range(MAX_REDIRECTS + 1):
         _validate_remote_url(current)
         try:
@@ -101,6 +107,55 @@ def fetch_brochure(url: str, timeout: float = 6.0) -> BrochureResource:
         raise LinkedResourceError("Linked resource exceeds the 20MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
     return BrochureResource(payload, response.headers.get("Content-Type", ""), response.url or current, url, tuple(redirects))
 
+
+
+def _embedded_http_target(url: str) -> str:
+    """Resolve an explicit public HTTP(S) destination embedded by trackers.
+
+    Some marketing platforms return a JavaScript-only shell instead of an HTTP
+    redirect while carrying the real destination in a JSON query value. Only
+    explicit URL-shaped values/TargetUrl keys are accepted; the result still
+    passes the normal public-host and redirect safety checks before fetching.
+    """
+    def decode(value):
+        previous = str(value or "")
+        for _ in range(4):
+            current = unquote(previous)
+            if current == previous:
+                break
+            previous = current
+        return previous
+
+    def find_target(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if str(key).lower() in {"targeturl", "target_url", "destination", "redirecturl"}:
+                    candidate = decode(nested)
+                    if normalize_url(candidate):
+                        return candidate
+                found = find_target(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = find_target(nested)
+                if found:
+                    return found
+        return ""
+
+    for values in parse_qs(urlparse(url).query).values():
+        for raw in values:
+            decoded = decode(raw)
+            if normalize_url(decoded):
+                return decoded
+            try:
+                structured = json.loads(decoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            target = find_target(structured)
+            if target:
+                return target
+    return ""
 
 def _validate_remote_url(url):
     normalized = normalize_url(url)
@@ -163,7 +218,7 @@ def _extract_direct_image(payload: bytes, content_type: str, source_document: st
     except Exception as exc:
         raise LinkedResourceError("Linked image is corrupt or unsupported", "LINK_UNSUPPORTED", source_document) from exc
     detected_mime = "image/jpeg" if detected_format in {"jpg", "jpeg"} else f"image/{detected_format or 'unknown'}"
-    candidate = classify_candidate(AssetCandidate(source_document, source_document, mime_type=detected_mime, filename=urlparse(source_document).path.rsplit("/", 1)[-1], content_hash=hashlib.sha256(payload).hexdigest()))
+    candidate = classify_candidate(AssetCandidate(source_document, source_document, mime_type=detected_mime, original_url=source_document, final_url=source_document, filename=urlparse(source_document).path.rsplit("/", 1)[-1], discovery_method="direct_resource", association_confidence=1.0, content_hash=hashlib.sha256(payload).hexdigest()))
     if candidate.classification == AssetType.PROPERTY_IMAGE and pdf_images.is_floorplan_image(payload):
         candidate.classification = AssetType.FLOORPLAN
         candidate.confidence = 0.9
@@ -177,7 +232,8 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
     for node in soup(["script", "style", "noscript"]):
         node.decompose()
     candidates = []
-    for image in soup.find_all("img"):
+    content_root = soup.find("main") or soup.find("article") or soup.body or soup
+    for image in content_root.find_all("img"):
         # Marketing platforms commonly keep the real image in a lazy-load
         # attribute or expose several responsive variants in srcset.  Keep
         # every distinct full asset URL; the shared asset layer performs
@@ -191,16 +247,18 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
         for raw_url in image_urls:
             src = urljoin(source_document, raw_url)
             if src:
-                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1]))
-    for source in soup.find_all("source"):
+                container = image.find_parent(["article", "section", "figure", "li", "div"])
+                context = container.get_text(" ", strip=True)[:600] if container else ""
+                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", original_url=raw_url, final_url=src, alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1], surrounding_text=context, html_container=getattr(container, "name", None), discovery_method="html_img", association_confidence=0.85 if container and container.name in {"article", "section", "figure"} else 0.55))
+    for source in content_root.find_all("source"):
         for raw_url in _srcset_urls(source.get("srcset") or source.get("data-srcset") or ""):
             src = urljoin(source_document, raw_url)
-            candidates.append(AssetCandidate(src, source_document, mime_type=source.get("type") or "image/*", filename=urlparse(src).path.rsplit("/", 1)[-1]))
+            candidates.append(AssetCandidate(src, source_document, mime_type=source.get("type") or "image/*", original_url=raw_url, final_url=src, filename=urlparse(src).path.rsplit("/", 1)[-1], discovery_method="html_srcset", association_confidence=0.7))
     for meta in soup.find_all("meta"):
         if (meta.get("property") or meta.get("name") or "").lower() in {"og:image", "twitter:image", "twitter:image:src"}:
             src = urljoin(source_document, meta.get("content") or "")
             if src:
-                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", anchor_text="page preview image", filename=urlparse(src).path.rsplit("/", 1)[-1]))
+                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", original_url=meta.get("content"), final_url=src, anchor_text="page preview image", filename=urlparse(src).path.rsplit("/", 1)[-1], discovery_method="html_metadata"))
     hosted_documents = _hosted_document_candidates(soup, source_document)
     if hosted_documents:
         # Viewer thumbnails are document previews, not independent property
@@ -211,9 +269,11 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
                 candidate.classification = AssetType.DECORATIVE
                 candidate.confidence = 0.95
     candidates.extend(hosted_documents)
-    for link in soup.find_all("a", href=True):
+    for link in content_root.find_all("a", href=True):
         href = urljoin(source_document, link.get("href"))
-        candidates.append(AssetCandidate(href, source_document, anchor_text=link.get_text(" ", strip=True), filename=urlparse(href).path.rsplit("/", 1)[-1]))
+        container = link.find_parent(["article", "section", "figure", "li", "div"])
+        context = container.get_text(" ", strip=True)[:600] if container else ""
+        candidates.append(AssetCandidate(href, source_document, original_url=link.get("href"), final_url=href, anchor_text=link.get_text(" ", strip=True), filename=urlparse(href).path.rsplit("/", 1)[-1], surrounding_text=context, html_container=getattr(container, "name", None), discovery_method="html_link", association_confidence=0.85 if container and container.name in {"article", "section", "figure"} else 0.55))
         # Download/navigation labels are asset metadata, not property
         # description text (e.g. "Download brochure" under Amenities).
         link.decompose()
@@ -280,12 +340,20 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     counts[digest] += 1
                     with Image.open(BytesIO(content)) as bitmap:
                         width, height = bitmap.size
-                    classification = AssetType.FLOORPLAN if (
-                        pdf_images.is_floorplan_page(pages_text[page_number] if page_number < len(pages_text) else "")
-                        or pdf_images.is_floorplan_image(content)
-                    ) else (AssetType.DECORATIVE if width < 300 or height < 200 else AssetType.PROPERTY_IMAGE)
+                    page_text = pages_text[page_number] if page_number < len(pages_text) else ""
+                    is_floorplan = pdf_images.is_floorplan_page(page_text) or pdf_images.is_floorplan_image(content)
+                    classification = AssetType.FLOORPLAN if is_floorplan else (AssetType.DECORATIVE if width < 300 or height < 200 else AssetType.UNKNOWN)
                     extracted.append(
-                        AssetCandidate("", source_document, mime_type=f"image/{base.get('ext', 'png')}", filename=f"brochure-p{page_number + 1}-{digest[:10]}.{base.get('ext', 'png')}", page_number=page_number + 1, classification=classification, confidence=0.9 if classification == AssetType.FLOORPLAN else 0.78, content=content, content_hash=digest, extension=base.get("ext", "png"))
+                        AssetCandidate(
+                            "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
+                            filename=f"asset-p{page_number + 1}-{digest[:10]}.{base.get('ext', 'png')}",
+                            page_number=page_number + 1, classification=classification,
+                            confidence=0.9 if classification == AssetType.FLOORPLAN else (0.86 if classification == AssetType.DECORATIVE else 0.0),
+                            surrounding_text=page_text[:800], discovery_method="pdf_embedded_image",
+                            association_confidence=0.85 if classification == AssetType.UNKNOWN else 0.0,
+                            width=width, height=height, content=content, content_hash=digest,
+                            extension=base.get("ext", "png"),
+                        )
                     )
                 except Exception:
                     continue
@@ -296,9 +364,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
         except Exception:
             pass
     for candidate in extracted:
-        if counts[candidate.content_hash] > 1 and candidate.classification == AssetType.PROPERTY_IMAGE:
-            candidate.classification = AssetType.DECORATIVE
-            candidate.confidence = 0.8
+        candidate.occurrence_count = counts[candidate.content_hash]
     return classify_candidates(extracted)
 
 
@@ -369,9 +435,20 @@ def enrich_properties(
             if brochure_url not in cache:
                 cache[brochure_url] = _retrieve(brochure_url, fetcher, extractor)
             extraction = cache[brochure_url]
-            if not _identity_matches(prop, extraction.identity_text):
-                _record_diagnostic(prop, "LINK_IDENTITY_MISMATCH", brochure_url, extraction.source_document, detail="Resolved content conflicts with the source property identity.")
-                prop.add_issue(ValidationIssue("Brochure PDF", "Linked property content appears to belong to a different property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
+            identity = compare_property_identity(prop.values, extraction.identity_text, association_confidence=1.0)
+            _record_diagnostic(
+                prop,
+                f"LINK_IDENTITY_{identity.decision.value}",
+                brochure_url,
+                extraction.source_document,
+                detail="; ".join(identity.reasons),
+                property_identity=property_key(prop.values),
+                identity_result=identity.decision.value,
+            )
+            prop.link_diagnostics.extend(extraction.diagnostics)
+            if identity.decision in {IdentityDecision.AMBIGUOUS, IdentityDecision.HARD_CONFLICT}:
+                label = "conflicts with" if identity.decision == IdentityDecision.HARD_CONFLICT else "could not be confidently matched to"
+                prop.add_issue(ValidationIssue("Brochure PDF", f"Linked property content {label} this property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
                 continue
             # Merge into a copy, then publish the result as one atomic unit.
             # An unexpected merge error cannot leave half-applied enrichment.
@@ -382,7 +459,6 @@ def enrich_properties(
             prop.assets = staged.assets
             prop.issues = staged.issues
             prop.review_required = staged.review_required
-            prop.link_diagnostics.extend(extraction.diagnostics)
             _record_diagnostic(prop, "LINK_ENRICHMENT_SUCCESS", brochure_url, extraction.source_document, _diagnostic_resource_type(extraction))
         except Exception as exc:
             status = getattr(exc, "status", "LINK_ENRICHMENT_FAILED")
@@ -422,6 +498,15 @@ def _retrieve(url, fetcher, extractor):
         except Exception as exc:
             combined.warnings.append(f"Linked brochure document could not be enriched: {exc}")
     combined.assets = classify_candidates(combined.assets)
+    counts = Counter(candidate.classification.value for candidate in combined.assets)
+    combined.diagnostics.append(
+        LinkDiagnostic(
+            "IMAGE_CANDIDATES_CLASSIFIED",
+            original_url=url,
+            final_url=combined.source_document,
+            detail=", ".join(f"{kind}={count}" for kind, count in sorted(counts.items())) or "no asset candidates",
+        )
+    )
     return combined
 
 
@@ -445,8 +530,8 @@ def _resolution_diagnostics(resource: BrochureResource, resource_type: str) -> L
     return diagnostics
 
 
-def _record_diagnostic(prop, status, original_url, final_url=None, resource_type=None, detail=""):
-    prop.link_diagnostics.append(LinkDiagnostic(status, original_url, final_url, resource_type, detail))
+def _record_diagnostic(prop, status, original_url, final_url=None, resource_type=None, detail="", property_identity="", identity_result="", source_context=""):
+    prop.link_diagnostics.append(LinkDiagnostic(status, original_url, final_url, resource_type, detail, property_identity, identity_result, source_context))
 
 
 def _diagnostic_resource_type(extraction):
@@ -454,26 +539,6 @@ def _diagnostic_resource_type(extraction):
         if diagnostic.resource_type:
             return diagnostic.resource_type
     return None
-
-
-def _identity_matches(prop: Property, linked_text: str) -> bool:
-    """Reject only hard property conflicts; ambiguity simply limits merging."""
-    if not linked_text:
-        return True
-    primary = " ".join(str(prop.values.get(field) or "") for field in ("Building", "Property Address 1", "Property Address 2", "Property Postcode"))
-    primary_postcodes = set(re.findall(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", primary.upper()))
-    linked_postcodes = set(re.findall(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", linked_text.upper()))
-    normalize_postcode = lambda values: {re.sub(r"\s+", "", value) for value in values}
-    if primary_postcodes and len(linked_postcodes) == 1 and normalize_postcode(primary_postcodes).isdisjoint(normalize_postcode(linked_postcodes)):
-        return False
-    # A different numbered street is a hard conflict only when both sides
-    # provide street-like evidence; floor/unit numbers elsewhere are ignored.
-    street_pattern = re.compile(r"\b(\d+[A-Z]?(?:\s*-\s*\d+[A-Z]?)?)\s+([A-Z][A-Z'’-]+(?:\s+[A-Z][A-Z'’-]+){0,3})\s+(?:STREET|ST|ROAD|RD|LANE|LN|SQUARE|SQ|AVENUE|AVE|PLACE|PL|COURT|CT|WAY)\b", re.I)
-    primary_streets = {(m.group(1).lower(), re.sub(r"\W+", "", m.group(2).lower())) for m in street_pattern.finditer(primary)}
-    linked_streets = {(m.group(1).lower(), re.sub(r"\W+", "", m.group(2).lower())) for m in street_pattern.finditer(linked_text)}
-    if primary_streets and linked_streets and primary_streets.isdisjoint(linked_streets):
-        return False
-    return True
 
 
 def _merge(prop: Property, extraction: BrochureExtraction) -> None:

@@ -19,7 +19,8 @@ load_dotenv()
 import storage
 from extraction import address_lookup, geocode as geocode_module, html_images, memlog, pdf_images, xlsx_links
 from extraction.naming import make_unique_names
-from extraction.models import AssetType
+from extraction.assets import merge_candidate_urls, validate_image_url
+from extraction.models import AssetType, LinkDiagnostic
 from extraction.pipeline import BATCH_DEADLINE_SECONDS, process_files
 from spreadsheet import write_xlsx
 
@@ -616,51 +617,77 @@ def _attach_pdf_images(records, source_path, pages_text, batch_dir, batch_id, na
     return jobs
 
 
-def _finalize_high_res_images(records, batch_dir, batch_id, name):
-    """Generic counterpart to _attach_pdf_images for rules (e.g.
-    extraction.rules.gpe) that can't tell in advance whether a listing has
-    one real photo or several, so they stash candidate URLs on
-    "_high_res_candidates" instead of setting High Res Images directly.
-    Unlike the PDF case, these URLs are already externally hosted (e.g.
-    GPE's own assets-gbr.mkt.dynamics.com images) — nothing to download or
-    re-host, only a gallery page to build when there's more than one.
+def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url):
+    """Validate, deduplicate and publish property-photo candidates.
 
-    Same page-cell constraint as the PDF path: 2+ candidates get a small
-    self-contained gallery (reusing pdf_images.build_gallery_html, which is
-    agnostic to whether the image URLs it embeds are ours or external),
-    exactly 1 links directly. Records that share the exact same candidate
-    list (e.g. every floor of one building) share one gallery file instead
-    of a duplicate.
-
-    Returns the (storage_key, local_path) pairs for the caller to upload,
-    same convention as _attach_pdf_images — only the generated gallery HTML
-    needs uploading here, never the candidate images themselves."""
+    Validation is bounded and cached once per canonical URL. Invalid,
+    inaccessible, decorative, and non-image resources can never produce a
+    successful gallery. Internal batch assets were just written locally and
+    are verified by their file write, so they do not make a loopback request.
+    """
     jobs = []
     gallery_url_by_candidates = {}
     gallery_count = 0
+    validation_cache = {}
 
     for record in records:
-        candidates = record.pop("_high_res_candidates", None)
-        if not candidates:
+        raw_candidates = record.pop("_high_res_candidates", None)
+        existing_image = str(record.get("High Res Images") or "")
+        if not raw_candidates and existing_image and ".html" not in existing_image.lower():
+            raw_candidates = [existing_image]
+        if not raw_candidates:
+            if not existing_image:
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
+                )
+            continue
+        candidates = merge_candidate_urls(raw_candidates)
+        diagnostics = record.setdefault("_link_diagnostics", [])
+        diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED", detail=f"{len(candidates)} candidate(s)"))
+        valid = []
+        rejected = []
+        for candidate in candidates:
+            if "/api/download?" in candidate:
+                result = {"ok": True, "url": candidate, "status": "VALID_LOCAL_IMAGE"}
+            else:
+                result = image_validator(candidate, cache=validation_cache)
+            if result.get("ok"):
+                resolved = result.get("url") or candidate
+                if resolved not in valid:
+                    valid.append(resolved)
+            else:
+                rejected.append((candidate, result.get("status") or "IMAGE_REJECTED"))
+        for candidate, status in rejected:
+            diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail="Candidate was excluded from High Res Images."))
+        if not valid:
+            record["High Res Images"] = ""
+            diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
 
-        key = tuple(candidates)
+        key = tuple(valid)
         if key not in gallery_url_by_candidates:
-            if len(candidates) == 1:
-                gallery_url_by_candidates[key] = candidates[0]
+            if len(valid) == 1:
+                gallery_url_by_candidates[key] = valid[0]
             else:
                 gallery_count += 1
                 gallery_filename = f"{name}_photos{gallery_count}.html"
-                gallery_html = pdf_images.build_gallery_html(record.get("Building") or name, candidates)
-                (batch_dir / gallery_filename).write_text(gallery_html, encoding="utf-8")
-                jobs.append((f"{batch_id}/{gallery_filename}", batch_dir / gallery_filename))
-                gallery_url_by_candidates[key] = _download_url(batch_id, gallery_filename)
+                gallery_path = batch_dir / gallery_filename
+                try:
+                    gallery_html = pdf_images.build_gallery_html(record.get("Building") or name, valid)
+                    gallery_path.write_text(gallery_html, encoding="utf-8")
+                    if gallery_path.exists() and gallery_path.stat().st_size and gallery_html.count("<img") >= len(valid):
+                        jobs.append((f"{batch_id}/{gallery_filename}", gallery_path))
+                        gallery_url_by_candidates[key] = _download_url(batch_id, gallery_filename)
+                    else:
+                        raise ValueError("generated gallery did not contain every validated image")
+                except Exception as exc:
+                    diagnostics.append(LinkDiagnostic("GALLERY_CREATION_FAILED", detail=str(exc)))
+                    continue
 
         record["High Res Images"] = gallery_url_by_candidates[key]
+        diagnostics.append(LinkDiagnostic("GALLERY_CREATED" if len(valid) > 1 else "DIRECT_IMAGE_ASSIGNED", final_url=record["High Res Images"], detail=f"{len(valid)} validated image(s)"))
 
     return jobs
-
-
 def _materialize_brochure_assets(records, batch_dir, batch_id, name):
     """Persist classified embedded brochure visuals after batch URLs exist."""
     jobs = []

@@ -92,9 +92,13 @@ field name rather than positional column index.
 - `FieldProvenance`: source, method, confidence, original value, and optional
   source document. It describes why a value exists without changing the public
   spreadsheet schema.
-- `AssetCandidate`: URL and discovery context (source, MIME type, filename,
-  anchor/alt text, page), classification/confidence, and optional embedded
-  content/hash/extension for brochure visuals awaiting application hosting.
+- `AssetCandidate`: original/final URL, source file/provider/section/block,
+  nearest-property and row/cell/container context, surrounding text, discovery
+  method, association confidence, dimensions/repetition, validation status,
+  classification/confidence, and optional embedded content/hash/extension.
+- `LinkDiagnostic`: resolution, resource typing, identity decision, source
+  context, validation/gallery outcome, original/final URL, and human-readable
+  detail for one linked-resource decision.
 - `BrochureResource`: retrieved bytes, response content type, and final URL
   after redirects.
 - `ExtractedValue` and `BrochureExtraction`: typed secondary field evidence
@@ -222,14 +226,14 @@ The deterministic asset process is:
 
 `extraction.assets.AssetType` currently includes `BROCHURE`, `FLOORPLAN`,
 `PROPERTY_IMAGE`, `LOGO`, `MAP`, `DECORATIVE`, the legacy
-`TRACKING_OR_DECORATIVE`, and `UNKNOWN`.
+`DOCUMENT_PREVIEW`, `TRACKING_OR_DECORATIVE`, and `UNKNOWN`.
 
-Classification uses filename, URL path, MIME type, link text, and image alt text.
-Strong floorplan, brochure, logo, map, and decorative/tracking terms take
-priority over generic image-extension classification. A remaining recognised
-image becomes a property-image candidate; an unrecognised candidate remains
-`UNKNOWN`. Provider-specific rules may supply stronger layout context, while
-generic HTML/XLSX/PDF helpers filter known low-trust or non-content assets.
+Classification uses filename, URL path, MIME type, link text, alt text,
+surrounding/container text, dimensions, repetition, and structural association
+confidence. Strong floorplan, brochure, logo, map, document-preview, and
+decorative/tracking signals take priority. An image extension or MIME type alone
+does not make a property photograph: positive property context or a strong
+record association is required; otherwise the candidate remains `UNKNOWN`.
 
 Semantic conflicts become validation issues rather than silent category reuse.
 Classification is deterministic but heuristic; ambiguous assets can still
@@ -259,19 +263,23 @@ pages, HTTP access/not-found/rate-limit/server errors, timeouts, SSL/DNS errors,
 and anti-bot responses produce a structured skip/failure diagnostic while the
 primary property remains usable.
 
-Before merge, hard property-identity conflicts are checked using available
-postcode and numbered-street evidence. A mismatching destination is rejected
-with `LINK_IDENTITY_MISMATCH`; ambiguous evidence is not invented. Successful
-enrichment is merged into a copy of the property and published atomically, so
+Before any linked fields or media merge, `extraction.identity` emits exactly
+`MATCH`, `PROBABLE_MATCH`, `AMBIGUOUS`, or `HARD_CONFLICT` using postcode,
+numbered-street, building-name, and structural-association evidence. Both
+`AMBIGUOUS` and `HARD_CONFLICT` are rejected; structural confidence can support
+a generic landing page but can never override an explicit address conflict.
+Successful enrichment is merged into a copy of the property and published atomically, so
 an unexpected failure cannot expose a partially changed record. Strong primary
 values still take precedence and credible conflicts still enter QA Review.
 
 Internal observability records `LINK_RESOLVED`, `LINK_REDIRECT_RESOLVED`,
 `LINK_RESOURCE_PDF`, `LINK_RESOURCE_HTML`, `LINK_RESOURCE_IMAGE`,
 `LINK_UNSUPPORTED`, `LINK_ACCESS_DENIED`, `LINK_NOT_FOUND`, `LINK_TIMEOUT`,
-`LINK_RATE_LIMITED`, `LINK_IDENTITY_MISMATCH`, `LINK_ENRICHMENT_SKIPPED`,
-`LINK_ENRICHMENT_SUCCESS`, and `LINK_ENRICHMENT_FAILED`. Spreadsheet users see
-only warnings that are meaningful for review.
+`LINK_RATE_LIMITED`, all four `LINK_IDENTITY_*` decisions,
+`LINK_ENRICHMENT_SKIPPED`, `LINK_ENRICHMENT_SUCCESS`, and
+`LINK_ENRICHMENT_FAILED`. Media finalisation also records discovery, rejection,
+inaccessibility, direct assignment, and gallery success/failure. These records
+are surfaced in `QA Review` without changing the Listings schema.
 
 Brochure media is collection-oriented: every relevant HTML image (including
 lazy-load, responsive `srcset`, and social-preview attributes) and every
@@ -283,10 +291,11 @@ application performs one final gallery pass. Classified floorplans remain on a
 separate path to `Floor Plan`; they are never passed to the photo gallery.
 
 The application materialises embedded brochure assets before gallery
-generation. This ordering is important: the gallery therefore receives the
-complete deduplicated list, and its HTML emits one image element for every
-candidate supplied. A broken remote image can fail independently in the
-browser without preventing the remaining gallery entries from rendering.
+generation. It validates each canonical external image URL once per finalisation
+pass with bounded requests, content-type and image decoding, size checks, and
+redirect preservation. Rejected links never enter a successful gallery. A
+gallery is published only after its file exists and contains every validated
+image; otherwise the output stays blank and QA records the reason.
 
 Public document-viewer pages are resolved at the hosting-platform layer. For
 example, a public Google Drive PDF viewer is converted to its public document
@@ -363,8 +372,8 @@ column order.
 
 `QA Review` makes structural uncertainty visible before downstream upload. Each
 row records source file, property/building, field, issue, severity, extracted
-value, and suggested action. It receives the `ValidationIssue` objects
-serialised by `Property.to_record()`.
+value, and suggested action. It receives the `ValidationIssue` objects and structured linked-media
+ diagnostics serialised with each record.
 
 Warnings and errors indicate that human review is required; informational rows
 describe recoverable optional-enrichment failures without setting review status.
@@ -460,9 +469,10 @@ operational results or safe degradation.
   background threads to avoid extending request latency.
 - Gunicorn worker recycling bounds cumulative memory growth.
 
-Remote validation is conservative and bounded. The service does not fetch every
-external URL merely to prove content type, because doing so would increase
-latency, quota/resource usage, and exposure to unavailable/dynamic pages.
+Remote validation is conservative, bounded, and cached per canonical URL.
+Linked documents are fetched only during optional enrichment; external photo
+URLs are fetched during media finalisation because invalid photos must not be
+published as successful galleries.
 
 ## 16. Caching
 
@@ -536,8 +546,8 @@ or avoided.
   availability, and external service responses.
 - Generic automatic structured ingestion of every landlord, agent, or property
   page is incomplete; dynamic or access-controlled pages may be unavailable.
-- URL validation is primarily syntactic/semantic and intentionally does not
-  fetch every remote resource to verify content type.
+- External image validation is bounded and cached, but remote servers can still
+  change or expire after workbook generation.
 - Scanned/image-only PDFs without extractable text are rejected; no general OCR
   stage is implemented.
 - Asset classification is heuristic and ambiguous assets may need review.
@@ -580,15 +590,19 @@ or avoided.
 
 ## 21. Architecture invariants
 
-1. Every exported property retains its original source provenance.
-2. Provider-specific and generic extraction enter shared downstream validation.
-3. Brochures, floorplans, and property images are distinct semantic asset types.
-4. A URL must not silently occupy incompatible asset categories.
-5. Strong source data must not be silently replaced by weaker enrichment.
-6. A conflicting building number must never provide a postcode for another property.
-7. Recoverable enrichment failures must not unnecessarily destroy primary extraction.
-8. Missing or uncertain important data produces diagnostics rather than disappearing silently.
-9. Spreadsheet output is mapped semantically and preserves the expected `Listings` schema.
-10. New providers reuse shared pipeline stages rather than bypassing them.
-11. Reproduced bug classes are preserved with regression tests.
-12. Documentation must not claim features or verification unsupported by code and the latest test run.
+1. A linked resource must not enrich a property until property identity is validated.
+2. Content belonging to another property must never be merged.
+3. Logos, branding, tracking graphics, document previews, and decorative assets must not become property photographs.
+4. Multiple distinct valid property photographs must not be collapsed into one.
+5. `Brochure PDF`, `Floor Plan`, and `High Res Images` are separate semantic outputs.
+6. A failed or inaccessible optional linked source must not damage the primary extraction.
+7. A blank media cell must be explainable by diagnostics.
+8. Provider-specific and generic extraction results use the same downstream identity, media, and validation pipeline.
+9. No successful gallery link may point to an empty or known-broken gallery.
+10. New providers inherit these protections through the canonical `Property` pipeline.
+11. Every exported property retains its original source provenance.
+12. Strong source data must not be silently replaced by weaker enrichment.
+13. A conflicting building number must never provide a postcode for another property.
+14. Spreadsheet output is mapped semantically and preserves the expected `Listings` schema.
+15. Reproduced bug classes are preserved with regression tests.
+16. Documentation must not claim features or verification unsupported by code and the latest test run.

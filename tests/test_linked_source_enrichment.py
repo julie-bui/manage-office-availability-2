@@ -147,7 +147,7 @@ def test_unrelated_property_page_is_rejected_before_any_merge():
     html = b"""<h1>Other House, 99 Different Road, London W1A 1AA</h1>
       <h2>Amenities</h2><p>Unrelated gym</p><img src='/other.jpg' alt='Office'>"""
     enriched = run(property_record(), BrochureResource(html, "text/html", LINK, LINK))
-    assert "LINK_IDENTITY_MISMATCH" in statuses(enriched)
+    assert "LINK_IDENTITY_HARD_CONFLICT" in statuses(enriched)
     assert not enriched.values["Special Features"]
     assert not enriched.assets
 

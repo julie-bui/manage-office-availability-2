@@ -106,12 +106,33 @@ def parse(content):
 
     building_names = {r.get("Building") for r in records if r.get("Building")}
     photo_by_building = _photo_by_building(content, building_names)
+    property_link_by_building = _property_link_by_building(content, building_names)
     for record in records:
-        candidates = photo_by_building.get(record.get("Building"))
+        building = record.get("Building")
+        candidates = photo_by_building.get(building)
         if candidates:
             record["_high_res_candidates"] = candidates
+        property_link = property_link_by_building.get(building)
+        if property_link:
+            # Brochure PDF is the established linked-property-source column;
+            # actual resource typing happens after retrieval and may resolve
+            # this HTML property page to a brochure, floorplan, and/or photos.
+            record["Brochure PDF"] = property_link
 
     return records
+
+
+def _property_link_by_building(content, building_names):
+    """Map exact building-name anchors to their own property-page URL."""
+    building_by_lower = {name.lower(): name for name in building_names}
+    result = {}
+    for kind, text, url in content.get("html_items", []):
+        if kind != "link" or not url:
+            continue
+        canonical = building_by_lower.get((text or "").strip().lower())
+        if canonical and canonical not in result:
+            result[canonical] = url
+    return result
 
 
 def _photo_by_building(content, building_names):

@@ -160,13 +160,13 @@ def test_html_brochure_discovers_lazy_responsive_and_preview_images():
     result = extract_brochure(html, "text/html", "https://property.example.test/listing/1")
     urls = {asset.url for asset in result.assets if asset.classification == AssetType.PROPERTY_IMAGE}
     assert urls == {
-        "https://property.example.test/preview.jpg",
         "https://property.example.test/reception.jpg",
         "https://property.example.test/reception-small.jpg",
         "https://property.example.test/reception-large.jpg",
         "https://property.example.test/terrace.webp",
         "https://property.example.test/terrace@2x.webp",
     }
+    assert next(asset for asset in result.assets if asset.url.endswith("preview.jpg")).classification == AssetType.DOCUMENT_PREVIEW
 
 
 def test_public_google_drive_pdf_viewer_exposes_downloadable_brochure_candidate():
@@ -289,21 +289,25 @@ def test_embedded_brochure_assets_are_hosted_by_classification(tmp_path):
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
     assert len(jobs) == 2
-    assert record["Floor Plan"].endswith(".png")
+    assert ".png?" in record["Floor Plan"]
     assert len(record["_high_res_candidates"]) == 1
     assert "logo" not in " ".join(path.name for _, path in jobs)
 
 
-def test_gallery_generator_renders_every_candidate_including_after_broken_url(tmp_path):
+def test_gallery_generator_excludes_broken_url_and_keeps_valid_candidates(tmp_path):
     candidates = [f"https://img.example.test/{number}.jpg" for number in range(1, 6)]
     candidates[2] = "https://img.example.test/broken.jpg"
     record = {"Building": "Five Photo House", "High Res Images": candidates[0], "_high_res_candidates": candidates}
+    def validate(url, cache=None):
+        return {"ok": "broken" not in url, "url": url, "status": "LINK_EXPIRED_OR_INACCESSIBLE" if "broken" in url else "VALID_IMAGE"}
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
-        jobs = app_module._finalize_high_res_images([record], tmp_path, "batch", "Example")
+        jobs = app_module._finalize_high_res_images([record], tmp_path, "batch", "Example", image_validator=validate)
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img ") == 5
-    assert all(url in gallery for url in candidates)
+    assert gallery.count("<img ") == 4
+    assert candidates[2] not in gallery
+    assert all(url in gallery for url in candidates if url != candidates[2])
+    assert any(item.status == "LINK_EXPIRED_OR_INACCESSIBLE" for item in record["_link_diagnostics"])
 
 
 def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorplan_separate(tmp_path):
@@ -320,9 +324,9 @@ def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorp
     }
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
-        app_module._finalize_high_res_images([record], tmp_path, "batch", "Example")
+        app_module._finalize_high_res_images([record], tmp_path, "batch", "Example", image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"})
     assert len(jobs) == 3
-    assert record["Floor Plan"].endswith(".png")
+    assert ".png?" in record["Floor Plan"]
     gallery_path = next(tmp_path.glob("*_photos*.html"))
     gallery = gallery_path.read_text(encoding="utf-8")
     assert gallery.count("<img ") == 3
