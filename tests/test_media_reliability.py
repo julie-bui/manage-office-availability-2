@@ -514,3 +514,32 @@ def test_dense_spreadsheet_triggers_chunking_before_row_threshold():
     rows = [[f"Building {i}", "Floor", "100 desks", "£10,000", "feature " * 80] for i in range(35)]
     assert is_large_spreadsheet({"tables": [rows]})
     assert not is_large_spreadsheet({"tables": [[["Building", "Floor"], ["1 Small Street", "1st"]]]})
+
+
+def test_next_image_wrapper_normalizes_to_underlying_asset():
+    wrapped = (
+        "https://knotel.com/_next/image?url="
+        "https%3A%2F%2Fknotel.directus.app%2Fassets%2Fabc123&w=1080&q=75"
+    )
+    assert normalize_url(wrapped) == "https://knotel.directus.app/assets/abc123"
+    assert merge_candidate_urls([
+        wrapped,
+        "https://knotel.com/_next/image?url=https%3A%2F%2Fknotel.directus.app%2Fassets%2Fabc123&w=256&q=75",
+        "https://knotel.directus.app/assets/other",
+    ]) == [
+        "https://knotel.directus.app/assets/abc123",
+        "https://knotel.directus.app/assets/other",
+    ]
+
+
+def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
+    from extraction.html_images import is_brochure_link
+
+    assert is_brochure_link("CLICK HERE", "https://app.box.com/s/abc")
+    assert is_brochure_link("9-10 Market Place", "https://us.list-manage.com/track")
+    assert is_brochure_link("", "https://drive.google.com/file/d/abc/view")
+    assert not is_brochure_link("unsubscribe", "https://example.com/unsubscribe")
+    assert not is_brochure_link(
+        "unsubscribe",
+        "https://metspace.us13.list-manage.com/unsubscribe?u=1&id=2",
+    )

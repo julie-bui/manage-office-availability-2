@@ -179,6 +179,18 @@ def test_public_google_drive_pdf_viewer_exposes_downloadable_brochure_candidate(
     ]
 
 
+def test_metspace_style_drive_viewer_without_pdf_in_title_still_exposes_download():
+    """MetSpace Drive titles omit '.pdf'; mime hint is only inside <script>."""
+    viewer = b"""<html><head><title>9-10 Market Place - 2nd Floor - Google Drive</title></head>
+      <body><script>window.config={\"docs-dm\":\"application/pdf\"}</script>
+      <img src="/preview.png" alt="preview"></body></html>"""
+    result = extract_brochure(viewer, "text/html", "https://drive.google.com/file/d/metspace_file_id/view")
+    brochure_assets = [asset for asset in result.assets if asset.classification == AssetType.BROCHURE]
+    assert [asset.url for asset in brochure_assets] == [
+        "https://drive.usercontent.google.com/download?id=metspace_file_id&export=download"
+    ]
+
+
 def test_direct_pdf_brochure_extracts_text_and_embedded_photo():
     import fitz
     from PIL import Image

@@ -239,6 +239,9 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(payload, "lxml")
+    # Resolve Drive/docs download targets BEFORE stripping <script> — the
+    # public PDF mime hint for MetSpace-style Drive viewers lives there.
+    hosted_documents = _hosted_document_candidates(soup, source_document, raw_html=payload)
     for node in soup(["script", "style", "noscript"]):
         node.decompose()
     candidates = []
@@ -270,7 +273,6 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
             src = urljoin(source_document, meta.get("content") or "")
             if src:
                 candidates.append(AssetCandidate(src, source_document, mime_type="image/*", original_url=meta.get("content"), final_url=src, anchor_text="page preview image", filename=urlparse(src).path.rsplit("/", 1)[-1], discovery_method="html_metadata"))
-    hosted_documents = _hosted_document_candidates(soup, source_document)
     if hosted_documents:
         # Viewer thumbnails are document previews, not independent property
         # photographs. The downloaded document below supplies the real,
@@ -303,22 +305,27 @@ def _srcset_urls(value: str) -> List[str]:
     return [part.strip().split()[0] for part in value.split(",") if part.strip()]
 
 
-def _hosted_document_candidates(soup, source_document: str) -> List[AssetCandidate]:
+def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
     """Resolve public document-viewer pages to their downloadable document.
 
     This is based on the hosting platform, never the property provider.  A
     Google Drive viewer deliberately exposes only a single preview bitmap in
     its HTML; the actual public PDF is required for multi-page media discovery.
+
+    Confirmed real (2026-07, MetSpace Mailchimp → Drive): listing titles are
+    like "9-10 Market Place - 2nd Floor - Google Drive" with NO ".pdf" in the
+    title, and the `"docs-dm":"application/pdf"` hint lives only inside a
+    <script> block. _extract_html strips script/style before this runs, so the
+    old title/docs-dm gate silently returned no download candidate and High
+    Res stayed blank despite a public PDF existing. Always expose the
+    usercontent download URL for /file/d/{id} viewers; nested retrieve then
+    keeps only real PDF/image payloads.
     """
     parsed = urlparse(source_document)
     if parsed.hostname not in {"drive.google.com", "docs.google.com"}:
         return []
     match = re.search(r"/file/d/([\w-]+)", parsed.path)
     if not match:
-        return []
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    page_text = str(soup)
-    if ".pdf" not in title.lower() and '"docs-dm":"application/pdf"' not in page_text:
         return []
     file_id = match.group(1)
     url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
@@ -420,19 +427,25 @@ def _evidence(value, source_document, confidence):
     return ExtractedValue(value, "brochure", source_document, "deterministic:brochure", confidence)
 
 
-def _needs_photo_enrichment(prop: Property) -> bool:
-    """True when the listing still has no property-photo candidates from the
-    uploaded file itself. Linked-source enrichment should try these first so
-    a shared batch deadline is spent where High Res would otherwise stay blank
-    (MetSpace weekly, Union-like sheets) rather than only deepening galleries
-    for buildings that already have email-card photos (typical GPE)."""
+def _source_photo_count(prop: Property) -> int:
     values = prop.values
-    if values.get("_source_high_res_candidates"):
-        return False
-    if values.get("_high_res_candidates"):
-        return False
+    candidates = list(values.get("_source_high_res_candidates") or [])
+    candidates.extend(values.get("_high_res_candidates") or [])
     existing = str(values.get("High Res Images") or "").strip()
-    return not existing
+    if existing and ".html" not in existing.lower():
+        candidates.insert(0, existing)
+    return len({str(url).split("?", 1)[0] for url in candidates if url})
+
+
+def _photo_enrichment_priority(prop: Property) -> int:
+    """Lower runs first. Blank High Res (MetSpace) before single featured
+    images (Knotel) before galleries that already meet the 2+ target."""
+    count = _source_photo_count(prop)
+    if count <= 0:
+        return 0
+    if count < 2:
+        return 1
+    return 2
 
 
 def enrich_properties(
@@ -442,14 +455,15 @@ def enrich_properties(
     deadline: float = None,
 ) -> List[Property]:
     properties = list(properties)
-    # Visit listings with no source photos first so a shared enrichment
-    # deadline is spent where High Res would otherwise stay blank. Props are
-    # mutated in place; the returned list keeps the caller's original order.
+    # Visit listings with no/few source photos first so a shared enrichment
+    # deadline is spent where High Res would otherwise stay blank or stuck
+    # on one featured image. Props are mutated in place; the returned list
+    # keeps the caller's original order.
     fetch_order = [
         prop
         for _, prop in sorted(
             enumerate(properties),
-            key=lambda item: (0 if _needs_photo_enrichment(item[1]) else 1, item[0]),
+            key=lambda item: (_photo_enrichment_priority(item[1]), item[0]),
         )
     ]
     cache = {}

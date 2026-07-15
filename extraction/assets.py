@@ -43,6 +43,18 @@ def normalize_url(url: str) -> str:
         return ""
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return ""
+    # Confirmed real (2026-07, Knotel property pages): Next.js serves
+    # Directus assets via /_next/image?url=<encoded>&w=… — keep the underlying
+    # asset URL so gallery dedupe/validation see one real photo, not five
+    # resized wrappers of the same image.
+    if "/_next/image" in (parsed.path or "").lower():
+        from urllib.parse import unquote
+
+        inner = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("url")
+        if inner:
+            unwrapped = normalize_url(unquote(inner))
+            if unwrapped:
+                return unwrapped
     query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in _TRACKING_KEYS | _RENDITION_KEYS]
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, parsed.params, urlencode(query), ""))
 

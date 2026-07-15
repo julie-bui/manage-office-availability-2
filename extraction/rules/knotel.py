@@ -259,7 +259,14 @@ def parse(content):
                     "Contacts": contact,
                     "Brochure PDF": _best_brochure_link(group),
                     "Floor Plan": group.get("floorplan", ""),
+                    # Featured email photo plus later knotel.com page photos
+                    # land in _high_res_candidates so app.py can build a
+                    # multi-image gallery (same path as GPE), not a single
+                    # direct High Res URL that enrichment never expands.
                     "High Res Images": group.get("highres", ""),
+                    "_high_res_candidates": (
+                        [group["highres"]] if group.get("highres") else []
+                    ),
                 }
             )
         i += 1

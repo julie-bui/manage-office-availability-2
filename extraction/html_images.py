@@ -53,7 +53,20 @@ _IMAGE_EXTENSION_RE = re.compile(r"\.(?:png|jpe?g|gif|webp)(?:[?#]|$)", re.IGNOR
 _NON_CONTENT_URL_RE = re.compile(r"logo", re.IGNORECASE)
 
 _FLOORPLAN_TEXT_RE = re.compile(r"floor\s*plan", re.IGNORECASE)
-_BROCHURE_TEXT_RE = re.compile(r"brochure|view\s*propert|property\s*details|particulars", re.IGNORECASE)
+# Visible labels are often generic ("CLICK HERE", building name, blank) even
+# when the href is a real brochure/Drive/property page — MetSpace building-
+# name links and Union "CLICK HERE" cells are the confirmed cases.
+_BROCHURE_TEXT_RE = re.compile(
+    r"brochure|view\s*propert|property\s*details|particulars|click\s*here|"
+    r"view\s*listing|website|download|more\s*info|landlord|full\s*details",
+    re.IGNORECASE,
+)
+_DOCUMENT_URL_RE = re.compile(
+    r"(?:drive\.google\.com|docs\.google\.com|dropbox\.com|/file/d/|"
+    r"\.pdf(?:[?#]|$)|list-manage\.com|usercontent\.google\.com|"
+    r"box\.com/s/)",
+    re.IGNORECASE,
+)
 
 # Confirmed real (2026-07, The Workplace Company): a source can give
 # multiple link candidates for the same listing under different labels
@@ -93,8 +106,17 @@ def is_floorplan_link(text):
     return bool(_FLOORPLAN_TEXT_RE.search(text or ""))
 
 
-def is_brochure_link(text):
-    return bool(_BROCHURE_TEXT_RE.search(text or ""))
+def is_brochure_link(text, url=""):
+    """True when link text OR the destination URL looks like a property
+    brochure / particulars / Drive document — not only when the visible
+    label literally says 'Brochure'."""
+    if _BROCHURE_TEXT_RE.search(text or ""):
+        return True
+    lowered = (url or "").lower()
+    # Mailchimp footers share list-manage.com with real listing trackers.
+    if any(token in lowered for token in ("unsubscribe", "/profile?", "update%20your%20preferences", "preferences")):
+        return False
+    return bool(_DOCUMENT_URL_RE.search(url or ""))
 
 
 # Real network fetch, so bounded to a short timeout — a slow/unreachable
@@ -210,7 +232,7 @@ def _collect(html_items):
         elif kind == "link":
             if floorplan_url is None and is_floorplan_link(a):
                 floorplan_url = b
-            elif brochure_url is None and is_brochure_link(a):
+            elif brochure_url is None and is_brochure_link(a, b):
                 brochure_url = b
     return images, floorplan_url, brochure_url
 
