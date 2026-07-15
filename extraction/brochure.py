@@ -420,6 +420,21 @@ def _evidence(value, source_document, confidence):
     return ExtractedValue(value, "brochure", source_document, "deterministic:brochure", confidence)
 
 
+def _needs_photo_enrichment(prop: Property) -> bool:
+    """True when the listing still has no property-photo candidates from the
+    uploaded file itself. Linked-source enrichment should try these first so
+    a shared batch deadline is spent where High Res would otherwise stay blank
+    (MetSpace weekly, Union-like sheets) rather than only deepening galleries
+    for buildings that already have email-card photos (typical GPE)."""
+    values = prop.values
+    if values.get("_source_high_res_candidates"):
+        return False
+    if values.get("_high_res_candidates"):
+        return False
+    existing = str(values.get("High Res Images") or "").strip()
+    return not existing
+
+
 def enrich_properties(
     properties: Iterable[Property],
     fetcher: Callable = fetch_brochure,
@@ -427,8 +442,18 @@ def enrich_properties(
     deadline: float = None,
 ) -> List[Property]:
     properties = list(properties)
+    # Visit listings with no source photos first so a shared enrichment
+    # deadline is spent where High Res would otherwise stay blank. Props are
+    # mutated in place; the returned list keeps the caller's original order.
+    fetch_order = [
+        prop
+        for _, prop in sorted(
+            enumerate(properties),
+            key=lambda item: (0 if _needs_photo_enrichment(item[1]) else 1, item[0]),
+        )
+    ]
     cache = {}
-    for prop in properties:
+    for prop in fetch_order:
         raw_url = str(prop.values.get("Brochure PDF") or "").strip()
         brochure_url = normalize_url(raw_url)
         if raw_url and not brochure_url:
@@ -442,12 +467,12 @@ def enrich_properties(
         # repeated across several rows (one per floor) shares the exact
         # same Brochure PDF URL, fetched/extracted once and cached. This
         # deadline check used to run before the cache lookup below, so
-        # once the (deliberately short, ~15s) enrichment budget for the
-        # whole file was used up by the FIRST row's own real network
-        # fetch, every later row sharing that already-cached URL got
-        # skipped too -- even though reusing a cache hit costs nothing
-        # and there was no real budget reason to skip it. Only a genuinely
-        # new fetch (not yet in cache) is gated on the deadline now.
+        # once the enrichment budget for the whole file was used up by the
+        # FIRST row's own real network fetch, every later row sharing that
+        # already-cached URL got skipped too -- even though reusing a cache
+        # hit costs nothing and there was no real budget reason to skip it.
+        # Only a genuinely new fetch (not yet in cache) is gated on the
+        # deadline now.
         if brochure_url not in cache and deadline is not None and time.monotonic() >= deadline:
             _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
             prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))

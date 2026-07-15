@@ -368,3 +368,99 @@ def test_brochure_fetch_does_not_start_after_deadline(monkeypatch):
             deadline=time.monotonic() - 1,
         )
     assert error.value.status == "LINK_ENRICHMENT_SKIPPED"
+
+
+def test_gallery_creation_failure_falls_back_to_first_image(tmp_path, monkeypatch):
+    urls = ["https://img.test/a.jpg", "https://img.test/b.jpg"]
+    record = {
+        "Building": "Two Photo House",
+        "_source_high_res_candidates": urls,
+        "_high_res_candidates": urls,
+    }
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app_module.pdf_images, "build_gallery_html", boom)
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"},
+        )
+    assert jobs == []
+    assert record["High Res Images"] == urls[0]
+    statuses = [item.status for item in record["_link_diagnostics"]]
+    assert "GALLERY_CREATION_FAILED" in statuses
+    assert "DIRECT_IMAGE_ASSIGNED" in statuses
+    assert any("fell back" in (item.detail or "") for item in record["_link_diagnostics"])
+
+
+def test_enrichment_prioritizes_listings_without_source_photos():
+    """Budget should prefer blank High Res rows over deepening existing photos."""
+    fetched = []
+
+    def fetch(url):
+        fetched.append(url)
+        return BrochureResource(b"<html>Example House, 1 Example Street, EC1A 1AA</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        return BrochureExtraction(
+            final_url,
+            assets=[classify_candidate(AssetCandidate(f"{final_url}/photo.jpg", final_url, alt_text="Office"))],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    already_has_photo = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "High Res Images": "https://source.test/card.jpg",
+            "_source_high_res_candidates": ["https://source.test/card.jpg"],
+            "Brochure PDF": "https://property.test/has-photo",
+        }),
+        "mixed.eml", "Mixed", "rule:test",
+    )
+    needs_photo = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "Brochure PDF": "https://property.test/needs-photo",
+        }),
+        "mixed.eml", "Mixed", "rule:test",
+    )
+
+    result = enrich_properties(
+        [already_has_photo, needs_photo],
+        fetcher=fetch,
+        extractor=extract,
+    )
+    assert fetched[0] == "https://property.test/needs-photo"
+    assert fetched[1] == "https://property.test/has-photo"
+    # Original caller order is preserved in the returned list.
+    assert result[0] is already_has_photo
+    assert result[1] is needs_photo
+
+
+def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
+    """Solo uploads with free batch time must not be hard-capped at 15s."""
+    path = next(Path(".").glob("Fw_ The latest GPE Fully Managed availability*.eml"))
+    captured = {}
+
+    def fake_enrich(properties, **kwargs):
+        captured["deadline"] = kwargs.get("deadline")
+        return list(properties)
+
+    monkeypatch.setattr(pipeline.brochure, "enrich_properties", fake_enrich)
+    monkeypatch.setattr(pipeline, "_geocode_records", lambda *_args: (False, False))
+
+    batch_deadline = time.monotonic() + 80
+    result = pipeline.process_files(
+        [path],
+        deadline=batch_deadline,
+        brochure_enrichment=True,
+    )[0]
+    assert result["status"] == "ok"
+    assert captured["deadline"] == pytest.approx(batch_deadline - 20, abs=0.5)
+    # Old behaviour: min(deadline-20, now+15) ≈ batch_deadline-65 for an 80s
+    # batch. New behaviour keeps deadline-20 (~60s of enrichment headroom).
+    assert captured["deadline"] > batch_deadline - 30

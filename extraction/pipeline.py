@@ -398,7 +398,20 @@ def process_files(
         ]
 
         if brochure_enrichment:
-            enrichment_deadline = min(deadline - 20, time.monotonic() + 15)
+            # Confirmed real (GPE, MetSpace, 2026-07): this used to hard-cap
+            # at time.monotonic() + 15 no matter how much of the overall
+            # batch deadline was actually free -- so even a SOLO upload with
+            # 80+ free seconds still only gave linked-source enrichment 15
+            # seconds total. A file with several distinct buildings each
+            # needing their own real network fetch (a property page, plus up
+            # to 2 nested document fetches) routinely burns through that in
+            # the FIRST building alone, leaving every other building in the
+            # file to hit "budget exhausted" regardless of whether it's a
+            # repeat building or a brand-new one. Now scales with whatever's
+            # actually left of the real deadline (reserving 20s for image
+            # validation/writing the file afterward) instead of an arbitrary
+            # small constant that ignored genuinely available headroom.
+            enrichment_deadline = deadline - 20
             kwargs = {}
             if brochure_fetcher is not None:
                 kwargs["fetcher"] = brochure_fetcher

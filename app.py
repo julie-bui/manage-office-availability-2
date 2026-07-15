@@ -718,11 +718,26 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     else:
                         raise ValueError("generated gallery did not contain every validated image")
                 except Exception as exc:
+                    # Confirmed real (2026-07, GPE multi-photo buildings): a
+                    # failed gallery write used to leave High Res blank even
+                    # though validated candidates already existed. Fall back
+                    # to the first validated URL so a gallery failure never
+                    # erases source/linked photos.
                     diagnostics.append(LinkDiagnostic("GALLERY_CREATION_FAILED", detail=str(exc)))
-                    continue
+                    gallery_url_by_candidates[key] = valid[0]
 
         record["High Res Images"] = gallery_url_by_candidates[key]
-        diagnostics.append(LinkDiagnostic("GALLERY_CREATED" if len(valid) > 1 else "DIRECT_IMAGE_ASSIGNED", final_url=record["High Res Images"], detail=f"{len(valid)} validated image(s)"))
+        if len(valid) == 1:
+            status, detail = "DIRECT_IMAGE_ASSIGNED", "1 validated image(s)"
+        elif record["High Res Images"] == valid[0]:
+            # Gallery write failed; public cell keeps the first validated URL.
+            status, detail = (
+                "DIRECT_IMAGE_ASSIGNED",
+                f"Gallery creation failed; fell back to first of {len(valid)} validated image(s).",
+            )
+        else:
+            status, detail = "GALLERY_CREATED", f"{len(valid)} validated image(s)"
+        diagnostics.append(LinkDiagnostic(status, final_url=record["High Res Images"], detail=detail))
 
     return jobs
 def _materialize_brochure_assets(records, batch_dir, batch_id, name):
