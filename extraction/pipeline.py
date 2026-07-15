@@ -19,6 +19,7 @@ from .models import FieldProvenance, ProcessingReport, Property, RawDocument
 from .naming import area_from_records, extract_area_hint, resolve_provider_name, resolve_source_date
 from .rules import try_rules
 from .schema import normalize_record, street_address_only
+from .spreadsheet_chunks import extract_in_chunks, is_large_spreadsheet, is_spreadsheet
 from .validation import validate_properties
 
 # Confirmed via a real Render SIGKILL (2026-07, "UNION - Availability -
@@ -181,6 +182,7 @@ def process_files(
             "row_links": None,
             "processing_report": None,
             "properties": [],
+            "spreadsheet_diagnostics": None,
         }
         memlog.log("before file parsing", filename)
         try:
@@ -258,11 +260,37 @@ def process_files(
         if raw_records:
             result["method"] = f"rule:{rule_name}"
             report.record("EXTRACTION", "PASS", f"rule:{rule_name}", len(raw_records))
+            if rule_name == "Spreadsheet Blocks":
+                blocks = len({((r.get("_spreadsheet_block") or {}).get("sheet"), (r.get("_spreadsheet_block") or {}).get("address_row")) for r in raw_records})
+                result["spreadsheet_diagnostics"] = {
+                    "property_blocks_detected": blocks,
+                    "deterministic_blocks_parsed": blocks,
+                    "llm_blocks_required": 0,
+                    "final_records": len(raw_records),
+                    "largest_llm_prompt_chars": 0,
+                    "largest_llm_response_chars": 0,
+                    "failed_chunks": [],
+                }
+                report.record("SPREADSHEET_STRUCTURE_DETECTED", "PASS", "Repeated address/header blocks", blocks)
+                report.record("PROPERTY_BLOCKS_FOUND", "PASS", item_count=blocks)
+                report.record("DETERMINISTIC_BLOCKS_PARSED", "PASS", item_count=blocks)
+                report.record("LLM_BLOCKS_REQUIRED", "PASS", item_count=0)
         else:
             memlog.log("before LLM call", filename)
             try:
-                raw_records, llm_source_name = extract_with_llm(content["text"], source_hint=filename)
-                result["method"] = "llm"
+                if is_spreadsheet(content) and is_large_spreadsheet(content):
+                    raw_records, llm_source_name, diagnostics = extract_in_chunks(content, source_hint=filename)
+                    result["method"] = "llm:chunked"
+                    result["spreadsheet_diagnostics"] = diagnostics
+                    report.record("LARGE_FILE_CHUNKED", "PASS", item_count=diagnostics["chunks"])
+                    report.record("LLM_CHUNK_SUCCESS", "PASS", item_count=diagnostics["successful_chunks"])
+                    if diagnostics["failed_chunks"]:
+                        report.record("LLM_CHUNK_FAILED", "WARNING", item_count=len(diagnostics["failed_chunks"]))
+                        report.record("PARTIAL_EXTRACTION", "WARNING", "Successful chunks retained", len(raw_records))
+                        result["warning"] = "Some spreadsheet sections could not be extracted; successful sections are included. Please review this output for missing rows."
+                else:
+                    raw_records, llm_source_name = extract_with_llm(content["text"], source_hint=filename)
+                    result["method"] = "llm"
                 report.record("EXTRACTION", "PASS", "llm fallback", len(raw_records))
             except LLMExtractionError as e:
                 memlog.log("after LLM call (raised LLMExtractionError)", filename)
@@ -295,9 +323,9 @@ def process_files(
         # Generic asset/brochure discovery belongs in the pipeline, before
         # typed properties and validation.  These helpers only fill blanks,
         # so dedicated provider rules retain priority.
-        if result["method"] == "llm" and content.get("html_items"):
+        if (result["method"] or "").startswith("llm") and content.get("html_items"):
             html_images.enrich_records(normalized, content["html_items"])
-        if result["method"] == "llm" and content.get("row_links"):
+        if (result["method"] or "").startswith("llm") and content.get("row_links"):
             xlsx_links.enrich_records(normalized, content["row_links"])
 
         # Resolved before geocoding (rather than after, as before) so the

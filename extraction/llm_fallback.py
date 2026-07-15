@@ -65,7 +65,13 @@ class LLMExtractionError(Exception):
     pass
 
 
-def extract_with_llm(text, source_hint=""):
+def extract_with_llm(
+    text,
+    source_hint="",
+    max_output_tokens=MAX_OUTPUT_TOKENS,
+    retry_malformed=False,
+    include_metrics=False,
+):
     """Returns (records, source_name). source_name is the LLM's best guess at
     the sender/broker/company this document is from (used to name the output
     spreadsheet), or "" if it couldn't confidently tell."""
@@ -75,6 +81,8 @@ def extract_with_llm(text, source_hint=""):
             "No GEMINI_API_KEY set — cannot use the LLM fallback for this file. "
             "Add it to your .env file (see README)."
         )
+
+    max_output_tokens = max(512, min(int(max_output_tokens), MAX_OUTPUT_TOKENS))
 
     try:
         from google import genai
@@ -100,7 +108,7 @@ def extract_with_llm(text, source_hint=""):
                 model=MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    max_output_tokens=max_output_tokens,
                     response_mime_type="application/json",
                     # Keep the token budget for the actual JSON response,
                     # not hidden reasoning — max_output_tokens caps both
@@ -193,9 +201,21 @@ def extract_with_llm(text, source_hint=""):
         raise LLMExtractionError(f"Gemini API call failed [{type(e).__module__}.{type(e).__name__}]: {e}")
 
     raw = response.text or ""
-    records, source_name = _parse_and_validate(raw)
+    try:
+        records, source_name = _parse_and_validate(raw)
+    except LLMExtractionError:
+        if not retry_malformed:
+            raise
+        # Retry one bounded malformed chunk; never repair or repeat a giant request.
+        response = quota.call_with_overload_retry(
+            lambda: call_with_timeout(_call, CALL_TIMEOUT_SECONDS), label=f"{source_hint} retry"
+        )
+        raw = response.text or ""
+        records, source_name = _parse_and_validate(raw)
     if not records:
         raise LLMExtractionError("LLM returned no usable records for this file")
+    if include_metrics:
+        return records, source_name, {"prompt_chars": len(prompt), "response_chars": len(raw)}
     return records, source_name
 
 

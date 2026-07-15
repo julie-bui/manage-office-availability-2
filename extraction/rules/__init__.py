@@ -8,7 +8,7 @@ Each module exposes:
 The pipeline tries each rule's detect() in order and uses the first match's
 parse(). If none match, it falls back to the LLM.
 """
-from . import knotel, metspace, workplace_plus, gpe, bc, breezblok, grid
+from . import knotel, metspace, workplace_plus, gpe, bc, breezblok, spreadsheet_blocks, grid
 from ..rule_sanity import records_look_plausible
 
 RULES = [
@@ -18,6 +18,7 @@ RULES = [
     ("GPE", gpe),
     ("BC", bc),
     ("Breezblok", breezblok),
+    ("Spreadsheet Blocks", spreadsheet_blocks),
     ("Grid/Tabular", grid),
 ]
 

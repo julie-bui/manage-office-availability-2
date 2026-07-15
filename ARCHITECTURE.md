@@ -606,3 +606,15 @@ or avoided.
 14. Spreadsheet output is mapped semantically and preserves the expected `Listings` schema.
 15. Reproduced bug classes are preserved with regression tests.
 16. Documentation must not claim features or verification unsupported by code and the latest test run.
+
+## 22. Large spreadsheet reliability
+
+Large workbooks are never flattened into one unbounded AI extraction request. The rule registry first tries deterministic parsers, including the generic repeated-block parser in `extraction.rules.spreadsheet_blocks`. It recognizes postcode/address rows followed by semantic headers (`Unit/Floor`, `Sq Ft`, `Desks`, `Term`, `Per Month`), permits a variable number of availability rows, and retains source sheet/row context.
+
+Hyperlinks are associated inside the detected property boundary using their source sheet and row. They are not globally collected or assigned by document order. A block-level brochure may therefore serve sibling floor rows from the same property, but cannot leak into the next property block.
+
+If an unknown large spreadsheet has no usable deterministic structure, `extraction.spreadsheet_chunks` divides it into bounded row groups with a small overlap. Limits apply independently to rows, input characters, expected records, and output tokens. Each chunk uses structured JSON output, receives at most one malformed-output retry, and is validated before aggregation. Duplicate overlap records are removed by stable property/floor/size/price identity. A failed chunk is recorded while successful chunks are preserved and the file is clearly marked as a partial extraction; all chunks failing remains a file-level error.
+
+Processing reports expose `SPREADSHEET_STRUCTURE_DETECTED`, `PROPERTY_BLOCKS_FOUND`, `DETERMINISTIC_BLOCKS_PARSED`, `LLM_BLOCKS_REQUIRED`, `LARGE_FILE_CHUNKED`, `LLM_CHUNK_SUCCESS`, `LLM_CHUNK_FAILED`, and `PARTIAL_EXTRACTION` as applicable. Diagnostics also record chunk counts, failures, and largest prompt/response sizes.
+
+**Invariant:** No large file should depend on a single unbounded LLM response for all extracted records.

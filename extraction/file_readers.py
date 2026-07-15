@@ -79,6 +79,7 @@ def _empty(**overrides):
         "pages_text": [],
         "size_warning": None,
         "row_links": [],
+        "sheet_names": [],
     }
     base.update(overrides)
     return base
@@ -245,7 +246,7 @@ def _read_xlsx(path):
     except Exception:
         row_links = []
 
-    return _empty(text="\n".join(text_parts), tables=tables, row_links=row_links)
+    return _empty(text="\n".join(text_parts), tables=tables, row_links=row_links, sheet_names=list(sheets))
 
 
 def _extract_xlsx_row_links(path):
@@ -275,7 +276,7 @@ def _extract_xlsx_row_links(path):
     wb = load_workbook(path, data_only=True)
     row_links = []
     for ws in wb.worksheets:
-        for row in ws.iter_rows():
+        for row_number, row in enumerate(ws.iter_rows(), start=1):
             links = [
                 (str(cell.value).strip() if cell.value is not None else "", cell.hyperlink.target)
                 for cell in row
@@ -284,7 +285,14 @@ def _extract_xlsx_row_links(path):
             if not links:
                 continue
             row_text = " | ".join(str(cell.value) for cell in row if cell.value not in (None, ""))
-            row_links.append({"row_text": row_text, "links": links})
+            row_links.append(
+                {
+                    "sheet_name": ws.title,
+                    "row_number": row_number,
+                    "row_text": row_text,
+                    "links": links,
+                }
+            )
     return row_links
 
 
