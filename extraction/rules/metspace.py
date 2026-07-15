@@ -163,9 +163,10 @@ def _attach_floor_plans(records, html_items):
 
     Confirmed by actually viewing several of these images that every one
     is a floor plan diagram, not a building photo. Goes into Floor Plan,
-    not High Res Images, for that reason; High Res Images is deliberately
-    left blank for MetSpace since no second, genuinely-photo image exists
-    per listing in this source.
+    not High Res Images, for that reason. High Res Images is filled later
+    by brochure.enrich_properties from the building-name Brochure PDF link
+    (Mailchimp tracker → Google Drive PDF page embeds) — that is the only
+    reliable photo source for this weekly template.
 
     Direction confirmed directly against this source's raw HTML (not
     inherited from Knotel or GPE): each image FOLLOWS the listing link it

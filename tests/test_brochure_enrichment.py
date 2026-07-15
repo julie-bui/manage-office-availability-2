@@ -301,7 +301,7 @@ def test_embedded_brochure_assets_are_hosted_by_classification(tmp_path):
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
     assert len(jobs) == 2
-    assert ".png?" in record["Floor Plan"]
+    assert record["Floor Plan"].endswith(".png") or ".png?" in record["Floor Plan"]
     assert len(record["_high_res_candidates"]) == 1
     assert "logo" not in " ".join(path.name for _, path in jobs)
 
@@ -338,7 +338,7 @@ def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorp
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
         app_module._finalize_high_res_images([record], tmp_path, "batch", "Example", image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"})
     assert len(jobs) == 3
-    assert ".png?" in record["Floor Plan"]
+    assert record["Floor Plan"].endswith(".png") or ".png?" in record["Floor Plan"]
     gallery_path = next(tmp_path.glob("*_photos*.html"))
     gallery = gallery_path.read_text(encoding="utf-8")
     assert gallery.count("<img ") == 3

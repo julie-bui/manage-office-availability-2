@@ -462,10 +462,12 @@ def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
         brochure_enrichment=True,
     )[0]
     assert result["status"] == "ok"
-    assert captured["deadline"] == pytest.approx(batch_deadline - 20, abs=0.5)
+    assert captured["deadline"] == pytest.approx(batch_deadline - 10, abs=0.5)
     # Old behaviour: min(deadline-20, now+15) ≈ batch_deadline-65 for an 80s
-    # batch. New behaviour keeps deadline-20 (~60s of enrichment headroom).
-    assert captured["deadline"] > batch_deadline - 30
+    # batch. Current behaviour keeps deadline-10 so brochure enrichment (the
+    # path that actually fills High Res for MetSpace/UNION/Workplace Plus
+    # sheets) gets most of the remaining batch headroom.
+    assert captured["deadline"] > batch_deadline - 20
 
 
 def test_workplace_plus_address_accepts_manchester_and_other_cities():

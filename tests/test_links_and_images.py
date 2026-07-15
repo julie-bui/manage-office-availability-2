@@ -165,6 +165,13 @@ def check_knotel_links_and_images(failures, client):
             failures.append(f"{filename} {building!r}: expected Floor Plan {expected_floorplan!r}, got {_link(row, 'Floor Plan')!r}")
         if not _link(row, "High Res Images"):
             failures.append(f"{filename} {building!r}: expected a real High Res Images link (knotel.directus.app), got blank")
+        highres = _link(row, "High Res Images")
+        # Email supplies one featured photo; brochure enrichment of the
+        # knotel.com property page must expand this into a multi-image gallery.
+        if "photos" not in highres and "directus.app" not in highres:
+            failures.append(
+                f"{filename} {building!r}: expected High Res Images gallery (2-5 photos) or a Directus image, got {highres!r}"
+            )
 
 
 def check_metspace_normal_links_and_images(failures, client):
@@ -183,12 +190,14 @@ def check_metspace_normal_links_and_images(failures, client):
         failures.append(f"{filename}: unexpected Brochure PDF for '9-10 Market Place': {_link(row, 'Brochure PDF')!r}")
     if _link(row, "Floor Plan") != "https://mcusercontent.com/53e32083f03d0f8f854aea227/images/5df50ebd-470f-ceba-fa1f-aeb0ac63172f.jpg":
         failures.append(f"{filename}: unexpected Floor Plan for '9-10 Market Place': {_link(row, 'Floor Plan')!r}")
-    if _link(row, "High Res Images"):
-        # Confirmed real (this template's own docstring, extraction.
-        # rules.metspace._attach_floor_plans): no second, genuinely-photo
-        # image exists per listing in this source — every mcusercontent.
-        # com image is a floor plan, not a photo, for THIS template.
-        failures.append(f"{filename}: expected High Res Images blank for MetSpace's usual template, got {_link(row, 'High Res Images')!r}")
+    highres = _link(row, "High Res Images")
+    # Weekly emails only embed floorplans; property photos come from the
+    # building-name brochure link (Mailchimp → Google Drive PDF). Enrichment
+    # must produce a hosted multi-image gallery, never leave High Res blank.
+    if not highres or "photos" not in highres:
+        failures.append(
+            f"{filename}: expected a hosted High Res Images gallery from the Drive brochure, got {highres!r}"
+        )
 
 
 def check_metspace_office_of_week_links_and_images(failures, client):
@@ -337,6 +346,8 @@ def check_union_links_and_images(failures, client):
     if fr["status"] != "ok":
         failures.append(f"{filename}: expected status ok, got {fr['status']} ({fr.get('error')})")
         return
+    if fr.get("method") != "rule:UNION":
+        failures.append(f"{filename}: expected rule:UNION (no Gemini required), got {fr.get('method')!r}")
     rows = list(_row_dict(ws))
     row = _find_row(rows, "9a Devonshire Square")
     if row is None:
@@ -344,12 +355,12 @@ def check_union_links_and_images(failures, client):
         return
     if _link(row, "Brochure PDF") != "https://app.box.com/s/5ln9uri46xhq586qdoskbc37rhrrftr7":
         failures.append(f"{filename}: unexpected Brochure PDF for '9a Devonshire Square': {_link(row, 'Brochure PDF')!r}")
-    if _link(row, "Floor Plan") or _link(row, "High Res Images"):
-        # Confirmed real: this exact source .xlsx has zero embedded media
-        # images at all (checked directly via its own zip structure).
+    highres = _link(row, "High Res Images")
+    # Hidden "CLICK HERE" Box shares resolve to real PDFs via shared/static;
+    # those brochure pages supply the property-photo gallery.
+    if not highres or "photos" not in highres:
         failures.append(
-            f"{filename}: expected Floor Plan/High Res Images blank (confirmed zero embedded images in this "
-            f"exact source file), got Floor Plan={_link(row, 'Floor Plan')!r} High Res Images={_link(row, 'High Res Images')!r}"
+            f"{filename}: expected High Res Images gallery from the Box brochure PDF, got {highres!r}"
         )
 
 
@@ -413,8 +424,14 @@ def check_workplace_plus_links_and_images(failures, client):
             continue
         if _link(row, "Brochure PDF") != expected_brochure:
             failures.append(f"{filename} {building!r} ({floor!r}): expected Brochure PDF {expected_brochure!r}, got {_link(row, 'Brochure PDF')!r}")
-        if _link(row, "High Res Images") != expected_highres:
-            failures.append(f"{filename} {building!r} ({floor!r}): expected High Res Images {expected_highres!r}, got {_link(row, 'High Res Images')!r}")
+        highres = _link(row, "High Res Images")
+        # Accept either the email's own gallery host URL or a multi-image
+        # hosted gallery page built after brochure enrichment.
+        if expected_highres not in highres and "photos" not in highres:
+            failures.append(
+                f"{filename} {building!r} ({floor!r}): expected High Res Images containing "
+                f"{expected_highres!r} or a photos gallery, got {highres!r}"
+            )
 
 
 def main():

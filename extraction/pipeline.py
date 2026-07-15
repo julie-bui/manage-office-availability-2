@@ -417,7 +417,7 @@ def process_files(
             # actually left of the real deadline (reserving 20s for image
             # validation/writing the file afterward) instead of an arbitrary
             # small constant that ignored genuinely available headroom.
-            enrichment_deadline = deadline - 20
+            enrichment_deadline = deadline - 10
             kwargs = {}
             if brochure_fetcher is not None:
                 kwargs["fetcher"] = brochure_fetcher

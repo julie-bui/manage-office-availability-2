@@ -3,7 +3,8 @@
 Brochures are secondary evidence.  Failure is isolated per brochure and a
 strong primary value is never silently replaced.
 """
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import hashlib
 import ipaddress
@@ -32,10 +33,15 @@ from .models import (
     ValidationIssue,
 )
 
-MAX_BROCHURE_BYTES = 20 * 1024 * 1024
+# Raised from 20MB after confirming real UNION Box shared brochures arrive
+# as ~22MB PDFs via app.box.com/shared/static/{id}.pdf — the previous
+# hard cap skipped those downloads and left High Res blank despite a
+# real public PDF existing behind the "CLICK HERE" cell.
+MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
+_ENRICHMENT_FETCH_WORKERS = 3
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -69,6 +75,14 @@ class LinkedResourceError(Exception):
 def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> BrochureResource:
     current = url
     redirects = []
+    # Confirmed real (2026-07, UNION): app.box.com/s/{id} is a JS viewer shell
+    # with no usable photos. The same share id downloads as a public PDF at
+    # /shared/static/{id}.pdf — jump straight there so enrichment does not
+    # burn a round-trip (and ~20s) on the useless HTML page per listing.
+    box_shared = _box_shared_name(current)
+    if box_shared and "/shared/static/" not in (urlparse(current).path or ""):
+        current = f"https://app.box.com/shared/static/{box_shared}.pdf"
+        redirects.append(current)
     embedded_target = _embedded_http_target(url)
     if embedded_target and normalize_url(embedded_target) != normalize_url(url):
         current = embedded_target
@@ -86,7 +100,16 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
             request_timeout = timeout
         _validate_remote_url(current)
         try:
-            response = requests.get(current, timeout=request_timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
+            # Box landlord PDFs are often 15-25MB; give the static PDF path a
+            # longer per-request timeout than a normal HTML property page.
+            if "/shared/static/" in (urlparse(current).path or "") or _box_shared_name(current):
+                if deadline is not None:
+                    effective_timeout = min(25.0, max(0.5, deadline - time.monotonic()))
+                else:
+                    effective_timeout = max(float(timeout), 20.0)
+            else:
+                effective_timeout = request_timeout
+            response = requests.get(current, timeout=effective_timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
         except requests.Timeout as exc:
             raise LinkedResourceError("Linked resource timed out", "LINK_TIMEOUT", current) from exc
         except requests.RequestException as exc:
@@ -114,7 +137,7 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
         raise LinkedResourceError("Linked resource exceeded the redirect limit", "LINK_ENRICHMENT_FAILED", current)
     payload = response.content
     if len(payload) > MAX_BROCHURE_BYTES:
-        raise LinkedResourceError("Linked resource exceeds the 20MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
+        raise LinkedResourceError("Linked resource exceeds the 30MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
     return BrochureResource(payload, response.headers.get("Content-Type", ""), response.url or current, url, tuple(redirects))
 
 
@@ -320,16 +343,37 @@ def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = No
     Res stayed blank despite a public PDF existing. Always expose the
     usercontent download URL for /file/d/{id} viewers; nested retrieve then
     keeps only real PDF/image payloads.
+
+    Confirmed real (2026-07, UNION Box "CLICK HERE" cells): app.box.com/s/{id}
+    returns a JS shell with no usable images, but the same share id downloads
+    as a real PDF from app.box.com/shared/static/{id}.pdf. Without that
+    rewrite, brochure enrichment "succeeds" on decorative Box chrome and
+    High Res stays blank even though a public brochure PDF exists.
     """
     parsed = urlparse(source_document)
-    if parsed.hostname not in {"drive.google.com", "docs.google.com"}:
-        return []
-    match = re.search(r"/file/d/([\w-]+)", parsed.path)
-    if not match:
-        return []
-    file_id = match.group(1)
-    url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
-    return [AssetCandidate(url, source_document, mime_type="application/pdf", filename=f"{file_id}.pdf", anchor_text="Download brochure")]
+    host = (parsed.hostname or "").lower()
+    if host in {"drive.google.com", "docs.google.com"}:
+        match = re.search(r"/file/d/([\w-]+)", parsed.path)
+        if not match:
+            return []
+        file_id = match.group(1)
+        url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
+        return [AssetCandidate(url, source_document, mime_type="application/pdf", filename=f"{file_id}.pdf", anchor_text="Download brochure")]
+    if host.endswith("box.com"):
+        shared = _box_shared_name(source_document)
+        if not shared:
+            return []
+        url = f"https://app.box.com/shared/static/{shared}.pdf"
+        return [AssetCandidate(url, source_document, mime_type="application/pdf", filename=f"{shared}.pdf", anchor_text="Download brochure")]
+    return []
+
+
+def _box_shared_name(url: str) -> str:
+    parsed = urlparse(url)
+    if not (parsed.hostname or "").lower().endswith("box.com"):
+        return ""
+    match = re.search(r"/s/([A-Za-z0-9]+)", parsed.path or "")
+    return match.group(1) if match else ""
 
 
 def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[str]) -> List[AssetCandidate]:
@@ -346,8 +390,20 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
         return []
     extracted = []
     counts = Counter()
+    # Large landlord brochures (UNION Box ~22MB) can carry dozens of pages;
+    # keep the first stretch that usually holds the property photos and stop
+    # once we already have enough High Res candidates for the gallery target.
+    max_pages = 6 if len(payload) > 5 * 1024 * 1024 else len(document)
     try:
         for page_number, page in enumerate(document):
+            if page_number >= max_pages:
+                break
+            property_photos_so_far = sum(
+                1 for candidate in extracted
+                if candidate.classification in {AssetType.PROPERTY_IMAGE, AssetType.UNKNOWN}
+            )
+            if property_photos_so_far >= 5:
+                break
             for image in page.get_images(full=True):
                 try:
                     base = document.extract_image(image[0])
@@ -455,19 +511,13 @@ def enrich_properties(
     deadline: float = None,
 ) -> List[Property]:
     properties = list(properties)
-    # Visit listings with no/few source photos first so a shared enrichment
-    # deadline is spent where High Res would otherwise stay blank or stuck
-    # on one featured image. Props are mutated in place; the returned list
-    # keeps the caller's original order.
-    fetch_order = [
-        prop
-        for _, prop in sorted(
-            enumerate(properties),
-            key=lambda item: (_photo_enrichment_priority(item[1]), item[0]),
-        )
-    ]
-    cache = {}
-    for prop in fetch_order:
+    # Group by brochure URL first so each unique linked document is fetched
+    # once, then applied to every listing that shares it (Workplace Plus
+    # London has 231 rows / ~140 unique Drive PDFs — serial fetches under a
+    # shared deadline blanked High Res for the majority). Props keep the
+    # caller's original order in the returned list.
+    by_url = defaultdict(list)
+    for index, prop in enumerate(properties):
         raw_url = str(prop.values.get("Brochure PDF") or "").strip()
         brochure_url = normalize_url(raw_url)
         if raw_url and not brochure_url:
@@ -477,63 +527,135 @@ def enrich_properties(
             continue
         if not brochure_url:
             continue
-        # Confirmed real (2026-07, GPE "16 Dufour's Place"): a building
-        # repeated across several rows (one per floor) shares the exact
-        # same Brochure PDF URL, fetched/extracted once and cached. This
-        # deadline check used to run before the cache lookup below, so
-        # once the enrichment budget for the whole file was used up by the
-        # FIRST row's own real network fetch, every later row sharing that
-        # already-cached URL got skipped too -- even though reusing a cache
-        # hit costs nothing and there was no real budget reason to skip it.
-        # Only a genuinely new fetch (not yet in cache) is gated on the
-        # deadline now.
-        if brochure_url not in cache and deadline is not None and time.monotonic() >= deadline:
-            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
-            prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
+        by_url[brochure_url].append((index, prop, raw_url))
+
+    # Unique URLs ordered by photo-need: blank High Res first (MetSpace /
+    # Union / spreadsheet Drive rows), then single featured images
+    # (Knotel), then already-complete galleries last.
+    unique_urls = sorted(
+        by_url.keys(),
+        key=lambda url: min(_photo_enrichment_priority(prop) for _, prop, _ in by_url[url]),
+    )
+
+    pending = []
+    for brochure_url in unique_urls:
+        if deadline is not None and time.monotonic() >= deadline:
+            for _, prop, _ in by_url[brochure_url]:
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
+                prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             continue
-        try:
-            if brochure_url not in cache:
-                cache[brochure_url] = _retrieve(brochure_url, fetcher, extractor, deadline)
-            extraction = cache[brochure_url]
-            identity = compare_property_identity(prop.values, extraction.identity_text, association_confidence=1.0)
-            _record_diagnostic(
-                prop,
-                f"LINK_IDENTITY_{identity.decision.value}",
-                brochure_url,
-                extraction.source_document,
-                detail="; ".join(identity.reasons),
-                property_identity=property_key(prop.values),
-                identity_result=identity.decision.value,
-            )
-            prop.link_diagnostics.extend(extraction.diagnostics)
-            if identity.decision in {IdentityDecision.AMBIGUOUS, IdentityDecision.HARD_CONFLICT}:
-                label = "conflicts with" if identity.decision == IdentityDecision.HARD_CONFLICT else "could not be confidently matched to"
-                prop.add_issue(ValidationIssue("Brochure PDF", f"Linked property content {label} this property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
-                continue
-            # Merge into a copy, then publish the result as one atomic unit.
-            # An unexpected merge error cannot leave half-applied enrichment.
-            staged = deepcopy(prop)
-            _merge(staged, extraction)
-            prop.values = staged.values
-            prop.provenance = staged.provenance
-            prop.assets = staged.assets
-            prop.issues = staged.issues
-            prop.review_required = staged.review_required
-            _record_diagnostic(prop, "LINK_ENRICHMENT_SUCCESS", brochure_url, extraction.source_document, _diagnostic_resource_type(extraction))
-        except Exception as exc:
-            status = getattr(exc, "status", "LINK_ENRICHMENT_FAILED")
-            _record_diagnostic(prop, status, brochure_url, getattr(exc, "final_url", None), detail=str(exc))
-            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, getattr(exc, "final_url", None), detail="Primary extraction preserved unchanged.")
-            prop.add_issue(
-                ValidationIssue(
-                    "Brochure PDF",
-                    f"Linked-source enrichment was skipped: {exc}",
-                    Severity.INFO,
-                    brochure_url,
-                    "Primary extraction remains valid; review the linked source manually if needed.",
-                    "brochure_enrichment",
+        pending.append(brochure_url)
+
+    if not pending:
+        return properties
+
+    # Fetch in small waves and apply immediately. Holding every UNION Box
+    # PDF (~22MB) plus extracted page images in one giant cache (the old
+    # "fetch all, then merge" approach) blew past Render's free-tier RSS
+    # ceiling before spreadsheet write.
+    workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
+    wave_size = max(1, workers)
+
+    def _apply_result(brochure_url, extraction):
+        shared_embeds = None
+        for member_index, (_, prop, _raw_url) in enumerate(by_url[brochure_url]):
+            if isinstance(extraction, Exception):
+                exc = extraction
+                status = getattr(exc, "status", "LINK_ENRICHMENT_FAILED")
+                _record_diagnostic(prop, status, brochure_url, getattr(exc, "final_url", None), detail=str(exc))
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, getattr(exc, "final_url", None), detail="Primary extraction preserved unchanged.")
+                prop.add_issue(
+                    ValidationIssue(
+                        "Brochure PDF",
+                        f"Linked-source enrichment was skipped: {exc}",
+                        Severity.INFO,
+                        brochure_url,
+                        "Primary extraction remains valid; review the linked source manually if needed.",
+                        "brochure_enrichment",
+                    )
                 )
-            )
+                continue
+            try:
+                identity = compare_property_identity(prop.values, extraction.identity_text, association_confidence=1.0)
+                _record_diagnostic(
+                    prop,
+                    f"LINK_IDENTITY_{identity.decision.value}",
+                    brochure_url,
+                    extraction.source_document,
+                    detail="; ".join(identity.reasons),
+                    property_identity=property_key(prop.values),
+                    identity_result=identity.decision.value,
+                )
+                prop.link_diagnostics.extend(extraction.diagnostics)
+                if identity.decision in {IdentityDecision.AMBIGUOUS, IdentityDecision.HARD_CONFLICT}:
+                    label = "conflicts with" if identity.decision == IdentityDecision.HARD_CONFLICT else "could not be confidently matched to"
+                    prop.add_issue(ValidationIssue("Brochure PDF", f"Linked property content {label} this property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
+                    continue
+                staged = deepcopy(prop)
+                _merge(staged, extraction)
+                # One brochure URL can span many floors (UNION, Workplace Plus
+                # sheets). Keep heavy embedded bitmaps once and reuse the same
+                # candidate objects so 6 floors of HYLO don't each retain a
+                # private copy of the same 22MB PDF's photos.
+                embeds = staged.values.get("_brochure_embedded_assets") or []
+                if embeds:
+                    if shared_embeds is None:
+                        shared_embeds = embeds
+                    staged.values["_brochure_embedded_assets"] = shared_embeds
+                # Drop bitmap bytes from the general assets list; materialise
+                # only needs `_brochure_embedded_assets`.
+                for asset in staged.assets:
+                    if asset.content and (not shared_embeds or asset not in shared_embeds):
+                        asset.content = None
+                prop.values = staged.values
+                prop.provenance = staged.provenance
+                prop.assets = staged.assets
+                prop.issues = staged.issues
+                prop.review_required = staged.review_required
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SUCCESS", brochure_url, extraction.source_document, _diagnostic_resource_type(extraction))
+            except Exception as exc:
+                status = getattr(exc, "status", "LINK_ENRICHMENT_FAILED")
+                _record_diagnostic(prop, status, brochure_url, getattr(exc, "final_url", None), detail=str(exc))
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, getattr(exc, "final_url", None), detail="Primary extraction preserved unchanged.")
+                prop.add_issue(
+                    ValidationIssue(
+                        "Brochure PDF",
+                        f"Linked-source enrichment was skipped: {exc}",
+                        Severity.INFO,
+                        brochure_url,
+                        "Primary extraction remains valid; review the linked source manually if needed.",
+                        "brochure_enrichment",
+                    )
+                )
+
+    for wave_start in range(0, len(pending), wave_size):
+        if deadline is not None and time.monotonic() >= deadline:
+            for brochure_url in pending[wave_start:]:
+                for _, prop, _ in by_url[brochure_url]:
+                    _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
+                    prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
+            break
+        wave = pending[wave_start : wave_start + wave_size]
+        if len(wave) == 1:
+            brochure_url = wave[0]
+            try:
+                result = _retrieve(brochure_url, fetcher, extractor, deadline)
+            except Exception as exc:
+                result = exc
+            _apply_result(brochure_url, result)
+            continue
+        with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            futures = {
+                pool.submit(_retrieve, brochure_url, fetcher, extractor, deadline): brochure_url
+                for brochure_url in wave
+            }
+            for future in as_completed(futures):
+                brochure_url = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = exc
+                _apply_result(brochure_url, result)
     return properties
 
 
@@ -624,7 +746,11 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         _add_asset(prop, candidate)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
-        prop.values["_brochure_embedded_assets"] = embedded
+        # Cap how many embedded bitmaps we carry into materialisation — a
+        # single UNION Box brochure can easily embed dozens of page images.
+        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:5]
+        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN][:1]
+        prop.values["_brochure_embedded_assets"] = photos + plans
     # Keep at most five property photos per listing so brochure dumps cannot
     # flood High Res; the web layer targets 2-5 when photos exist.
     _MAX_PROPERTY_IMAGES = 5

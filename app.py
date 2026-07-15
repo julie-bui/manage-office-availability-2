@@ -848,8 +848,13 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
             existing_candidates.insert(0, existing)
         combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
-        if not existing or existing_candidates:
-            record["_high_res_candidates"] = combined
+        # Always publish merged candidates. A blank High Res with only
+        # embedded brochure bytes (MetSpace Drive / UNION Box / Workplace
+        # Plus spreadsheets) previously relied on `not existing` being
+        # true; a single email featured photo with no _high_res_candidates
+        # list also needs the embedded URLs merged in so finalize can
+        # build a 2-5 image gallery.
+        record["_high_res_candidates"] = combined
     return jobs
 
 
