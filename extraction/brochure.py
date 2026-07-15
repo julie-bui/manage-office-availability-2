@@ -66,7 +66,7 @@ class LinkedResourceError(Exception):
         self.final_url = final_url
 
 
-def fetch_brochure(url: str, timeout: float = 6.0) -> BrochureResource:
+def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> BrochureResource:
     current = url
     redirects = []
     embedded_target = _embedded_http_target(url)
@@ -74,9 +74,19 @@ def fetch_brochure(url: str, timeout: float = 6.0) -> BrochureResource:
         current = embedded_target
         redirects.append(embedded_target)
     for _ in range(MAX_REDIRECTS + 1):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                raise LinkedResourceError(
+                    "Linked enrichment skipped to preserve the request deadline",
+                    "LINK_ENRICHMENT_SKIPPED", current,
+                )
+            request_timeout = min(timeout, remaining)
+        else:
+            request_timeout = timeout
         _validate_remote_url(current)
         try:
-            response = requests.get(current, timeout=timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
+            response = requests.get(current, timeout=request_timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
         except requests.Timeout as exc:
             raise LinkedResourceError("Linked resource timed out", "LINK_TIMEOUT", current) from exc
         except requests.RequestException as exc:
@@ -233,6 +243,7 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
         node.decompose()
     candidates = []
     content_root = soup.find("main") or soup.find("article") or soup.body or soup
+    semantic_property_root = getattr(content_root, "name", None) in {"main", "article"}
     for image in content_root.find_all("img"):
         # Marketing platforms commonly keep the real image in a lazy-load
         # attribute or expose several responsive variants in srcset.  Keep
@@ -249,11 +260,11 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
             if src:
                 container = image.find_parent(["article", "section", "figure", "li", "div"])
                 context = container.get_text(" ", strip=True)[:600] if container else ""
-                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", original_url=raw_url, final_url=src, alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1], surrounding_text=context, html_container=getattr(container, "name", None), discovery_method="html_img", association_confidence=0.85 if container and container.name in {"article", "section", "figure"} else 0.55))
+                candidates.append(AssetCandidate(src, source_document, mime_type="image/*", original_url=raw_url, final_url=src, alt_text=image.get("alt"), filename=urlparse(src).path.rsplit("/", 1)[-1], surrounding_text=context, html_container=getattr(container, "name", None), discovery_method="html_img", association_confidence=0.85 if semantic_property_root or (container and container.name in {"article", "section", "figure"}) else 0.55))
     for source in content_root.find_all("source"):
         for raw_url in _srcset_urls(source.get("srcset") or source.get("data-srcset") or ""):
             src = urljoin(source_document, raw_url)
-            candidates.append(AssetCandidate(src, source_document, mime_type=source.get("type") or "image/*", original_url=raw_url, final_url=src, filename=urlparse(src).path.rsplit("/", 1)[-1], discovery_method="html_srcset", association_confidence=0.7))
+            candidates.append(AssetCandidate(src, source_document, mime_type=source.get("type") or "image/*", original_url=raw_url, final_url=src, filename=urlparse(src).path.rsplit("/", 1)[-1], discovery_method="html_srcset", association_confidence=0.85 if semantic_property_root else 0.7))
     for meta in soup.find_all("meta"):
         if (meta.get("property") or meta.get("name") or "").lower() in {"og:image", "twitter:image", "twitter:image:src"}:
             src = urljoin(source_document, meta.get("content") or "")
@@ -433,7 +444,7 @@ def enrich_properties(
             continue
         try:
             if brochure_url not in cache:
-                cache[brochure_url] = _retrieve(brochure_url, fetcher, extractor)
+                cache[brochure_url] = _retrieve(brochure_url, fetcher, extractor, deadline)
             extraction = cache[brochure_url]
             identity = compare_property_identity(prop.values, extraction.identity_text, association_confidence=1.0)
             _record_diagnostic(
@@ -477,8 +488,19 @@ def enrich_properties(
     return properties
 
 
-def _retrieve(url, fetcher, extractor):
-    resource = _coerce_resource(fetcher(url), url)
+def _fetch_resource(fetcher, url, deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise LinkedResourceError(
+            "Linked enrichment skipped to preserve the request deadline",
+            "LINK_ENRICHMENT_SKIPPED", url,
+        )
+    if fetcher is fetch_brochure:
+        return fetcher(url, deadline=deadline)
+    return fetcher(url)
+
+
+def _retrieve(url, fetcher, extractor, deadline=None):
+    resource = _coerce_resource(_fetch_resource(fetcher, url, deadline), url)
     resource_type = _resource_type(resource.payload, resource.content_type)
     combined = extractor(resource.payload, resource.content_type, resource.final_url)
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
@@ -486,8 +508,13 @@ def _retrieve(url, fetcher, extractor):
     # as a PDF link. Follow at most two unique document assets, once each.
     documents = [a.url for a in combined.assets if a.classification == AssetType.BROCHURE and a.url != resource.final_url][:2]
     for document_url in documents:
+        if deadline is not None and time.monotonic() >= deadline:
+            combined.warnings.append(
+                "Linked brochure document was skipped to preserve the request deadline."
+            )
+            break
         try:
-            nested = _coerce_resource(fetcher(document_url), document_url)
+            nested = _coerce_resource(_fetch_resource(fetcher, document_url, deadline), document_url)
             nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
             for field, value in nested_extraction.fields.items():

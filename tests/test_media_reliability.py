@@ -1,8 +1,11 @@
 from pathlib import Path
 from io import BytesIO
+import time
 
+import pytest
 from PIL import Image
 
+from extraction import brochure as brochure_module, pipeline
 from extraction.assets import classify_candidate, merge_candidate_urls, normalize_url, validate_image_url
 from extraction.identity import IdentityDecision, compare_property_identity
 from extraction.brochure import _embedded_http_target, enrich_properties
@@ -217,3 +220,91 @@ def test_responsive_renditions_of_same_image_deduplicate_but_distinct_paths_surv
         "https://img.test/media/terrace.jpg?width=1160&v=1",
     ])
     assert urls == ["https://img.test/media/office.jpg", "https://img.test/media/terrace.jpg"]
+
+
+def test_source_image_survives_failed_optional_image_validation(tmp_path):
+    source = "https://source.test/email-card.jpg"
+    external = "https://linked.test/gallery-extra.jpg"
+    record = {
+        "Building": "Example House",
+        "_source_high_res_candidates": [source],
+        "_high_res_candidates": [source, external],
+    }
+
+    def reject_external(url, cache=None):
+        assert url == external
+        return {"ok": False, "url": url, "status": "LINK_EXPIRED_OR_INACCESSIBLE"}
+
+    jobs = app_module._finalize_high_res_images(
+        [record], tmp_path, "batch", "Example", image_validator=reject_external
+    )
+    assert jobs == []
+    assert record["High Res Images"] == source
+
+
+def test_source_and_linked_images_create_gallery(tmp_path):
+    source = "https://source.test/email-card.jpg"
+    external = "https://linked.test/gallery-extra.jpg"
+    record = {
+        "Building": "Example House",
+        "_source_high_res_candidates": [source],
+        "_high_res_candidates": [source, external],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE"
+            },
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert source in gallery
+    assert external in gallery
+
+
+def test_deadline_skips_optional_image_but_keeps_source(tmp_path):
+    source = "https://source.test/metspace-photo.jpg"
+    external = "https://linked.test/extra.jpg"
+    record = {
+        "_source_high_res_candidates": [source],
+        "_high_res_candidates": [source, external],
+    }
+    jobs = app_module._finalize_high_res_images(
+        [record], tmp_path, "batch", "MetSpace",
+        image_validator=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("deadline must prevent optional network validation")
+        ),
+        deadline=time.monotonic() + 1,
+    )
+    assert jobs == []
+    assert record["High Res Images"] == source
+
+
+def test_gpe_core_extraction_skips_linked_fetch_near_deadline(monkeypatch):
+    path = next(Path(".").glob("Fw_ The latest GPE Fully Managed availability*.eml"))
+    monkeypatch.setattr(pipeline, "_geocode_records", lambda *_args: (False, True))
+
+    def must_not_fetch(_url):
+        raise AssertionError("optional linked fetch must not start near deadline")
+
+    result = pipeline.process_files(
+        [path], deadline=time.monotonic() + 19,
+        brochure_enrichment=True, brochure_fetcher=must_not_fetch,
+    )[0]
+    assert result["status"] == "ok"
+    assert result["record_count"] == 15
+    assert any(record.get("_source_high_res_candidates") for record in result["records"])
+
+
+def test_brochure_fetch_does_not_start_after_deadline(monkeypatch):
+    def must_not_request(*_args, **_kwargs):
+        raise AssertionError("expired optional fetch must not reach DNS/network")
+
+    monkeypatch.setattr(brochure_module.requests, "get", must_not_request)
+    with pytest.raises(brochure_module.LinkedResourceError) as error:
+        brochure_module.fetch_brochure(
+            "https://property.test/listing",
+            deadline=time.monotonic() - 1,
+        )
+    assert error.value.status == "LINK_ENRICHMENT_SKIPPED"

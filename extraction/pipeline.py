@@ -41,6 +41,11 @@ from .validation import validate_properties
 # attachment, spreadsheet writing — for this file and any others already
 # queued in the same batch.
 BATCH_DEADLINE_SECONDS = 100
+# Do not start another optional address/geocode operation unless there is
+# enough shared time for the longest bounded lookup (Gemini: 25s) plus a
+# small scheduling margin. Core extraction and spreadsheet writing win.
+OPTIONAL_LOOKUP_START_SECONDS = 30
+
 
 # A trailing postal district/area code with no inward part (e.g. "W1",
 # "SW1Y", "EC2V") — short enough to be a district code, not a full street
@@ -331,6 +336,19 @@ def process_files(
         # Resolved before geocoding (rather than after, as before) so the
         # web-search fallback can pass it along as disambiguating context
         # (e.g. "Elsley GPE Fully Managed" instead of just "Elsley").
+        # Snapshot every image supplied by the uploaded file before optional
+        # linked-source enrichment adds anything. The web layer trusts these
+        # source-derived candidates and must never blank them merely because
+        # an external validator is slow or unavailable.
+        for record in normalized:
+            source_images = list(record.get("_high_res_candidates") or [])
+            existing_image = str(record.get("High Res Images") or "").strip()
+            if existing_image:
+                source_images.insert(0, existing_image)
+            if source_images:
+                record["_source_high_res_candidates"] = list(dict.fromkeys(source_images))
+
+
         provider_name = resolve_provider_name(rule_name, filename, llm_source_name)
 
         # Create the canonical properties before secondary-source address
@@ -347,13 +365,22 @@ def process_files(
             )
             for record in normalized
         ]
+
         if brochure_enrichment:
+            enrichment_deadline = min(deadline - 20, time.monotonic() + 15)
             kwargs = {}
             if brochure_fetcher is not None:
                 kwargs["fetcher"] = brochure_fetcher
             if brochure_extractor is not None:
                 kwargs["extractor"] = brochure_extractor
-            kwargs["deadline"] = min(deadline - 15, time.monotonic() + 20)
+            kwargs["deadline"] = enrichment_deadline
+            if enrichment_deadline <= time.monotonic() + 1:
+                report.record(
+                    "BROCHURE_ENRICHMENT", "WARNING",
+                    "Optional linked-source enrichment skipped to preserve the request deadline.",
+                    len(properties),
+                )
+                kwargs["deadline"] = time.monotonic()
             properties = brochure.enrich_properties(properties, **kwargs)
             brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith(("brochure_", "linked_source_"))]
             report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} linked-source issue(s)" if brochure_issues else "Optional linked-source enrichment complete", len(properties))
@@ -574,7 +601,7 @@ def _geocode_records(records, filename, provider_name, deadline):
     daily_quota_hit = False
     deadline_hit = False
     for record in records:
-        if time.monotonic() >= deadline:
+        if deadline - time.monotonic() < OPTIONAL_LOOKUP_START_SECONDS:
             deadline_hit = True
             record["Lat"] = "Needs manual lookup"
             record["Lng"] = "Needs manual lookup"

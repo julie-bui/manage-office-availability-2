@@ -343,7 +343,7 @@ def process():
             # listing card). Turns 2+ into a small gallery page, 1 into a
             # direct link, same as the PDF path above.
             upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
-            upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name))
+            upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=batch_deadline))
 
             memlog.log("before spreadsheet write", r["filename"])
             write_xlsx(batch_dir / r["output_file"], r["records"], sheet_title=name)
@@ -630,7 +630,7 @@ def _is_local_download_url(url, batch_id):
     )
 
 
-def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url):
+def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
     Validation is bounded and cached once per canonical URL. Invalid,
@@ -645,6 +645,9 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
 
     for record in records:
         raw_candidates = record.pop("_high_res_candidates", None)
+        source_candidates = list(record.pop("_source_high_res_candidates", None) or [])
+        if source_candidates:
+            raw_candidates = source_candidates + list(raw_candidates or [])
         existing_image = str(record.get("High Res Images") or "")
         if not raw_candidates and existing_image and ".html" not in existing_image.lower():
             raw_candidates = [existing_image]
@@ -657,11 +660,17 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         candidates = merge_candidate_urls(raw_candidates)
         diagnostics = record.setdefault("_link_diagnostics", [])
         diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED", detail=f"{len(candidates)} candidate(s)"))
+        trusted = set(merge_candidate_urls(source_candidates))
         valid = []
         rejected = []
         for candidate in candidates:
-            if _is_local_download_url(candidate, batch_id):
-                result = {"ok": True, "url": candidate, "status": "VALID_LOCAL_IMAGE"}
+            if _is_local_download_url(candidate, batch_id) or candidate in trusted:
+                result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+            elif deadline is not None and time.monotonic() >= deadline - 5:
+                result = {
+                    "ok": False, "url": candidate,
+                    "status": "OPTIONAL_IMAGE_VALIDATION_SKIPPED",
+                }
             else:
                 result = image_validator(candidate, cache=validation_cache)
             if result.get("ok"):
