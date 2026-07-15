@@ -221,18 +221,12 @@ def check_metspace_office_of_week_links_and_images(failures, client):
         failures.append(f"{filename}: expected the real floor-plan diagram in Floor Plan, got {_link(row, 'Floor Plan')!r}")
     if _link(row, "High Res Images") != "https://mcusercontent.com/53e32083f03d0f8f854aea227/images/457d7a07-d10f-1ac4-67b3-61c9cf7308ff.jpg":
         failures.append(f"{filename}: expected the real interior photo in High Res Images, got {_link(row, 'High Res Images')!r}")
-    # KNOWN GAP (2026-07, not yet fixed): the building's own link text
-    # ("44 Pentonville Road") isn't recognized as a brochure link by
-    # extraction.html_images.is_brochure_link (which requires the link
-    # text to actually mention "brochure"/"particulars"/etc), so
-    # Brochure PDF stays blank here even though that link resolves to a
-    # real (if JS-viewer) Google Drive page. Pinned as the CURRENT real
-    # value, not the ideal one — update this the moment that gap is
-    # fixed, don't just delete the check.
-    if _link(row, "Brochure PDF"):
+    # Building-name anchors seed Brochure PDF via html_images enrichment
+    # (is_enrichment_seed_link) even when the visible text is not "brochure".
+    brochure = _link(row, "Brochure PDF")
+    if not brochure:
         failures.append(
-            f"{filename}: expected Brochure PDF still blank (known unfixed gap — see this check's own docstring), "
-            f"got {_link(row, 'Brochure PDF')!r} — if this is now populated, UPDATE this expectation, don't just delete it"
+            f"{filename}: expected Brochure PDF seeded from the building-name listing link, got blank"
         )
 
 

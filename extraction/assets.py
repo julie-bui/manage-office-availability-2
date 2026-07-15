@@ -27,6 +27,12 @@ _PROPERTY_RE = re.compile(
     r"breakout|kitchen|building|facade|fa?ade|gallery|hero|desk|lounge|property",
     re.I,
 )
+# CMS/CDN asset paths often omit a file extension (Directus /assets/{uuid}).
+_IMAGE_LIKE_PATH_RE = re.compile(
+    r"/assets?/|/media/|/digitalassets?/|/static/(?:img|images|media)/|"
+    r"/img/|/photos?/|/gallery/",
+    re.I,
+)
 _UNSTABLE_RE = re.compile(r"(?:^|[?&])(expires?|signature|token|x-amz-expires)=", re.I)
 MIN_PROPERTY_IMAGE_WIDTH = 320
 MIN_PROPERTY_IMAGE_HEIGHT = 200
@@ -117,10 +123,12 @@ def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
             classification, confidence = AssetType.BROCHURE, 0.84
         else:
             classification, confidence = AssetType.UNKNOWN, 0.2
-    elif extension in _IMAGE_EXTENSIONS or mime.startswith("image/"):
+    elif extension in _IMAGE_EXTENSIONS or mime.startswith("image/") or _IMAGE_LIKE_PATH_RE.search(parsed.path or ""):
         # Repetition alone does not make a strongly property-associated
         # brochure image decorative. The same photo is often reused on a
         # cover and an availability page; it still needs to reach the gallery.
+        # Extensionless /assets/ (and similar CDN) paths count as images by
+        # path evidence — never skip them solely because the host is new.
         if (
             candidate.occurrence_count > 1
             and candidate.association_confidence < 0.8

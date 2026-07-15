@@ -686,18 +686,21 @@ def _accept_image_url_under_deadline(url):
     batch_deadline; finalize marked every non-source URL
     OPTIONAL_IMAGE_VALIDATION_SKIPPED and left email-only singles. Trust
     image-like URLs already found during enrichment rather than erasing them.
+
+    Prefer path/extension evidence over a fixed CDN host allowlist so
+    unknown asset hosts survive the same way Directus/Cloudinary do.
     """
+    from extraction.html_images import is_image_like_url
+
     text = str(url or "").strip()
     if not text.lower().startswith(("http://", "https://")):
         return False
+    if is_image_like_url(text):
+        return True
     parsed = urlparse(text)
-    path = (parsed.path or "").lower()
-    if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
-        return True
     host = (parsed.netloc or "").lower()
-    if "directus" in host or "cloudinary" in host or "imgix" in host:
-        return True
-    if "/assets/" in path or "/image/" in path or "/images/" in path:
+    # Common image CDNs without a revealing path still host photos.
+    if any(token in host for token in ("cloudinary", "imgix", "cloudfront", "imagekit", "cdn")):
         return True
     return False
 

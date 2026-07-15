@@ -12,6 +12,11 @@ brochure/floor-plan URL through a hyperlink on a generic display cell
 ("CLICK HERE", "Landlord Brochure", "FLOOR PLAN") — invisible to the
 LLM's own text input, so Brochure PDF/Floor Plan came back blank for
 every row despite real links existing in the source.
+
+The same FLOOR-PLAN-labeled share is also filed as Brochure PDF when no
+separate brochure cell exists — otherwise High Res enrichment never
+fetches the landlord PDF. That dual-fill lives here so dedicated rules
+(UNION) and the LLM fallback path share one association helper.
 """
 import re
 
@@ -30,6 +35,36 @@ def _normalize_for_matching(text):
     — not because it didn't exist, but because "-  25" (source) never
     equals "- 25" (extracted) as raw substrings."""
     return _WHITESPACE_RE.sub(" ", text).strip().lower()
+
+
+def associate_row_links(links):
+    """Map one spreadsheet row's (display_text, url) pairs to fields.
+
+    Returns (floorplan_url_or_None, brochure_url_or_None).
+
+    Floor-plan-labeled cells still populate Floor Plan, and their URL is
+    ALSO a Brochure PDF candidate — hosts often put the only landlord
+    PDF behind "FLOOR PLAN" with no separate brochure label. Other
+    hyperlinks (CLICK HERE, Landlord Brochure, Website, …) are brochure
+    candidates regardless of display text: a per-row spreadsheet link
+    column has little of the unrelated-link noise that email bodies have.
+
+    When several brochure candidates exist, prefer domains that are not
+    known JS viewers (is_low_trust_link_domain); fall back to the first
+    candidate only when every option is low-trust.
+    """
+    floorplan_url = None
+    brochure_candidates = []
+    for display_text, url in links or []:
+        if not url:
+            continue
+        if is_floorplan_link(display_text):
+            if floorplan_url is None:
+                floorplan_url = url
+            brochure_candidates.append(url)
+        else:
+            brochure_candidates.append(url)
+    return floorplan_url, _best_brochure_candidate(brochure_candidates)
 
 
 def enrich_records(records, row_links):
@@ -81,16 +116,7 @@ def enrich_records(records, row_links):
         if match_idx is None:
             continue
         row = available.pop(match_idx)
-
-        floorplan_url = None
-        brochure_candidates = []
-        for display_text, url in row["links"]:
-            if is_floorplan_link(display_text):
-                if floorplan_url is None:
-                    floorplan_url = url
-            else:
-                brochure_candidates.append(url)
-        brochure_url = _best_brochure_candidate(brochure_candidates)
+        floorplan_url, brochure_url = associate_row_links(row["links"])
 
         if floorplan_url and not record.get("Floor Plan"):
             record["Floor Plan"] = floorplan_url

@@ -327,7 +327,9 @@ def test_source_and_linked_images_create_gallery(tmp_path):
 
 def test_deadline_skips_optional_image_but_keeps_source(tmp_path):
     source = "https://source.test/metspace-photo.jpg"
-    external = "https://linked.test/extra.jpg"
+    # Non-image-like optional URL must still be skipped under deadline;
+    # already-discovered image-like CDN assets are kept elsewhere.
+    external = "https://linked.test/property-page"
     record = {
         "_source_high_res_candidates": [source],
         "_high_res_candidates": [source, external],
@@ -699,7 +701,7 @@ def test_next_image_wrapper_normalizes_to_underlying_asset():
 
 
 def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
-    from extraction.html_images import is_brochure_link
+    from extraction.html_images import is_brochure_link, is_image_like_url
 
     assert is_brochure_link("CLICK HERE", "https://app.box.com/s/abc")
     assert is_brochure_link("9-10 Market Place", "https://us.list-manage.com/track")
@@ -708,4 +710,8 @@ def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
     assert not is_brochure_link(
         "unsubscribe",
         "https://metspace.us13.list-manage.com/unsubscribe?u=1&id=2",
+    )
+    assert is_image_like_url("https://anything.example/assets/opaque-id")
+    assert app_module._accept_image_url_under_deadline(
+        "https://anything.example/assets/opaque-id"
     )

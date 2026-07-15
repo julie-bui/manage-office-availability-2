@@ -18,13 +18,13 @@ name / Area column value is the sub-market, not a UK city name.
 
 Confirmed real (2026-07): some UNION rows label the Box landlord PDF
 "FLOOR PLAN" even when no separate brochure link exists — treating that as
-Floor-Plan-only left Brochure PDF blank. Those Box URLs are also filed as
-Brochure PDF so enrichment can still pull High Res images.
+Floor-Plan-only left Brochure PDF blank. Dual-fill of those URLs into
+Brochure PDF lives in extraction.xlsx_links.associate_row_links so the
+LLM fallback path gets the same recovery without a UNION-only rule.
 """
 import re
 
-from extraction.html_images import is_floorplan_link
-from extraction.xlsx_links import _best_brochure_candidate, _normalize_for_matching
+from extraction.xlsx_links import associate_row_links, _normalize_for_matching
 
 _HEADER_ALIASES = {
     "Building": (("city",), ("building",), ("address",), ("property",)),
@@ -182,28 +182,6 @@ def _attach_row_links(records, row_links):
             return i
         return None
 
-    def apply_links(record, row):
-        floorplan_url = None
-        brochure_candidates = []
-        for display_text, url in row["links"]:
-            if not url:
-                continue
-            if is_floorplan_link(display_text):
-                if floorplan_url is None:
-                    floorplan_url = url
-                # Confirmed real (2026-07): UNION often labels the Box
-                # landlord PDF "FLOOR PLAN" with no separate Brochure
-                # cell — that URL is still the brochure for High Res
-                # enrichment, so keep it as a brochure candidate too.
-                brochure_candidates.append(url)
-            else:
-                brochure_candidates.append(url)
-        brochure_url = _best_brochure_candidate(brochure_candidates)
-        if floorplan_url and not record.get("Floor Plan"):
-            record["Floor Plan"] = floorplan_url
-        if brochure_url and not record.get("Brochure PDF"):
-            record["Brochure PDF"] = brochure_url
-
     # Pass 1: building + floor (+ sheet) so multi-floor buildings keep
     # their own Box link. Pass 2: building-only for leftovers.
     for require_floor in (True, False):
@@ -213,4 +191,9 @@ def _attach_row_links(records, row_links):
             match_idx = find_match(record, require_floor=require_floor)
             if match_idx is None:
                 continue
-            apply_links(record, available.pop(match_idx))
+            row = available.pop(match_idx)
+            floorplan_url, brochure_url = associate_row_links(row["links"])
+            if floorplan_url and not record.get("Floor Plan"):
+                record["Floor Plan"] = floorplan_url
+            if brochure_url and not record.get("Brochure PDF"):
+                record["Brochure PDF"] = brochure_url

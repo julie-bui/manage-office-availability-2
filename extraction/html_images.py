@@ -58,15 +58,25 @@ _FLOORPLAN_TEXT_RE = re.compile(r"floor\s*plan", re.IGNORECASE)
 # name links and Union "CLICK HERE" cells are the confirmed cases.
 _BROCHURE_TEXT_RE = re.compile(
     r"brochure|view\s*propert|property\s*details|particulars|click\s*here|"
-    r"view\s*listing|website|download|more\s*info|landlord|full\s*details",
+    r"view\s*listing|website|download|more\s*info|landlord|full\s*details|"
+    r"learn\s*more|see\s*(?:more|details)|explore\s*(?:property|listing)|"
+    r"find\s*out\s*more|read\s*more",
     re.IGNORECASE,
 )
 _DOCUMENT_URL_RE = re.compile(
     r"(?:drive\.google\.com|docs\.google\.com|dropbox\.com|/file/d/|"
     r"\.pdf(?:[?#]|$)|list-manage\.com|usercontent\.google\.com|"
-    r"box\.com/s/)",
+    r"box\.com/(?:s|shared/static)/|dl\.dropboxusercontent\.com)",
     re.IGNORECASE,
 )
+# Extensionless CMS/CDN asset paths still host real property photos
+# (Directus /assets/{uuid}, Dynamics digitalassets, generic /media/).
+_IMAGE_LIKE_PATH_RE = re.compile(
+    r"/assets?/|/media/|/digitalassets?/|/static/(?:img|images|media)/|"
+    r"/img/|/photos?/|/gallery/",
+    re.IGNORECASE,
+)
+_WHITESPACE_RE = re.compile(r"\s+")
 
 # Confirmed real (2026-07, The Workplace Company): a source can give
 # multiple link candidates for the same listing under different labels
@@ -83,6 +93,24 @@ _DOCUMENT_URL_RE = re.compile(
 # than trusting a label alone.
 _LOW_TRUST_LINK_DOMAIN_RE = re.compile(r"(?:^|\.)canva\.(?:com|link)$|(?:^|\.)pitch\.com$|(?:^|\.)box\.com$", re.IGNORECASE)
 
+def is_image_like_url(src):
+    """True when the URL itself looks like a fetchable image resource.
+
+    Prefer path/extension evidence over host allowlists so unknown CDNs
+    (Directus /assets/, Dynamics digitalassets, generic /media/) still
+    count — hosts we have not seen yet should not be silently skipped.
+    """
+    if not src:
+        return False
+    if _IMAGE_EXTENSION_RE.search(src):
+        return True
+    try:
+        path = urlparse(src).path or ""
+    except ValueError:
+        path = src
+    return bool(_IMAGE_LIKE_PATH_RE.search(path))
+
+
 def is_real_content_image(alt, src):
     """Best-effort "is this a genuine listing photo, not a logo/icon/
     tracking pixel" for a source with no dedicated rule of its own — see
@@ -97,7 +125,7 @@ def is_real_content_image(alt, src):
         return False
     if _NON_CONTENT_DOMAIN_RE.search(src):
         return False
-    if not _IMAGE_EXTENSION_RE.search(src):
+    if not is_image_like_url(src):
         return False
     return True
 
@@ -117,6 +145,30 @@ def is_brochure_link(text, url=""):
     if any(token in lowered for token in ("unsubscribe", "/profile?", "update%20your%20preferences", "preferences")):
         return False
     return bool(_DOCUMENT_URL_RE.search(url or ""))
+
+
+def is_enrichment_seed_link(text, url="", building=""):
+    """True when this hyperlink is a usable seed for brochure enrichment.
+
+    Broader than is_brochure_link: floor-plan labels (landlord PDFs often
+    hide only behind "FLOOR PLAN"), building-name anchors, and document
+    hosts. Used when a listing has ≤1 email photo and Brochure PDF is
+    still blank — enrichment then follows the seed for a 2–5 image gallery.
+    """
+    if is_floorplan_link(text) or is_brochure_link(text, url):
+        return True
+    if not url or not str(url).lower().startswith(("http://", "https://")):
+        return False
+    lowered = (url or "").lower()
+    if any(token in lowered for token in ("unsubscribe", "/profile?", "mailto:", "tel:", "javascript:")):
+        return False
+    if is_image_like_url(url):
+        return False
+    building_l = _WHITESPACE_RE.sub(" ", (building or "").strip().lower())
+    text_l = _WHITESPACE_RE.sub(" ", (text or "").strip().lower())
+    if building_l and text_l and (building_l in text_l or text_l in building_l):
+        return True
+    return False
 
 
 # Real network fetch, so bounded to a short timeout — a slow/unreachable
@@ -203,14 +255,22 @@ def enrich_records(records, html_items):
         _enrich_multi_building(records, html_items)
 
 
-def _collect(html_items):
+def _collect(html_items, building=""):
     """One pass over an html_items slice, returning (image_urls,
     floorplan_url, brochure_url) — shared by both the single- and
     multi-building tiers below so the classification rules only live in
-    one place."""
+    one place.
+
+    Floor-plan-labeled links also seed Brochure PDF when no brochure CTA
+    exists (landlord PDFs often hide only behind "FLOOR PLAN"). When the
+    email only has ≤1 featured photo and Brochure is still blank, CTA /
+    building-name anchors become enrichment seeds so linked pages can
+    expand High Res to 2–5 images.
+    """
     images = []
     floorplan_url = None
     brochure_url = None
+    seed_candidates = []
     for kind, a, b in html_items:
         if kind == "image":
             if is_real_content_image(a, b) and b not in images and b not in (floorplan_url,):
@@ -232,22 +292,39 @@ def _collect(html_items):
         elif kind == "link":
             if floorplan_url is None and is_floorplan_link(a):
                 floorplan_url = b
+                # Document-style floor-plan links (Box/Drive shares) dual-fill
+                # Brochure PDF; pixel-classified floorplan *images* do not.
+                if is_brochure_link(a, b) or _DOCUMENT_URL_RE.search(b or "") or not is_image_like_url(b):
+                    seed_candidates.insert(0, b)
             elif brochure_url is None and is_brochure_link(a, b):
                 brochure_url = b
+            elif is_enrichment_seed_link(a, b, building=building):
+                seed_candidates.append(b)
+    if brochure_url is None and seed_candidates:
+        for url in seed_candidates:
+            if url and not is_image_like_url(url):
+                brochure_url = url
+                break
+        if brochure_url is None and len(images) <= 1:
+            for url in seed_candidates:
+                if url:
+                    brochure_url = url
+                    break
     return images, floorplan_url, brochure_url
 
 
 def _apply(record, images, floorplan_url, brochure_url):
     if images:
         record["_high_res_candidates"] = list(images)
-    if floorplan_url:
+    if floorplan_url and not record.get("Floor Plan"):
         record["Floor Plan"] = floorplan_url
-    if brochure_url:
+    if brochure_url and not record.get("Brochure PDF"):
         record["Brochure PDF"] = brochure_url
 
 
 def _enrich_single_building(records, html_items):
-    images, floorplan_url, brochure_url = _collect(html_items)
+    building = next((r.get("Building") or "" for r in records if r.get("Building")), "")
+    images, floorplan_url, brochure_url = _collect(html_items, building=building)
     for record in records:
         _apply(record, images, floorplan_url, brochure_url)
 
@@ -282,7 +359,7 @@ def _enrich_multi_building(records, html_items):
             prev_building = building
         if seg_idx >= len(segments):
             break
-        images, floorplan_url, brochure_url = _collect(segments[seg_idx])
+        images, floorplan_url, brochure_url = _collect(segments[seg_idx], building=building)
         _apply(record, images, floorplan_url, brochure_url)
 
 

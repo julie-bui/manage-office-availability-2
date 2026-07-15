@@ -13,7 +13,7 @@ from io import BytesIO
 import re
 import time
 from typing import Callable, Iterable, List
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 
@@ -331,6 +331,13 @@ def _srcset_urls(value: str) -> List[str]:
     return [part.strip().split()[0] for part in value.split(",") if part.strip()]
 
 
+def _is_box_host(host: str) -> bool:
+    host = (host or "").lower()
+    if "dropbox" in host:
+        return False
+    return host == "box.com" or host.endswith(".box.com")
+
+
 def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
     """Resolve public document-viewer pages to their downloadable document.
 
@@ -362,7 +369,14 @@ def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = No
         file_id = match.group(1)
         url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
         return [AssetCandidate(url, source_document, mime_type="application/pdf", filename=f"{file_id}.pdf", anchor_text="Download brochure")]
-    if host.endswith("box.com"):
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        # Public Dropbox share → direct download (?dl=1) for nested retrieve.
+        if "/s/" in (parsed.path or "") or "/scl/" in (parsed.path or "") or host.endswith("dropboxusercontent.com"):
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query["dl"] = "1"
+            url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query), ""))
+            return [AssetCandidate(url, source_document, mime_type="application/pdf", filename="dropbox-brochure.pdf", anchor_text="Download brochure")]
+    if _is_box_host(host):
         shared = _box_shared_name(source_document)
         if not shared:
             return []
@@ -373,7 +387,7 @@ def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = No
 
 def _box_shared_name(url: str) -> str:
     parsed = urlparse(url)
-    if not (parsed.hostname or "").lower().endswith("box.com"):
+    if not _is_box_host(parsed.hostname or ""):
         return ""
     match = re.search(r"/s/([A-Za-z0-9]+)", parsed.path or "")
     return match.group(1) if match else ""

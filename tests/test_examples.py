@@ -781,14 +781,16 @@ def check_xlsx_links_for_llm_fallback(failures):
 
     local_failures = []
     expected = [
-        ("Brochure PDF", "https://example.com/107-4th"),
-        ("Brochure PDF", "https://example.com/107-1st"),
-        ("Floor Plan", "https://example.com/155-plan"),
-        ("Brochure PDF", "https://example.com/nexus"),
-        (None, None),
-        ("Brochure PDF", "https://www.theworkplacecompany.co.uk/offices-to-rent/london/1-valentine-place"),
+        ("Brochure PDF", "https://example.com/107-4th", None),
+        ("Brochure PDF", "https://example.com/107-1st", None),
+        # FLOOR PLAN-labeled landlord links fill Floor Plan AND Brochure PDF
+        # (shared xlsx_links.associate_row_links dual-fill).
+        ("Floor Plan", "https://example.com/155-plan", "https://example.com/155-plan"),
+        ("Brochure PDF", "https://example.com/nexus", None),
+        (None, None, None),
+        ("Brochure PDF", "https://www.theworkplacecompany.co.uk/offices-to-rent/london/1-valentine-place", None),
     ]
-    for record, (field, url) in zip(records, expected):
+    for record, (field, url, also_brochure) in zip(records, expected):
         if field is None:
             if record.get("Floor Plan") or record.get("Brochure PDF"):
                 local_failures.append(
@@ -798,16 +800,23 @@ def check_xlsx_links_for_llm_fallback(failures):
             continue
         if record.get(field) != url:
             local_failures.append(f"{record['Building']!r} ({record['Floor/Unit']}): expected {field} {url!r}, got {record.get(field)!r}")
-        other_field = "Brochure PDF" if field == "Floor Plan" else "Floor Plan"
-        if record.get(other_field):
-            local_failures.append(
-                f"{record['Building']!r} ({record['Floor/Unit']}): expected {other_field} to stay blank, got {record.get(other_field)!r}"
-            )
+        if also_brochure is not None:
+            if record.get("Brochure PDF") != also_brochure:
+                local_failures.append(
+                    f"{record['Building']!r} ({record['Floor/Unit']}): expected Brochure PDF {also_brochure!r} "
+                    f"(floor-plan dual-fill), got {record.get('Brochure PDF')!r}"
+                )
+        else:
+            other_field = "Brochure PDF" if field == "Floor Plan" else "Floor Plan"
+            if record.get(other_field):
+                local_failures.append(
+                    f"{record['Building']!r} ({record['Floor/Unit']}): expected {other_field} to stay blank, got {record.get(other_field)!r}"
+                )
 
     if not local_failures:
         print(
-            "OK  xlsx_links: 2 same-building rows each get their OWN link, a floor-plan link classified "
-            "separately, a real double-space mismatch resolved, a linkless row left blank, a Canva "
+            "OK  xlsx_links: 2 same-building rows each get their OWN link, a floor-plan link dual-fills "
+            "Brochure PDF, a real double-space mismatch resolved, a linkless row left blank, a Canva "
             "candidate skipped in favor of the real company domain"
         )
     failures.extend(local_failures)
