@@ -147,6 +147,8 @@ def process_files(
     brochure_enrichment=False,
     brochure_fetcher=None,
     brochure_extractor=None,
+    batch_total_files=None,
+    batch_file_index=None,
 ):
     """Returns a list of per-file dicts:
     {filename, status: "ok"|"error", method: "rule:<Name>"|"llm"|None,
@@ -165,6 +167,13 @@ def process_files(
     one's geocoding too — this is one shared deadline for the whole
     batch, not reset per file.
 
+    batch_total_files / batch_file_index: when the app finishes each file
+    (materialize + write + free embeds) before starting the next — required
+    on Render free-tier ~512MB — it calls this with one path at a time.
+    Pass the overall batch size/index so fair enrichment shares still
+    reserve time for later files (otherwise each solo call would take the
+    entire remaining pool).
+
     warning is set alongside a normal "ok" status/None error — any of: a
     PDF bigger than what's actually been tested end-to-end
     (extraction.file_readers.TESTED_MAX_PDF_PAGES/TESTED_MAX_PDF_BYTES —
@@ -182,10 +191,11 @@ def process_files(
 
     results = []
     path_list = list(paths)
-    total_files = len(path_list)
+    total_files = max(1, int(batch_total_files) if batch_total_files is not None else len(path_list))
     _enrich_pool_end = deadline - ENRICHMENT_FINALIZE_RESERVE_SECONDS
 
-    for file_index, path in enumerate(path_list):
+    for local_index, path in enumerate(path_list):
+        file_index = int(batch_file_index) if batch_file_index is not None else local_index
         filename = path.name if hasattr(path, "name") else str(path)
         source_url = _source_url_for(path, filename, source_urls)
         report = ProcessingReport(filename)

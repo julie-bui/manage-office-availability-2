@@ -555,8 +555,15 @@ def enrich_properties(
     # Fetch in small waves and apply immediately. Holding every UNION Box
     # PDF (~22MB) plus extracted page images in one giant cache (the old
     # "fetch all, then merge" approach) blew past Render's free-tier RSS
-    # ceiling before spreadsheet write.
+    # ceiling before spreadsheet write. Prefer a single in-flight large
+    # PDF when possible — three parallel 22MB Box downloads still spike
+    # past the free tier's ~512MB even after per-file finishing.
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
+    if any(
+        "/shared/static/" in (urlparse(url).path or "") or _box_shared_name(url)
+        for url in pending
+    ):
+        workers = 1
     wave_size = max(1, workers)
 
     def _apply_result(brochure_url, extraction):

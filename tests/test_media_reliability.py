@@ -469,6 +469,36 @@ def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
     assert captured["deadline"] > batch_deadline - 20
 
 
+def test_batch_file_index_preserves_fair_share_when_finishing_one_at_a_time(monkeypatch):
+    """app.py finishes each file before the next; process_files still shares time."""
+    path = next(Path(".").glob("Fw_ Knotel Availability _ 30_06_2026.eml"))
+    started = time.monotonic()
+    captured = []
+
+    def fake_enrich(properties, **kwargs):
+        captured.append({"deadline": kwargs.get("deadline"), "started": time.monotonic()})
+        return list(properties)
+
+    monkeypatch.setattr(pipeline.brochure, "enrich_properties", fake_enrich)
+    monkeypatch.setattr(pipeline, "_geocode_records", lambda *_args: (False, False))
+
+    batch_deadline = started + 80
+    pipeline.process_files(
+        [path],
+        deadline=batch_deadline,
+        brochure_enrichment=True,
+        batch_total_files=4,
+        batch_file_index=1,
+    )
+    assert len(captured) == 1
+    pool_end = batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS
+    # File index 1 of 4 → rem/3 at call start, leaving ~2/3 for later files —
+    # not rem/1 (what a naive one-path call would get).
+    expected = captured[0]["started"] + (pool_end - captured[0]["started"]) / 3
+    assert captured[0]["deadline"] == pytest.approx(expected, abs=1.0)
+    assert (pool_end - captured[0]["deadline"]) > 20
+
+
 def test_batch_enrichment_splits_deadline_across_files(monkeypatch):
     """Each file takes a fair share of remaining enrichment time when it starts.
 

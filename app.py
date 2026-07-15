@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import os
 import secrets
@@ -227,13 +228,46 @@ def process():
             f.save(dest)
             saved_paths.append(dest)
 
-        processed_results = process_files(saved_paths, deadline=batch_deadline, brochure_enrichment=True)
-        # process_files() returns exactly one result per input path, in the
-        # same order — pair each back up with its saved original so the
-        # "ok" ones below can copy it into the persistent batch dir (the
-        # tmpdir it currently lives in is wiped in `finally`, below).
-        for r, path in zip(processed_results, saved_paths):
-            r["_source_path"] = path
+        # Finish EACH file (materialize galleries + write xlsx + free
+        # embedded brochure bitmaps) before starting the next file's
+        # brochure enrichment. Confirmed real on Render free tier (~512MB):
+        # holding MetSpace+Knotel+WP+Union embeds until the end peaked
+        # ~1.2GB locally and left production with the same blank/single
+        # photo symptoms even after deadline/gallery logic fixes.
+        upload_jobs = []
+        processed_results = []
+        claimed_names = []
+        batch_total = len(saved_paths)
+        for file_index, path in enumerate(saved_paths):
+            one = process_files(
+                [path],
+                deadline=batch_deadline,
+                brochure_enrichment=True,
+                batch_total_files=batch_total,
+                batch_file_index=file_index,
+            )[0]
+            one["_source_path"] = path
+            processed_results.append(one)
+            if one["status"] != "ok":
+                continue
+            if not batch_dir.exists():
+                batch_dir.mkdir(parents=True)
+            name = make_unique_names(claimed_names + [one["display_name"]])[-1]
+            claimed_names.append(name)
+            one["output_file"] = f"{name}.xlsx"
+            upload_jobs.extend(
+                _finish_ok_result(one, batch_dir=batch_dir, batch_id=batch_id, name=name, deadline=batch_deadline)
+            )
+            # Drop heavy in-memory brochure payloads before the next file
+            # (esp. UNION Box PDFs / MetSpace Drive embeds) starts.
+            one["properties"] = []
+            one["email_html"] = None
+            one["pages_text"] = None
+            one["html_items"] = None
+            for rec in one.get("records") or []:
+                rec.pop("_brochure_embedded_assets", None)
+            gc.collect()
+
         results = processed_results + unsupported_results
 
         # Mirroring the geocode/address-lookup on-disk caches to B2/S3 used
@@ -246,139 +280,6 @@ def process():
         # if nothing was cached this run, or if storage isn't configured
         # at all), same as every other storage.upload call below.
         threading.Thread(target=_flush_caches, daemon=True).start()
-
-        # (storage_key, local_path) pairs, uploaded together in one
-        # background thread after the response is built rather than
-        # inline here — confirmed empirically that doing each upload
-        # synchronously (a real network round-trip per file) adds up fast
-        # once a batch needs more than a couple of them, e.g. a PDF with
-        # several distinct per-listing images (see _attach_pdf_images
-        # below): real 500s from gunicorn's default 30s worker timeout on
-        # a 20-page/43-listing source with ~15 unique images to mirror.
-        upload_jobs = []
-
-        ok_results = [r for r in results if r["status"] == "ok"]
-        if ok_results:
-            batch_dir.mkdir(parents=True)
-        unique_names = make_unique_names([r["display_name"] for r in ok_results])
-        for r, name in zip(ok_results, unique_names):
-            r["output_file"] = f"{name}.xlsx"
-
-            # Persist the source artifact alongside the generated
-            # spreadsheet, and point every extracted row's "Link to File"
-            # at it so the spreadsheet is traceable back to where the data
-            # came from. Reuses the same collision-free `name` the
-            # spreadsheet got, so it can't collide with another source
-            # file in this batch.
-            #
-            # An .eml with an HTML body links to that HTML directly
-            # (extraction.pipeline already parsed it out, unmodified) —
-            # opens in-browser like the original email, images included,
-            # since the markup already points at the sender's hosted image
-            # URLs. There's nothing to render or convert. Everything else
-            # (PDF, DOCX, XLSX, CSV, a plain-text-only .eml) links to the
-            # original uploaded file as-is.
-            source_path = r["_source_path"]
-            email_html = r.get("email_html")
-            source_filename = f"{name}.html" if email_html else f"{name}{source_path.suffix.lower()}"
-            source_filename = _disambiguate_source_filename(source_filename, r["output_file"])
-
-            if email_html:
-                (batch_dir / source_filename).write_text(email_html, encoding="utf-8")
-            else:
-                shutil.copy2(source_path, batch_dir / source_filename)
-            r["source_file"] = source_filename
-            source_url = _download_url(batch_id, source_filename)
-            # The hosted URL only exists after this source artifact has a
-            # collision-safe batch filename. Update the canonical typed
-            # properties, then serialize them; never patch Link to File
-            # from an unrelated brochure/image field.
-            for prop in r.get("properties") or []:
-                # Display the user's original uploaded filename for audit
-                # traceability.  The URL may target a collision-safe stored
-                # copy (or an HTML rendering of an email), but that storage
-                # implementation detail must not replace source identity.
-                prop.set_source_reference(r["filename"], source_url)
-            if r.get("properties"):
-                r["records"] = [prop.to_record() for prop in r["properties"]]
-
-            # Floor Plan/High Res Images for a PDF source whose own rule (or
-            # the LLM fallback) doesn't already supply them from its own
-            # text/table structure — Kitt's already gets these from its own
-            # table columns (extraction.rules.grid) and Knotel already gets
-            # Floor Plan from its email's own "Download Floorplan" link
-            # (extraction.rules.knotel); neither goes through this. BC and
-            # Breezblok are rule-based (extraction.rules.bc/breezblok) but,
-            # like the LLM fallback, their own text has no image data at
-            # all — real embedded images only — genuinely blank when a
-            # source PDF has none (BC's own table has none at all) or a
-            # listing's building can't be matched to a page.
-            if r["method"] in PDF_IMAGE_ENRICHED_METHODS and source_path.suffix.lower() == ".pdf" and r.get("pages_text"):
-                memlog.log("before image extraction", r["filename"])
-                upload_jobs.extend(_attach_pdf_images(r["records"], source_path, r["pages_text"], batch_dir, batch_id, name))
-                memlog.log("after image extraction", r["filename"])
-            elif (r["method"] or "").startswith("llm") and r.get("html_items"):
-                # The non-PDF counterpart to the branch above: a brand-new
-                # provider's .eml/.html file with no dedicated rule yet
-                # (confirmed 2026-07 — The Workplace Company, the first
-                # real source seen through this path — previously got
-                # NONE of Floor Plan/High Res Images/Brochure PDF at all,
-                # despite the source genuinely having real listing photos
-                # and a "Brochure" link). Sets Floor Plan/Brochure PDF
-                # directly and stashes High Res Images candidates on
-                # "_high_res_candidates" for _finalize_high_res_images
-                # below, same convention as extraction.rules.gpe.
-                # llm:chunked must take this path too (method is not exactly
-                # "llm") — otherwise dense spreadsheet/email fallbacks skip
-                # secondary media attachment after a successful chunk parse.
-                html_images.enrich_records(r["records"], r["html_items"])
-            elif (
-                (r["method"] or "").startswith("llm")
-                and source_path.suffix.lower() in (".xlsx", ".xls")
-                and r.get("row_links")
-            ):
-                # The .xlsx/.xls counterpart to the two branches above: a
-                # raw-spreadsheet source with no dedicated rule of its own
-                # (confirmed 2026-07 — a UNION file, the first one seen
-                # through this path — came back with Brochure PDF/Floor
-                # Plan blank for every row despite its own "Brochure"
-                # column linking every row to a real box.com URL; pandas'
-                # own cell-value read, used to build the LLM's own
-                # plain-text prompt input, discards hyperlinks entirely,
-                # so nothing in that text could ever have recovered it).
-                # Same llm:chunked gotcha as above — Workplace Plus London
-                # hits chunked extraction and must still recover hyperlinks.
-                xlsx_links.enrich_records(r["records"], r["row_links"])
-
-            # Generic, source-agnostic finishing step: any rule (not just
-            # PDF ones) can stash a list of real candidate photo URLs on a
-            # record as "_high_res_candidates" instead of setting High Res
-            # Images directly, when it can't tell in advance whether a
-            # listing has one photo or several (extraction.rules.gpe does
-            # this — a building can genuinely have two distinct real
-            # photos, one from a promotional blurb and one from its own
-            # listing card). Turns 2+ into a small gallery page, 1 into a
-            # direct link, same as the PDF path above.
-            upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
-            upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=batch_deadline))
-            image_warning = _image_coverage_warning(r["records"], r.get("method") or "")
-            if image_warning:
-                existing = (r.get("warning") or "").strip()
-                r["warning"] = f"{existing} {image_warning}".strip() if existing else image_warning
-
-            memlog.log("before spreadsheet write", r["filename"])
-            write_xlsx(batch_dir / r["output_file"], r["records"], sheet_title=name, include_qa_sheet=False)
-            memlog.log("after spreadsheet write", r["filename"])
-
-            # Queued for the background thread below (storage.upload is a
-            # no-op returning False if S3_BUCKET etc. aren't configured) so
-            # these download links keep working past Render's ephemeral
-            # disk being wiped on redeploy/restart, and past our own
-            # hourly local cleanup below — local disk stays the fast path,
-            # this is just the durable fallback /api/download reaches for
-            # when the local copy is already gone.
-            upload_jobs.append((f"{batch_id}/{source_filename}", batch_dir / source_filename))
-            upload_jobs.append((f"{batch_id}/{r['output_file']}", batch_dir / r["output_file"]))
 
         if upload_jobs:
             threading.Thread(target=_upload_all, args=(upload_jobs,), daemon=True).start()
@@ -406,6 +307,132 @@ def process():
         return jsonify({"batch_id": batch_id, "files": response_files})
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
+    """Persist source + galleries + spreadsheet for one successful file.
+
+    Returns upload_jobs for background mirroring. Called before the next
+    uploaded file starts brochure enrichment so Render free-tier memory
+    stays bounded and finalize still has batch clock left.
+    """
+    upload_jobs = []
+    # Persist the source artifact alongside the generated
+    # spreadsheet, and point every extracted row's "Link to File"
+    # at it so the spreadsheet is traceable back to where the data
+    # came from. Reuses the same collision-free `name` the
+    # spreadsheet got, so it can't collide with another source
+    # file in this batch.
+    #
+    # An .eml with an HTML body links to that HTML directly
+    # (extraction.pipeline already parsed it out, unmodified) —
+    # opens in-browser like the original email, images included,
+    # since the markup already points at the sender's hosted image
+    # URLs. There's nothing to render or convert. Everything else
+    # (PDF, DOCX, XLSX, CSV, a plain-text-only .eml) links to the
+    # original uploaded file as-is.
+    source_path = r["_source_path"]
+    email_html = r.get("email_html")
+    source_filename = f"{name}.html" if email_html else f"{name}{source_path.suffix.lower()}"
+    source_filename = _disambiguate_source_filename(source_filename, r["output_file"])
+
+    if email_html:
+        (batch_dir / source_filename).write_text(email_html, encoding="utf-8")
+    else:
+        shutil.copy2(source_path, batch_dir / source_filename)
+    r["source_file"] = source_filename
+    source_url = _download_url(batch_id, source_filename)
+    # The hosted URL only exists after this source artifact has a
+    # collision-safe batch filename. Update the canonical typed
+    # properties, then serialize them; never patch Link to File
+    # from an unrelated brochure/image field.
+    for prop in r.get("properties") or []:
+        # Display the user's original uploaded filename for audit
+        # traceability.  The URL may target a collision-safe stored
+        # copy (or an HTML rendering of an email), but that storage
+        # implementation detail must not replace source identity.
+        prop.set_source_reference(r["filename"], source_url)
+    if r.get("properties"):
+        r["records"] = [prop.to_record() for prop in r["properties"]]
+
+    # Floor Plan/High Res Images for a PDF source whose own rule (or
+    # the LLM fallback) doesn't already supply them from its own
+    # text/table structure — Kitt's already gets these from its own
+    # table columns (extraction.rules.grid) and Knotel already gets
+    # Floor Plan from its email's own "Download Floorplan" link
+    # (extraction.rules.knotel); neither goes through this. BC and
+    # Breezblok are rule-based (extraction.rules.bc/breezblok) but,
+    # like the LLM fallback, their own text has no image data at
+    # all — real embedded images only — genuinely blank when a
+    # source PDF has none (BC's own table has none at all) or a
+    # listing's building can't be matched to a page.
+    if r["method"] in PDF_IMAGE_ENRICHED_METHODS and source_path.suffix.lower() == ".pdf" and r.get("pages_text"):
+        memlog.log("before image extraction", r["filename"])
+        upload_jobs.extend(_attach_pdf_images(r["records"], source_path, r["pages_text"], batch_dir, batch_id, name))
+        memlog.log("after image extraction", r["filename"])
+    elif (r["method"] or "").startswith("llm") and r.get("html_items"):
+        # The non-PDF counterpart to the branch above: a brand-new
+        # provider's .eml/.html file with no dedicated rule yet
+        # (confirmed 2026-07 — The Workplace Company, the first
+        # real source seen through this path — previously got
+        # NONE of Floor Plan/High Res Images/Brochure PDF at all,
+        # despite the source genuinely having real listing photos
+        # and a "Brochure" link). Sets Floor Plan/Brochure PDF
+        # directly and stashes High Res Images candidates on
+        # "_high_res_candidates" for _finalize_high_res_images
+        # below, same convention as extraction.rules.gpe.
+        # llm:chunked must take this path too (method is not exactly
+        # "llm") — otherwise dense spreadsheet/email fallbacks skip
+        # secondary media attachment after a successful chunk parse.
+        html_images.enrich_records(r["records"], r["html_items"])
+    elif (
+        (r["method"] or "").startswith("llm")
+        and source_path.suffix.lower() in (".xlsx", ".xls")
+        and r.get("row_links")
+    ):
+        # The .xlsx/.xls counterpart to the two branches above: a
+        # raw-spreadsheet source with no dedicated rule of its own
+        # (confirmed 2026-07 — a UNION file, the first one seen
+        # through this path — came back with Brochure PDF/Floor
+        # Plan blank for every row despite its own "Brochure"
+        # column linking every row to a real box.com URL; pandas'
+        # own cell-value read, used to build the LLM's own
+        # plain-text prompt input, discards hyperlinks entirely,
+        # so nothing in that text could ever have recovered it).
+        # Same llm:chunked gotcha as above — Workplace Plus London
+        # hits chunked extraction and must still recover hyperlinks.
+        xlsx_links.enrich_records(r["records"], r["row_links"])
+
+    # Generic, source-agnostic finishing step: any rule (not just
+    # PDF ones) can stash a list of real candidate photo URLs on a
+    # record as "_high_res_candidates" instead of setting High Res
+    # Images directly, when it can't tell in advance whether a
+    # listing has one photo or several (extraction.rules.gpe does
+    # this — a building can genuinely have two distinct real
+    # photos, one from a promotional blurb and one from its own
+    # listing card). Turns 2+ into a small gallery page, 1 into a
+    # direct link, same as the PDF path above.
+    upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
+    upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=deadline))
+    image_warning = _image_coverage_warning(r["records"], r.get("method") or "")
+    if image_warning:
+        existing = (r.get("warning") or "").strip()
+        r["warning"] = f"{existing} {image_warning}".strip() if existing else image_warning
+
+    memlog.log("before spreadsheet write", r["filename"])
+    write_xlsx(batch_dir / r["output_file"], r["records"], sheet_title=name, include_qa_sheet=False)
+    memlog.log("after spreadsheet write", r["filename"])
+
+    # Queued for the background thread below (storage.upload is a
+    # no-op returning False if S3_BUCKET etc. aren't configured) so
+    # these download links keep working past Render's ephemeral
+    # disk being wiped on redeploy/restart, and past our own
+    # hourly local cleanup below — local disk stays the fast path,
+    # this is just the durable fallback /api/download reaches for
+    # when the local copy is already gone.
+    upload_jobs.append((f"{batch_id}/{source_filename}", batch_dir / source_filename))
+    upload_jobs.append((f"{batch_id}/{r['output_file']}", batch_dir / r["output_file"]))
+    return upload_jobs
 
 
 def _disambiguate_source_filename(source_filename, output_filename):
