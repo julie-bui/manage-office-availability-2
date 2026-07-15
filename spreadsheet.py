@@ -40,7 +40,9 @@ WRAP_ALIGNMENT = Alignment(horizontal="center", vertical="center", wrap_text=Tru
 LINE_HEIGHT = 15  # approx. points needed per wrapped line at 11pt Calibri
 
 
-def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=True):
+def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=False):
+    """Write the Listings sheet. QA Review is opt-in only (include_qa_sheet=True);
+    user downloads omit it so the export is a single clean listings workbook."""
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_title[:31] or "Listings"  # Excel sheet name length limit

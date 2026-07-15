@@ -14,7 +14,7 @@ from extraction.brochure import _embedded_http_target, enrich_properties
 from extraction.models import AssetCandidate, AssetType, BrochureExtraction, BrochureResource, Property
 from extraction.schema import normalize_record
 from extraction.file_readers import read_file
-from extraction.rules.workplace_plus import _listing_assets
+from extraction.rules.workplace_plus import ADDRESS_RE, _listing_assets
 from extraction.rules import try_rules
 import app as app_module
 
@@ -264,7 +264,9 @@ def test_path_style_local_download_skips_loopback_image_validation(tmp_path):
         )
     assert jobs == []
     assert record["High Res Images"] == local
-    assert record["_link_diagnostics"][-1].status == "DIRECT_IMAGE_ASSIGNED"
+    statuses = [item.status for item in record["_link_diagnostics"]]
+    assert "DIRECT_IMAGE_ASSIGNED" in statuses
+    assert "IMAGE_COUNT_BELOW_TARGET" in statuses
 
 def test_json_tracking_parameter_resolves_explicit_https_target_only():
     tracked = "https://tracker.test/go?payload=%7B%22TargetUrl%22%3A%22https%253A%252F%252Fproperty.test%252Fone%22%7D"
@@ -464,3 +466,51 @@ def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
     # Old behaviour: min(deadline-20, now+15) ≈ batch_deadline-65 for an 80s
     # batch. New behaviour keeps deadline-20 (~60s of enrichment headroom).
     assert captured["deadline"] > batch_deadline - 30
+
+
+def test_workplace_plus_address_accepts_manchester_and_other_cities():
+    assert ADDRESS_RE.match("12 Dummy Street, Manchester, M1 2AB")
+    assert ADDRESS_RE.match("77 Gracechurch Street, EC3V 0AS")
+    assert ADDRESS_RE.match("150 Waterloo Road, London, SE1 8SB")
+    assert not ADDRESS_RE.match("Not an address line")
+
+
+def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
+    warning = app_module._image_coverage_warning(
+        [{"Building": "A", "High Res Images": ""}, {"Building": "B", "High Res Images": ""}],
+        "rule:Workplace Plus",
+    )
+    assert "No High Res Images" in warning
+    assert app_module._image_coverage_warning(
+        [{"Building": "A", "High Res Images": ""}],
+        "rule:BC",
+    ) == ""
+
+
+def test_finalize_caps_high_res_gallery_at_five(tmp_path):
+    urls = [f"https://img.test/{i}.jpg" for i in range(8)]
+    record = {
+        "Building": "Many Photo House",
+        "_source_high_res_candidates": urls,
+        "_high_res_candidates": urls,
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"},
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("<img") == 5
+    assert record["_high_res_image_count"] == 5
+    assert any(item.status == "IMAGE_CANDIDATES_CAPPED" for item in record["_link_diagnostics"])
+
+
+def test_dense_spreadsheet_triggers_chunking_before_row_threshold():
+    from extraction.spreadsheet_chunks import is_large_spreadsheet
+
+    # Under the old 80-row threshold, but verbose enough to need chunking
+    # (Workplace Plus London-style denseness).
+    rows = [[f"Building {i}", "Floor", "100 desks", "£10,000", "feature " * 80] for i in range(35)]
+    assert is_large_spreadsheet({"tables": [rows]})
+    assert not is_large_spreadsheet({"tables": [[["Building", "Floor"], ["1 Small Street", "1st"]]]})

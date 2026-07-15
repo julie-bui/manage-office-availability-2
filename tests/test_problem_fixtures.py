@@ -96,21 +96,25 @@ def test_exact_fixtures_run_through_orchestrator_and_qa(monkeypatch, tmp_path):
         path = tmp_path / f"{result['provider_name']}.xlsx"
         write_xlsx(path, result["records"])
         workbook = load_workbook(path)
-        listings = workbook["Listings"]
+        listings = workbook[workbook.sheetnames[0]]
         assert [cell.value for cell in listings[1]] == COLUMNS
         assert listings.max_column == len(COLUMNS)
         assert listings.max_row == result["record_count"] + 1
-        assert "QA Review" in workbook.sheetnames
+        # User-facing exports are Listings-only (QA Review is opt-in).
+        assert "QA Review" not in workbook.sheetnames
         link_column = COLUMNS.index("Link to File") + 1
         source_name = METSPACE.name if result["provider_name"] == "MetSpace" else WORKPLACE.name
         for row in range(2, listings.max_row + 1):
             assert listings.cell(row, link_column).value == source_name
             assert listings.cell(row, link_column).hyperlink is not None
 
-    metspace_qa = load_workbook(tmp_path / "MetSpace.xlsx")["QA Review"]
+    by_provider = {result["provider_name"]: result for result in results}
+    write_xlsx(tmp_path / "MetSpace-qa.xlsx", by_provider["MetSpace"]["records"], include_qa_sheet=True)
+    metspace_qa = load_workbook(tmp_path / "MetSpace-qa.xlsx")["QA Review"]
     metspace_issues = [cell.value for cell in metspace_qa["D"]]
     assert any("derived during enrichment" in str(value) for value in metspace_issues)
-    workplace_qa = load_workbook(tmp_path / "Workplace Plus.xlsx")["QA Review"]
+    write_xlsx(tmp_path / "Workplace Plus-qa.xlsx", by_provider["Workplace Plus"]["records"], include_qa_sheet=True)
+    workplace_qa = load_workbook(tmp_path / "Workplace Plus-qa.xlsx")["QA Review"]
     workplace_fields = [cell.value for cell in workplace_qa["C"]]
     assert workplace_fields.count("Size (sq ft)") == 4
 

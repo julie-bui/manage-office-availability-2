@@ -3,7 +3,14 @@ import re
 from urllib.parse import unquote
 
 
-ADDRESS_RE = re.compile(r"^\d[\w\- ]*,?\s+.+,\s*(?:London,\s*)?([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", re.I)
+# City is optional and not London-only — confirmed real (2026-07): Manchester
+# (and other UK city) Workplace Plus campaigns use the same card layout with
+# "…, Manchester, M1 2AB" style lines. Restricting to London silently dropped
+# every address and left the rule with zero rows / no photos.
+ADDRESS_RE = re.compile(
+    r"^\d[\w\-/' ]*,?\s+.+,\s*(?:[A-Za-z][A-Za-z .'\-]+,\s*)?([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$",
+    re.I,
+)
 FLOOR_RE = re.compile(r"^(?:Ground|Lower Ground|Basement|\d+(?:st|nd|rd|th))(?:\s*&\s*(?:First|\d+(?:st|nd|rd|th)))?\s+Floor$", re.I)
 DESKS_RE = re.compile(r"^(\d+)\s+Desks?\b", re.I)
 PRICE_RE = re.compile(r"£\s*([\d,]+)\s*Per Month", re.I)
@@ -63,12 +70,12 @@ def _listing_assets(html_items):
         if not (
             kind == "image"
             and "gallery.eocampaign1.com" in decoded
-            and "/019" in decoded
             and "logo" not in (alt or "").lower()
             and "tentacles/icons" not in decoded
+            and "availability" not in decoded.lower()
         ):
             continue
-        nearby = html_items[max(0, index - 2) : min(len(html_items), index + 3)]
+        nearby = html_items[max(0, index - 3) : min(len(html_items), index + 4)]
         wrapping_urls = {
             candidate_url
             for candidate_kind, text, candidate_url in nearby
@@ -80,10 +87,21 @@ def _listing_assets(html_items):
                 for candidate_kind, text, candidate_url in nearby
                 if candidate_kind == "link"
                 and text.strip().lower() == "brochure"
-                and candidate_url in wrapping_urls
+                and (not wrapping_urls or candidate_url in wrapping_urls)
             ),
             "",
         )
+        if not brochure:
+            # Manchester/other campaigns sometimes wrap the photo with a
+            # tracked href but omit a nearby "Brochure" label. Use that
+            # wrapping href only when no conflicting Brochure label is
+            # present — never steal another card's brochure URL.
+            has_brochure_label = any(
+                candidate_kind == "link" and (text or "").strip().lower() == "brochure"
+                for candidate_kind, text, _candidate_url in nearby
+            )
+            if not has_brochure_label:
+                brochure = next(iter(wrapping_urls), "")
         if brochure:
             pairs.append((brochure, url))
     return pairs

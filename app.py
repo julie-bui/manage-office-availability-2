@@ -35,7 +35,15 @@ BATCH_MAX_AGE_SECONDS = 60 * 60  # clean up old batch output dirs after an hour
 # Deliberately explicit (not "any rule other than grid/knotel") so adding a
 # future rule-based PDF parser that DOES supply its own images from its own
 # table/link structure doesn't silently get double-processed here.
-PDF_IMAGE_ENRICHED_METHODS = {"llm", "rule:BC", "rule:Breezblok"}
+PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
+# Target band for High Res Images when the source/brochures actually contain
+# property photos. Cap galleries at MAX so one brochure dump cannot flood a
+# listing; warn when a non-exempt file finishes below MIN or with zero images.
+MIN_HIGH_RES_IMAGES = 2
+MAX_HIGH_RES_IMAGES = 5
+# Sources confirmed to ship availability with literally no property photos
+# (tabular PDF only). Blank High Res is expected, not a coverage failure.
+IMAGE_EXEMPT_METHODS = {"rule:BC"}
 
 # Explicit Content-Type per extension for /api/download, rather than
 # relying on send_file's default (Python's mimetypes module, which is
@@ -309,7 +317,7 @@ def process():
                 memlog.log("before image extraction", r["filename"])
                 upload_jobs.extend(_attach_pdf_images(r["records"], source_path, r["pages_text"], batch_dir, batch_id, name))
                 memlog.log("after image extraction", r["filename"])
-            elif r["method"] == "llm" and r.get("html_items"):
+            elif (r["method"] or "").startswith("llm") and r.get("html_items"):
                 # The non-PDF counterpart to the branch above: a brand-new
                 # provider's .eml/.html file with no dedicated rule yet
                 # (confirmed 2026-07 — The Workplace Company, the first
@@ -320,8 +328,15 @@ def process():
                 # directly and stashes High Res Images candidates on
                 # "_high_res_candidates" for _finalize_high_res_images
                 # below, same convention as extraction.rules.gpe.
+                # llm:chunked must take this path too (method is not exactly
+                # "llm") — otherwise dense spreadsheet/email fallbacks skip
+                # secondary media attachment after a successful chunk parse.
                 html_images.enrich_records(r["records"], r["html_items"])
-            elif r["method"] == "llm" and source_path.suffix.lower() in (".xlsx", ".xls") and r.get("row_links"):
+            elif (
+                (r["method"] or "").startswith("llm")
+                and source_path.suffix.lower() in (".xlsx", ".xls")
+                and r.get("row_links")
+            ):
                 # The .xlsx/.xls counterpart to the two branches above: a
                 # raw-spreadsheet source with no dedicated rule of its own
                 # (confirmed 2026-07 — a UNION file, the first one seen
@@ -331,6 +346,8 @@ def process():
                 # own cell-value read, used to build the LLM's own
                 # plain-text prompt input, discards hyperlinks entirely,
                 # so nothing in that text could ever have recovered it).
+                # Same llm:chunked gotcha as above — Workplace Plus London
+                # hits chunked extraction and must still recover hyperlinks.
                 xlsx_links.enrich_records(r["records"], r["row_links"])
 
             # Generic, source-agnostic finishing step: any rule (not just
@@ -344,9 +361,13 @@ def process():
             # direct link, same as the PDF path above.
             upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
             upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=batch_deadline))
+            image_warning = _image_coverage_warning(r["records"], r.get("method") or "")
+            if image_warning:
+                existing = (r.get("warning") or "").strip()
+                r["warning"] = f"{existing} {image_warning}".strip() if existing else image_warning
 
             memlog.log("before spreadsheet write", r["filename"])
-            write_xlsx(batch_dir / r["output_file"], r["records"], sheet_title=name)
+            write_xlsx(batch_dir / r["output_file"], r["records"], sheet_title=name, include_qa_sheet=False)
             memlog.log("after spreadsheet write", r["filename"])
 
             # Queued for the background thread below (storage.upload is a
@@ -653,6 +674,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             raw_candidates = [existing_image]
         if not raw_candidates:
             if not existing_image:
+                record["_high_res_image_count"] = 0
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
                 )
@@ -698,8 +720,16 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail="Candidate was excluded from High Res Images."))
         if not valid:
             record["High Res Images"] = ""
+            record["_high_res_image_count"] = 0
             diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
+
+        if len(valid) > MAX_HIGH_RES_IMAGES:
+            diagnostics.append(LinkDiagnostic(
+                "IMAGE_CANDIDATES_CAPPED",
+                detail=f"Using first {MAX_HIGH_RES_IMAGES} of {len(valid)} validated image(s).",
+            ))
+            valid = valid[:MAX_HIGH_RES_IMAGES]
 
         key = tuple(valid)
         if key not in gallery_url_by_candidates:
@@ -727,6 +757,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     gallery_url_by_candidates[key] = valid[0]
 
         record["High Res Images"] = gallery_url_by_candidates[key]
+        record["_high_res_image_count"] = len(valid)
         if len(valid) == 1:
             status, detail = "DIRECT_IMAGE_ASSIGNED", "1 validated image(s)"
         elif record["High Res Images"] == valid[0]:
@@ -738,8 +769,50 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         else:
             status, detail = "GALLERY_CREATED", f"{len(valid)} validated image(s)"
         diagnostics.append(LinkDiagnostic(status, final_url=record["High Res Images"], detail=detail))
+        if 0 < len(valid) < MIN_HIGH_RES_IMAGES:
+            diagnostics.append(LinkDiagnostic(
+                "IMAGE_COUNT_BELOW_TARGET",
+                detail=f"{len(valid)} image(s); target is {MIN_HIGH_RES_IMAGES}-{MAX_HIGH_RES_IMAGES} when source/brochures provide photos.",
+            ))
 
     return jobs
+
+
+def _image_coverage_warning(records, method):
+    """Surface a Notes warning when a non-exempt file finishes without the
+    expected High Res coverage. BC-style tabular PDFs (no photos in source)
+    are exempt; every other provider should have building-matched photos from
+    the email/sheet and/or linked brochure HTTPS/PDF embeds."""
+    if not records:
+        return ""
+    if method in IMAGE_EXEMPT_METHODS:
+        return ""
+    with_images = sum(1 for record in records if str(record.get("High Res Images") or "").strip())
+    if with_images == 0:
+        return (
+            "No High Res Images were produced for any listing. Re-check brochure/property "
+            "links in the source, or process this file alone if enrichment hit the time budget."
+        )
+    below_target = sum(
+        1
+        for record in records
+        if str(record.get("High Res Images") or "").strip()
+        and int(record.get("_high_res_image_count") or 1) < MIN_HIGH_RES_IMAGES
+    )
+    blank = len(records) - with_images
+    parts = []
+    if blank:
+        parts.append(f"{blank} listing(s) have no High Res Images")
+    if below_target:
+        parts.append(
+            f"{below_target} listing(s) have fewer than {MIN_HIGH_RES_IMAGES} photos "
+            f"(target {MIN_HIGH_RES_IMAGES}-{MAX_HIGH_RES_IMAGES} when available)"
+        )
+    if not parts:
+        return ""
+    return "Image coverage check: " + "; ".join(parts) + "."
+
+
 def _materialize_brochure_assets(records, batch_dir, batch_id, name):
     """Persist classified embedded brochure visuals after batch URLs exist."""
     jobs = []
@@ -774,7 +847,7 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         # candidate and must survive the brochure merge.
         if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
             existing_candidates.insert(0, existing)
-        combined = list(dict.fromkeys(existing_candidates + photo_urls))
+        combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
         if not existing or existing_candidates:
             record["_high_res_candidates"] = combined
     return jobs

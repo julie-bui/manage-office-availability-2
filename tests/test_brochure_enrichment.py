@@ -104,7 +104,7 @@ def test_brochure_does_not_overwrite_stronger_primary_value_and_flags_conflict()
 def test_brochure_conflict_is_written_to_qa_review(tmp_path):
     enriched = run(prop(**{"Special Features": "Primary roof terrace"}), extraction([evidence("Special Features", "Brochure gym")]))
     output = tmp_path / "conflict.xlsx"
-    write_xlsx(output, [enriched.to_record()])
+    write_xlsx(output, [enriched.to_record()], include_qa_sheet=True)
     qa = load_workbook(output)["QA Review"]
     assert any("Brochure value conflicts" in str(cell.value) for cell in qa["D"])
 

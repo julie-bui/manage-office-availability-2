@@ -1,9 +1,14 @@
 """Bounded LLM fallback for spreadsheets without a deterministic rule."""
 from .llm_fallback import LLMExtractionError, extract_with_llm
 
-LARGE_SPREADSHEET_ROWS = 80
-MAX_LLM_CHUNK_ROWS = 35
-MAX_LLM_CHUNK_CHARS = 12000
+# Confirmed real (2026-07, "Workplace Plus - London.xlsx"): dense sheets under
+# the old 80-row threshold still blew Gemini's output token budget as one call.
+# Chunk earlier (by rows or total text volume) so London-style workbooks take
+# the reliable per-chunk path without waiting for a truncated JSON failure.
+LARGE_SPREADSHEET_ROWS = 40
+DENSE_SPREADSHEET_CHARS = 20000
+MAX_LLM_CHUNK_ROWS = 25
+MAX_LLM_CHUNK_CHARS = 10000
 MAX_EXPECTED_RECORDS = 25
 CHUNK_OVERLAP_ROWS = 2
 CHUNK_OUTPUT_TOKENS = 8000
@@ -13,12 +18,17 @@ def is_spreadsheet(content):
     return bool(content.get("tables"))
 
 
-def is_large_spreadsheet(content):
-    return sum(len(table) for table in content.get("tables") or []) > LARGE_SPREADSHEET_ROWS
-
-
 def _row_text(row):
     return " | ".join(str(value) for value in row if value not in (None, ""))
+
+
+def is_large_spreadsheet(content):
+    tables = content.get("tables") or []
+    total_rows = sum(len(table) for table in tables)
+    if total_rows > LARGE_SPREADSHEET_ROWS:
+        return True
+    total_chars = sum(len(_row_text(row)) for table in tables for row in table)
+    return total_chars > DENSE_SPREADSHEET_CHARS
 
 
 def build_row_chunks(content):

@@ -70,7 +70,7 @@ def test_spreadsheet_named_mapping_hyperlinks_and_qa_sheet(tmp_path: Path):
     record = normalize_record({"Building": "Example House", "Brochure PDF": "https://example.com/brochure.pdf"})
     prop = validate_property(Property.from_record(record, "source.eml", "Example", "rule:test"))
     path = tmp_path / "result.xlsx"
-    write_xlsx(path, [prop.to_record()])
+    write_xlsx(path, [prop.to_record()], include_qa_sheet=True)
     workbook = load_workbook(path)
     listings = workbook["Listings"]
     headers = [cell.value for cell in listings[1]]

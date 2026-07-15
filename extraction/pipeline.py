@@ -298,20 +298,26 @@ def process_files(
                         raw_records, llm_source_name = extract_with_llm(content["text"], source_hint=filename)
                         result["method"] = "llm"
                     except LLMExtractionError as e:
-                        if is_spreadsheet(content) and "not valid JSON" in str(e):
+                        err = str(e).lower()
+                        if is_spreadsheet(content) and (
+                            "not valid json" in err
+                            or "truncated" in err
+                            or "max_tokens" in err
+                            or "max output" in err
+                            or "output size" in err
+                        ):
                             # The single-call response was truncated (hit
-                            # MAX_OUTPUT_TOKENS) before the row count crossed
-                            # LARGE_SPREADSHEET_ROWS — confirmed real
-                            # ("Workplace Plus - London.xlsx", 2026-07): under
-                            # 80 rows, but verbose enough per-row text that
-                            # the JSON output still overran the token budget
-                            # mid-string. Retrying the SAME full-text prompt
-                            # would truncate at the same point again (this is
-                            # exactly what extract_with_llm's own
-                            # retry_malformed already tried and still failed),
-                            # so fall back to bounded per-chunk extraction —
-                            # the same path a >80-row file already uses —
-                            # instead of failing the whole file.
+                            # MAX_OUTPUT_TOKENS) before the density/row
+                            # thresholds selected chunking — confirmed real
+                            # ("Workplace Plus - London.xlsx", 2026-07): dense
+                            # enough per-row text that the JSON output still
+                            # overran the token budget mid-string. Retrying
+                            # the SAME full-text prompt would truncate at the
+                            # same point again (this is exactly what
+                            # extract_with_llm's own retry_malformed already
+                            # tried and still failed), so fall back to bounded
+                            # per-chunk extraction instead of failing the
+                            # whole file.
                             raw_records, llm_source_name, diagnostics = extract_in_chunks(content, source_hint=filename)
                             result["method"] = "llm:chunked"
                             result["spreadsheet_diagnostics"] = diagnostics

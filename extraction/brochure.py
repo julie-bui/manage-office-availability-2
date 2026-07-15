@@ -611,7 +611,12 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
         prop.values["_brochure_embedded_assets"] = embedded
-    property_images = [a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url]
+    # Keep at most five property photos per listing so brochure dumps cannot
+    # flood High Res; the web layer targets 2-5 when photos exist.
+    _MAX_PROPERTY_IMAGES = 5
+    property_images = [
+        a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
+    ][:_MAX_PROPERTY_IMAGES]
     floorplans = [a.url for a in prop.assets if a.classification == AssetType.FLOORPLAN and a.url]
     existing_images = str(prop.values.get("High Res Images") or "")
     if not existing_images and property_images:
@@ -630,7 +635,9 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         existing_candidates = list(prop.values.get("_high_res_candidates") or [])
         if existing_images and not re.search(r"\.html(?:[?#]|$)", existing_images, re.I):
             existing_candidates.insert(0, existing_images)
-        prop.values["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + property_images))
+        prop.values["_high_res_candidates"] = list(
+            dict.fromkeys(existing_candidates + property_images)
+        )[:_MAX_PROPERTY_IMAGES]
     if not prop.values.get("Floor Plan") and floorplans:
         _apply(prop, "Floor Plan", _evidence(floorplans[0], extraction.source_document, 0.9))
     for field, evidence in extraction.fields.items():
