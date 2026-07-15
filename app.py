@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from dotenv import load_dotenv
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
@@ -617,6 +617,19 @@ def _attach_pdf_images(records, source_path, pages_text, batch_dir, batch_id, na
     return jobs
 
 
+def _is_local_download_url(url, batch_id):
+    """True for assets just materialized in this processing batch.
+
+    Fetching these files back through the app's own HTTP endpoint can
+    deadlock a Gunicorn worker and needlessly decode large images in memory.
+    """
+    parsed = urlparse(str(url or ""))
+    batch_prefix = f"/api/download/{quote(str(batch_id), safe='')}/"
+    return parsed.path.startswith(batch_prefix) or (
+        parsed.path == "/api/download" and bool(parsed.query)
+    )
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -647,7 +660,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         valid = []
         rejected = []
         for candidate in candidates:
-            if "/api/download?" in candidate:
+            if _is_local_download_url(candidate, batch_id):
                 result = {"ok": True, "url": candidate, "status": "VALID_LOCAL_IMAGE"}
             else:
                 result = image_validator(candidate, cache=validation_cache)

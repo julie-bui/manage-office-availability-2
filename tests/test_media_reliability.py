@@ -188,6 +188,21 @@ def test_truthful_blank_image_diagnostic(tmp_path):
 
 
 
+def test_path_style_local_download_skips_loopback_image_validation(tmp_path):
+    local = "https://service.test/api/download/batch-123/GPE_brochure_r1_photo.jpx?token=secret"
+    record = {"Building": "Example House", "_high_res_candidates": [local]}
+
+    def must_not_fetch(*_args, **_kwargs):
+        raise AssertionError("local batch asset must not be fetched over HTTP")
+
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch-123", "GPE", image_validator=must_not_fetch
+        )
+    assert jobs == []
+    assert record["High Res Images"] == local
+    assert record["_link_diagnostics"][-1].status == "DIRECT_IMAGE_ASSIGNED"
+
 def test_json_tracking_parameter_resolves_explicit_https_target_only():
     tracked = "https://tracker.test/go?payload=%7B%22TargetUrl%22%3A%22https%253A%252F%252Fproperty.test%252Fone%22%7D"
     assert _embedded_http_target(tracked) == "https://property.test/one"
