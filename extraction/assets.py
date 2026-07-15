@@ -104,7 +104,16 @@ def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
         else:
             classification, confidence = AssetType.UNKNOWN, 0.2
     elif extension in _IMAGE_EXTENSIONS or mime.startswith("image/"):
-        if candidate.occurrence_count > 1 and not _PROPERTY_RE.search(" ".join(filter(None, [candidate.alt_text, candidate.anchor_text, filename]))):
+        # Repetition alone does not make a strongly property-associated
+        # brochure image decorative. The same photo is often reused on a
+        # cover and an availability page; it still needs to reach the gallery.
+        if (
+            candidate.occurrence_count > 1
+            and candidate.association_confidence < 0.8
+            and not _PROPERTY_RE.search(
+                " ".join(filter(None, [candidate.alt_text, candidate.anchor_text, filename]))
+            )
+        ):
             classification, confidence = AssetType.DECORATIVE, 0.9
         elif (
             candidate.width is not None

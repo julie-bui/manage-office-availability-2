@@ -53,6 +53,7 @@ def test_property_image_classification_requires_positive_evidence():
     floorplan = classify_candidate(AssetCandidate("https://cdn.test/plan.jpg", "html", alt_text="Third floor plan"))
     repeated = classify_candidate(AssetCandidate("https://cdn.test/123.jpg", "html", occurrence_count=5))
     small = classify_candidate(AssetCandidate("https://cdn.test/office.jpg", "html", width=120, height=80))
+    repeated_associated = classify_candidate(AssetCandidate("https://cdn.test/123.jpg", "pdf", occurrence_count=5, association_confidence=0.85))
     asserted = classify_candidate(AssetCandidate("https://cdn.test/123", "html", mime_type="image/jpeg", association_confidence=0.9))
     assert generic.classification == AssetType.UNKNOWN
     assert reception.classification == AssetType.PROPERTY_IMAGE
@@ -62,6 +63,7 @@ def test_property_image_classification_requires_positive_evidence():
     assert repeated.classification == AssetType.DECORATIVE
     assert small.classification == AssetType.DECORATIVE
     assert asserted.classification == AssetType.PROPERTY_IMAGE
+    assert repeated_associated.classification == AssetType.PROPERTY_IMAGE
 
 
 def test_url_union_is_stable_canonical_and_safe():
