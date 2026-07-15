@@ -1,0 +1,66 @@
+"""Parser for Workplace Plus availability email campaigns."""
+import re
+from urllib.parse import unquote
+
+
+ADDRESS_RE = re.compile(r"^\d[\w\- ]*,?\s+.+,\s*(?:London,\s*)?([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", re.I)
+FLOOR_RE = re.compile(r"^(?:Ground|Lower Ground|Basement|\d+(?:st|nd|rd|th))(?:\s*&\s*(?:First|\d+(?:st|nd|rd|th)))?\s+Floor$", re.I)
+DESKS_RE = re.compile(r"^(\d+)\s+Desks?\b", re.I)
+PRICE_RE = re.compile(r"£\s*([\d,]+)\s*Per Month", re.I)
+
+
+def detect(content):
+    blob = " ".join([content.get("sender") or "", content.get("subject") or "", content.get("text") or ""]).lower()
+    return "workplace plus" in blob or "@workplaceplus.co.uk" in blob
+
+
+def parse(content):
+    lines = [line.strip() for line in (content.get("text") or "").splitlines() if line.strip()]
+    address_indexes = [i for i, line in enumerate(lines) if ADDRESS_RE.match(line)]
+    if not address_indexes:
+        return []
+
+    assets = _listing_assets(content.get("html_items") or [])
+    records = []
+    for building_index, start in enumerate(address_indexes):
+        end = address_indexes[building_index + 1] if building_index + 1 < len(address_indexes) else len(lines)
+        block = lines[start + 1 : end]
+        brochure, photo = assets[building_index] if building_index < len(assets) else ("", "")
+        floor_indexes = [i for i, line in enumerate(block) if FLOOR_RE.match(line)]
+        for position, floor_idx in enumerate(floor_indexes):
+            floor_end = floor_indexes[position + 1] if position + 1 < len(floor_indexes) else len(block)
+            floor_block = block[floor_idx + 1 : floor_end]
+            desks_line = next((line for line in floor_block if DESKS_RE.match(line)), "")
+            price_line = next((line for line in floor_block if PRICE_RE.search(line)), "")
+            desks_match = DESKS_RE.match(desks_line)
+            price_match = PRICE_RE.search(price_line)
+            records.append(
+                {
+                    "Building": lines[start],
+                    "Floor/Unit": block[floor_idx],
+                    "Desks (max)": desks_match.group(1) if desks_match else "",
+                    "Marketing Price (Based on Min Term) PCM": price_match.group(1).replace(",", "") if price_match else "",
+                    "Special Features": desks_line,
+                    "Brochure PDF": brochure,
+                    "High Res Images": photo,
+                    "Contacts": "Workplace Plus, hello@workplaceplus.co.uk",
+                }
+            )
+    return records
+
+
+def _listing_assets(html_items):
+    """Return one (brochure, property photo) pair per building in DOM order."""
+    photos = []
+    for kind, alt, url in html_items:
+        decoded = unquote(url)
+        if (
+            kind == "image"
+            and "gallery.eocampaign1.com" in decoded
+            and "/019" in decoded
+            and "logo" not in (alt or "").lower()
+            and "tentacles/icons" not in decoded
+        ):
+            photos.append(url)
+    brochures = [url for kind, text, url in html_items if kind == "link" and text.strip().lower() == "brochure"]
+    return list(zip(brochures, photos))
