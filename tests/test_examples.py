@@ -1102,8 +1102,20 @@ def check_html_images_for_llm_fallback(failures):
     # records the LLM actually extracted from this file (both floors of
     # the one real building, "5-7 Ireland Yard") and confirm the single-
     # building tier attaches the real photos/brochure link to both.
-    records = [{"Building": "5-7 Ireland Yard"}, {"Building": "5-7 Ireland Yard"}]
-    html_images.enrich_records(records, items)
+    # is_floorplan_image_url does a real network fetch per candidate image
+    # (extraction.html_images' own pixel-content check, added 2026-07 for
+    # MetSpace's "Office Of The Week" case) — stubbed here to keep this
+    # check fast/offline/deterministic like every other one in this suite;
+    # already confirmed none of this file's own 4 real photos are actually
+    # floor plans (Floor Plan expected blank below), so False is the
+    # correct real answer here too, not just a convenient stub.
+    original_is_floorplan_image_url = html_images.is_floorplan_image_url
+    html_images.is_floorplan_image_url = lambda url: False
+    try:
+        records = [{"Building": "5-7 Ireland Yard"}, {"Building": "5-7 Ireland Yard"}]
+        html_images.enrich_records(records, items)
+    finally:
+        html_images.is_floorplan_image_url = original_is_floorplan_image_url
     expected_brochure = (
         "https://eot.theworkplacecompany.com/f/a/SjaePlQ3sgIFTBokxwTJWg~~/AAAHURA~/"
         "6VqBvhnc5QlGQszomwEcqpzwgstqcSru4Kr4FwvfNNuDYDjmbdFz7r26trpdM3mbkpiSchIk3Qs5LCw-O3nIE8H8i2Mr0prK1Ni4"

@@ -7,17 +7,32 @@ extension, not by provider).
 
 Unlike a dedicated rule — written and verified against ONE specific
 source's own already-seen HTML structure (e.g. extraction.rules.metspace
-trusting mcusercontent.com specifically as MetSpace's own real-photo
-domain, or extraction.rules.knotel filtering by its own "X Floor featured
-image" alt-text convention) — this has to work reasonably well against an
-ARBITRARY, previously-unseen sender's layout. So it favours a defensible,
-generic heuristic baseline (alt-text/URL patterns confirmed against a
-real example, not assumptions about any one source) over the precision a
-dedicated rule can achieve once a provider is seen often enough to
-justify writing one.
+trusting mcusercontent.com specifically as MetSpace's own FLOOR PLAN
+domain for its usual "WEEKLY AVAILABILITY" template, or
+extraction.rules.knotel filtering by its own "X Floor featured image"
+alt-text convention) — this has to work reasonably well against an
+ARBITRARY, previously-unseen sender's layout, or even a DIFFERENT
+template from an already-known sender (confirmed real, 2026-07:
+MetSpace's own "Office Of The Week" single-listing spotlight template
+goes through this generic path, not its dedicated rule, and — unlike
+its usual template — genuinely has BOTH a real content photo and a
+floor-plan diagram from the exact same mcusercontent.com domain, so the
+domain-based assumption that holds for metspace.py's own template
+doesn't hold here). So this favours a defensible, generic heuristic
+baseline (alt-text/URL patterns confirmed against a real example, not
+assumptions about any one source) over the precision a dedicated rule
+can achieve once a provider is seen often enough to justify writing
+one — including, for the floor-plan-vs-photo question specifically, an
+actual pixel-content check (is_floorplan_image, shared with
+extraction.pdf_images) rather than guessing from the URL/alt text
+alone, which carries no signal at all for a domain like this one.
 """
 import re
 from urllib.parse import urlparse
+
+import requests
+
+from . import pdf_images
 
 # Confirmed empirically (2026-07, The Workplace Company — a brand-new
 # provider's marketing email, first one seen through this generic path)
@@ -29,6 +44,13 @@ from urllib.parse import urlparse
 _NON_CONTENT_ALT_RE = re.compile(r"logo|icon|social", re.IGNORECASE)
 _NON_CONTENT_DOMAIN_RE = re.compile(r"wisestamp\.com|cdn-images\.mailchimp\.com", re.IGNORECASE)
 _IMAGE_EXTENSION_RE = re.compile(r"\.(?:png|jpe?g|gif|webp)(?:[?#]|$)", re.IGNORECASE)
+
+# Confirmed real (2026-07, Workplace Plus): a decorative section-header
+# banner image ("Availability", a stylized graphic, not a listing photo)
+# had alt text too generic to catch by _NON_CONTENT_ALT_RE, but its own
+# filename literally contained "...availability%20logo.png" — checked
+# against the URL itself, not just alt text, for exactly this reason.
+_NON_CONTENT_URL_RE = re.compile(r"logo", re.IGNORECASE)
 
 _FLOORPLAN_TEXT_RE = re.compile(r"floor\s*plan", re.IGNORECASE)
 _BROCHURE_TEXT_RE = re.compile(r"brochure|view\s*propert|property\s*details|particulars", re.IGNORECASE)
@@ -48,13 +70,6 @@ _BROCHURE_TEXT_RE = re.compile(r"brochure|view\s*propert|property\s*details|part
 # than trusting a label alone.
 _LOW_TRUST_LINK_DOMAIN_RE = re.compile(r"(?:^|\.)canva\.(?:com|link)$|(?:^|\.)pitch\.com$|(?:^|\.)box\.com$", re.IGNORECASE)
 
-# Positions either side of a building-name occurrence to scan for its own
-# images/links when a source has 2+ distinct buildings — same idea and
-# same order of magnitude as extraction.rules.gpe's own promotional-image
-# proximity window, not independently re-derived here.
-PROXIMITY_WINDOW = 8
-
-
 def is_real_content_image(alt, src):
     """Best-effort "is this a genuine listing photo, not a logo/icon/
     tracking pixel" for a source with no dedicated rule of its own — see
@@ -64,6 +79,8 @@ def is_real_content_image(alt, src):
     if not src:
         return False
     if _NON_CONTENT_ALT_RE.search(alt or ""):
+        return False
+    if _NON_CONTENT_URL_RE.search(src):
         return False
     if _NON_CONTENT_DOMAIN_RE.search(src):
         return False
@@ -78,6 +95,37 @@ def is_floorplan_link(text):
 
 def is_brochure_link(text):
     return bool(_BROCHURE_TEXT_RE.search(text or ""))
+
+
+# Real network fetch, so bounded to a short timeout — a slow/unreachable
+# image shouldn't hang or fail the whole batch (see is_floorplan_image_url
+# below, which treats a fetch failure as "not a floor plan" rather than
+# raising or blocking).
+_IMAGE_FETCH_TIMEOUT_SECONDS = 8
+
+
+def is_floorplan_image_url(url):
+    """Best-effort "is this real content image actually a floor-plan
+    diagram, not a photo" for a source with no dedicated rule of its own.
+    Confirmed real (2026-07, MetSpace's own "Office Of The Week"
+    single-listing template, an already-known sender's DIFFERENT
+    template going through this generic path instead of its own
+    dedicated rule): the URL/alt text alone carries no signal at all here
+    — both a real interior photo and a floor-plan diagram came from the
+    exact same mcusercontent.com domain, with no distinguishing alt text
+    on either. Reuses extraction.pdf_images.is_floorplan_image's own
+    pixel-content signal instead (a floor plan renders on an
+    overwhelmingly white background, confirmed empirically far whiter
+    than any real photo) — an actual fetch of the image bytes, not a URL
+    guess. Any fetch failure (network error, timeout, non-2xx, undecodable
+    image) is treated as "not a floor plan" — kept as a photo candidate
+    rather than dropped, and never allowed to fail or block the batch."""
+    try:
+        resp = requests.get(url, timeout=_IMAGE_FETCH_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+    except Exception:
+        return False
+    return pdf_images.is_floorplan_image(resp.content)
 
 
 def is_low_trust_link_domain(url):
@@ -112,12 +160,17 @@ def enrich_records(records, html_items):
       brochure link ANYWHERE in the document belongs to it, there's no
       other listing to misattribute to (same reasoning as app.py's own
       _attach_pdf_images single-record special case).
-    - 2+ distinct buildings (a multi-listing digest) — falls back to a
-      bounded text-proximity scan around each occurrence of a building's
-      own name in the html_items sequence. Real-world accuracy for this
-      tier hasn't been verified against an actual multi-building
-      LLM-fallback .eml yet, since none has come through this path so
-      far — flag it if a future one is ever seen to misattribute."""
+    - 2+ distinct buildings (a multi-listing digest) — segments
+      html_items by real-content-image position, one segment per
+      listing (see _segment_by_real_image). Confirmed real (2026-07,
+      Workplace Plus — the first genuinely multi-building LLM-fallback
+      .eml to ever exercise this tier): the ORIGINAL strategy here —
+      anchoring on a building's own name appearing in a link's visible
+      text — completely failed for this source, since every link's
+      visible text is generic ("Brochure", a phone number, or blank),
+      never a building name at all, so every anchor search came back
+      empty and nothing got enriched at all despite real photos and
+      brochure links genuinely existing in the source."""
     if not records or not html_items:
         return
 
@@ -138,8 +191,22 @@ def _collect(html_items):
     brochure_url = None
     for kind, a, b in html_items:
         if kind == "image":
-            if is_real_content_image(a, b) and b not in images:
-                images.append(b)
+            if is_real_content_image(a, b) and b not in images and b not in (floorplan_url,):
+                # Confirmed real (2026-07, MetSpace's own "Office Of The
+                # Week" template): a source can genuinely have BOTH a real
+                # content photo and a floor-plan diagram from the exact
+                # same domain, with identical (or no) alt text — nothing
+                # about the URL/alt text tells them apart, unlike a
+                # dedicated rule's own domain-based assumption (e.g.
+                # extraction.rules.metspace trusting mcusercontent.com to
+                # mean "floor plan" for ITS OWN template) which doesn't
+                # hold here. Only checked once floor_plan_url is still
+                # unclaimed — an actual pixel fetch per image, so no
+                # need to re-check once a floor plan's already been found.
+                if floorplan_url is None and is_floorplan_image_url(b):
+                    floorplan_url = b
+                else:
+                    images.append(b)
         elif kind == "link":
             if floorplan_url is None and is_floorplan_link(a):
                 floorplan_url = b
@@ -164,20 +231,53 @@ def _enrich_single_building(records, html_items):
 
 
 def _enrich_multi_building(records, html_items):
-    n = len(html_items)
+    """Assigns one segment (_segment_by_real_image) per DISTINCT
+    building, in order, to however many consecutive records share that
+    building — confirmed real (2026-07, Workplace Plus): its own two
+    "150 Waterloo Road" floors are two separate records but share the
+    ONE photo/brochure segment that building's own listing has (this
+    source has one real photo per BUILDING, not per floor), so a naive
+    one-record-per-segment mapping would starve every record after the
+    first repeat. Relies on the LLM having extracted records in the same
+    top-to-bottom order the source itself lists them in — the same
+    order-preserving assumption already relied on elsewhere
+    (extraction.xlsx_links' own row consumption) — since there's no
+    building-name text anywhere in html_items to match against instead
+    (see this function's own caller, enrich_records, for why the
+    original text-anchored strategy failed here). Stops silently,
+    leaving remaining records unenriched, if there turn out to be more
+    distinct buildings than segments — safer than guessing wrong."""
+    segments = _segment_by_real_image(html_items)
+    if not segments:
+        return
+
+    seg_idx = -1
+    prev_building = None
     for record in records:
         building = record.get("Building") or ""
-        if not building:
-            continue
-        building_l = building.lower()
-        anchor_positions = [
-            i for i, (kind, a, _b) in enumerate(html_items) if kind == "link" and a and building_l in a.lower()
-        ]
-        if not anchor_positions:
-            continue
-        window_items = []
-        for pos in anchor_positions:
-            start, end = max(0, pos - PROXIMITY_WINDOW), min(n, pos + PROXIMITY_WINDOW + 1)
-            window_items.extend(html_items[start:end])
-        images, floorplan_url, brochure_url = _collect(window_items)
+        if seg_idx == -1 or building != prev_building:
+            seg_idx += 1
+            prev_building = building
+        if seg_idx >= len(segments):
+            break
+        images, floorplan_url, brochure_url = _collect(segments[seg_idx])
         _apply(record, images, floorplan_url, brochure_url)
+
+
+def _segment_by_real_image(html_items):
+    """Splits html_items into one segment per real content image
+    (is_real_content_image) — each segment starts right at a real
+    image's own position and runs up to (not including) the NEXT real
+    image, so a "Brochure"/"Website"-style link that immediately follows
+    a listing's photo falls into that same listing's segment. Everything
+    before the FIRST real image (header logo, social icons, sender's own
+    signature graphics) is discarded — it can never belong to any real
+    listing. Returns [] if the source has no real content images at all
+    (nothing to segment by)."""
+    boundaries = [i for i, (kind, a, b) in enumerate(html_items) if kind == "image" and is_real_content_image(a, b)]
+    if not boundaries:
+        return []
+    return [
+        html_items[start : boundaries[idx + 1] if idx + 1 < len(boundaries) else len(html_items)]
+        for idx, start in enumerate(boundaries)
+    ]
