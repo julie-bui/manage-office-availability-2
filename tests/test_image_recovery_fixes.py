@@ -30,6 +30,35 @@ def test_union_rule_parses_without_llm_and_recovers_hidden_box_links():
     assert cannon[0]["Brochure PDF"] == cannon[1]["Brochure PDF"]
 
 
+def test_union_floor_plan_labeled_box_links_fill_brochure():
+    """UNION rows labeled only 'FLOOR PLAN' still get Brochure PDF filled.
+
+    Confirmed real (2026-07): 155 Fenchurch Street 7th and Broadgate Tower
+    19th carried a Box URL behind display text "FLOOR PLAN" — classifying
+    that as floorplan-only left Brochure PDF blank and High Res empty.
+    """
+    content = read_file(UNION_CITY2)
+    rule, records = try_rules(content)
+    assert rule == "UNION"
+    fenchurch = next(
+        r for r in (normalize_record(x) for x in records)
+        if "155 Fenchurch" in r["Building"] and r["Floor/Unit"] == "7th"
+    )
+    assert fenchurch["Brochure PDF"].startswith("https://app.box.com/s/")
+    assert fenchurch["Floor Plan"].startswith("https://app.box.com/s/")
+    broadgate = next(
+        r for r in (normalize_record(x) for x in records)
+        if r["Building"] == "Broadgate Tower"
+        and str(r["Floor/Unit"]).startswith("19th")
+        and "split" not in str(r["Floor/Unit"]).lower()
+    )
+    assert broadgate["Brochure PDF"].startswith("https://app.box.com/s/")
+    blank = [normalize_record(r) for r in records if not r.get("Brochure PDF")]
+    # The only known source row without a hyperlink at all is "100 Lower
+    # Thames Street"; everything else must have a Brochure PDF.
+    assert all("Lower Thames" in (r["Building"] or "") for r in blank)
+
+
 def test_box_shared_name_and_hosted_static_pdf_candidate():
     url = "https://app.box.com/s/5ln9uri46xhq586qdoskbc37rhrrftr7"
     assert _box_shared_name(url) == "5ln9uri46xhq586qdoskbc37rhrrftr7"

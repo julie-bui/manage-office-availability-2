@@ -462,12 +462,121 @@ def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
         brochure_enrichment=True,
     )[0]
     assert result["status"] == "ok"
-    assert captured["deadline"] == pytest.approx(batch_deadline - 10, abs=0.5)
+    assert captured["deadline"] == pytest.approx(batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS, abs=0.5)
     # Old behaviour: min(deadline-20, now+15) ≈ batch_deadline-65 for an 80s
-    # batch. Current behaviour keeps deadline-10 so brochure enrichment (the
-    # path that actually fills High Res for MetSpace/UNION/Workplace Plus
-    # sheets) gets most of the remaining batch headroom.
+    # batch. Solo files still receive nearly the full remaining enrichment
+    # headroom (deadline - finalize reserve).
     assert captured["deadline"] > batch_deadline - 20
+
+
+def test_batch_enrichment_splits_deadline_across_files(monkeypatch):
+    """Each file takes a fair share of remaining enrichment time when it starts.
+
+    Confirmed real (2026-07): MetSpace+Knotel together left Knotel on its
+    single email featured photo because MetSpace consumed the shared budget.
+    Absolute-from-batch-start windows also failed — MetSpace overrun left
+    Knotel with almost no time while later files still got galleries.
+    """
+    paths = [
+        next(Path(".").glob("Fw_ MetSpace Availability Update.eml")),
+        next(Path(".").glob("Fw_ Knotel Availability _ 30_06_2026.eml")),
+    ]
+    captured = []
+
+    def fake_enrich(properties, **kwargs):
+        captured.append({"deadline": kwargs.get("deadline"), "started": time.monotonic()})
+        # Simulate MetSpace overrun past a naive absolute midpoint so the
+        # second file's fair-share deadline must be computed from "now".
+        if len(captured) == 1:
+            time.sleep(0.35)
+        return list(properties)
+
+    monkeypatch.setattr(pipeline.brochure, "enrich_properties", fake_enrich)
+    monkeypatch.setattr(pipeline, "_geocode_records", lambda *_args: (False, False))
+
+    batch_start = time.monotonic()
+    batch_deadline = batch_start + 80
+    results = pipeline.process_files(paths, deadline=batch_deadline, brochure_enrichment=True)
+    assert [r["status"] for r in results] == ["ok", "ok"]
+    assert len(captured) == 2
+    pool_end = batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS
+    # File 0: half of remaining pool at start.
+    assert captured[0]["deadline"] == pytest.approx(
+        captured[0]["started"] + (pool_end - captured[0]["started"]) / 2,
+        abs=0.5,
+    )
+    # File 1 starts after MetSpace delay and still receives nearly all
+    # remaining pool time (1 file left → full remainder).
+    assert captured[1]["deadline"] == pytest.approx(pool_end, abs=1.0)
+    assert captured[1]["deadline"] - captured[1]["started"] > 30
+
+
+def test_enrichment_wave_hard_stops_at_deadline():
+    """New brochure waves must not start inside the pre-deadline margin."""
+    started = time.monotonic()
+    deadline = started + 0.3
+    calls = []
+
+    def slow_fetch(url, deadline=None):
+        calls.append(url)
+        time.sleep(2.0)
+        return BrochureResource(b"<html></html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        return BrochureExtraction(final_url, assets=[], identity_text="Example House EC1A 1AA")
+
+    props = [
+        Property.from_record(
+            normalize_record({
+                "Building": "Example House",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": f"https://property.test/{i}",
+            }),
+            "batch.eml",
+            "Knotel",
+            "rule:Knotel",
+        )
+        for i in range(6)
+    ]
+    enrich_properties(props, fetcher=slow_fetch, extractor=extract, deadline=deadline)
+    # 4s pre-deadline margin with a 0.3s budget → no wave starts.
+    assert calls == []
+    assert time.monotonic() - started < 0.8
+
+
+def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
+    """Knotel HTML galleries should not burn time fetching nested brochures."""
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        assert "brochure.pdf" not in url
+        return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        return BrochureExtraction(
+            final_url,
+            assets=[
+                classify_candidate(AssetCandidate(f"{final_url}/a.jpg", final_url, alt_text="Office")),
+                classify_candidate(AssetCandidate(f"{final_url}/b.jpg", final_url, alt_text="Reception")),
+                classify_candidate(AssetCandidate(f"{final_url}/brochure.pdf", final_url, anchor_text="Download brochure")),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "Brochure PDF": "https://property.test/listing",
+        }),
+        "knotel.eml",
+        "Knotel",
+        "rule:Knotel",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    assert fetched == ["https://property.test/listing"]
+    assert len(prop.values.get("_high_res_candidates") or []) >= 2
 
 
 def test_workplace_plus_address_accepts_manchester_and_other_cities():
@@ -487,6 +596,31 @@ def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
         [{"Building": "A", "High Res Images": ""}],
         "rule:BC",
     ) == ""
+
+
+def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
+    """Knotel Directus candidates must survive finalize after a late Union wave."""
+    urls = [
+        "https://knotel.directus.app/assets/aaa11111-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "https://knotel.directus.app/assets/fff22222-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "https://knotel.directus.app/assets/ggg33333-bbbb-cccc-dddd-eeeeeeeeeeee",
+    ]
+    record = {
+        "Building": "Classic House",
+        "_source_high_res_candidates": [urls[0]],
+        "_high_res_candidates": urls,
+        "High Res Images": urls[0],
+    }
+    past = time.monotonic() - 1
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Knotel",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
+            deadline=past,
+        )
+    assert record["_high_res_image_count"] == 3
+    assert "photos" in (record.get("High Res Images") or "")
+    assert jobs
 
 
 def test_finalize_caps_high_res_gallery_at_five(tmp_path):

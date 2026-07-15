@@ -45,6 +45,21 @@ BATCH_DEADLINE_SECONDS = 100
 # enough shared time for the longest bounded lookup (Gemini: 25s) plus a
 # small scheduling margin. Core extraction and spreadsheet writing win.
 OPTIONAL_LOOKUP_START_SECONDS = 30
+# Reserve wall-clock for finalize/write after the last file's enrichment.
+# Must cover gallery HTML writes for every earlier file: Union Box waves
+# previously ran into (and past) batch_deadline and left Knotel finalize
+# with OPTIONAL_IMAGE_VALIDATION_SKIPPED for every Directus URL.
+ENRICHMENT_FINALIZE_RESERVE_SECONDS = 20
+# Confirmed real (2026-07 batch MetSpace+Knotel+WP+Union): enrichment used
+# ONE absolute deadline shared by every file. MetSpace (first) consumed the
+# budget fetching Drive brochure photos; Knotel (second) kept only its
+# single email featured image; Union got almost no Box PDF photos.
+# Absolute equal windows FROM batch-start failed too: when MetSpace overrun
+# its slice, Knotel's fixed end-time was already nearly gone (email-only
+# singles again) while Workplace Plus — later, with a later absolute end —
+# still got galleries. Each file therefore takes a fair share of WHATEVER
+# enrichment time remains when that file starts (remaining / files left),
+# and in-flight brochure waves hard-stop at that deadline.
 
 
 # A trailing postal district/area code with no inward part (e.g. "W1",
@@ -166,8 +181,11 @@ def process_files(
         deadline = time.monotonic() + BATCH_DEADLINE_SECONDS
 
     results = []
+    path_list = list(paths)
+    total_files = len(path_list)
+    _enrich_pool_end = deadline - ENRICHMENT_FINALIZE_RESERVE_SECONDS
 
-    for path in paths:
+    for file_index, path in enumerate(path_list):
         filename = path.name if hasattr(path, "name") else str(path)
         source_url = _source_url_for(path, filename, source_urls)
         report = ProcessingReport(filename)
@@ -403,21 +421,14 @@ def process_files(
             for record in normalized
         ]
 
+        enrichment_deadline = None
         if brochure_enrichment:
-            # Confirmed real (GPE, MetSpace, 2026-07): this used to hard-cap
-            # at time.monotonic() + 15 no matter how much of the overall
-            # batch deadline was actually free -- so even a SOLO upload with
-            # 80+ free seconds still only gave linked-source enrichment 15
-            # seconds total. A file with several distinct buildings each
-            # needing their own real network fetch (a property page, plus up
-            # to 2 nested document fetches) routinely burns through that in
-            # the FIRST building alone, leaving every other building in the
-            # file to hit "budget exhausted" regardless of whether it's a
-            # repeat building or a brand-new one. Now scales with whatever's
-            # actually left of the real deadline (reserving 20s for image
-            # validation/writing the file afterward) instead of an arbitrary
-            # small constant that ignored genuinely available headroom.
-            enrichment_deadline = deadline - 10
+            # Fair share of remaining enrichment time when THIS file starts —
+            # not an absolute clock from batch start (that left Knotel with
+            # ~5s after MetSpace overrun while WP still got a full window).
+            files_remaining = max(1, total_files - file_index)
+            remaining_enrich = max(0.0, _enrich_pool_end - time.monotonic())
+            enrichment_deadline = time.monotonic() + remaining_enrich / files_remaining
             kwargs = {}
             if brochure_fetcher is not None:
                 kwargs["fetcher"] = brochure_fetcher
@@ -436,7 +447,19 @@ def process_files(
             report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} linked-source issue(s)" if brochure_issues else "Optional linked-source enrichment complete", len(properties))
         normalized = [prop.values for prop in properties]
 
-        quota_exhausted, deadline_hit = _geocode_records(normalized, filename, provider_name, deadline)
+        # Geocode only with surplus left before this file's enrichment
+        # deadline — never spend later files' brochure shares on Nominatim.
+        files_after = max(0, total_files - file_index - 1)
+        if files_after > 0 and enrichment_deadline is not None:
+            geocode_deadline = min(deadline, enrichment_deadline)
+            if geocode_deadline <= time.monotonic():
+                geocode_deadline = time.monotonic()
+        elif files_after > 0:
+            rem = max(0.0, _enrich_pool_end - time.monotonic())
+            geocode_deadline = time.monotonic() + rem / (files_after + 1)
+        else:
+            geocode_deadline = deadline
+        quota_exhausted, deadline_hit = _geocode_records(normalized, filename, provider_name, geocode_deadline)
         report.record(
             "ENRICHMENT",
             "WARNING" if quota_exhausted or deadline_hit else "PASS",

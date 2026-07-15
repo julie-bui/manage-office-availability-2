@@ -104,7 +104,10 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
             # longer per-request timeout than a normal HTML property page.
             if "/shared/static/" in (urlparse(current).path or "") or _box_shared_name(current):
                 if deadline is not None:
-                    effective_timeout = min(25.0, max(0.5, deadline - time.monotonic()))
+                    # Cap under the remaining enrichment window so a late
+                    # UNION wave cannot overrun batch_deadline and erase
+                    # earlier files' galleries at finalize time.
+                    effective_timeout = min(12.0, max(0.5, deadline - time.monotonic()))
                 else:
                     effective_timeout = max(float(timeout), 20.0)
             else:
@@ -629,7 +632,10 @@ def enrich_properties(
                 )
 
     for wave_start in range(0, len(pending), wave_size):
-        if deadline is not None and time.monotonic() >= deadline:
+        # Stop before starting a wave that cannot finish inside this file's
+        # fair share. Drive/Box fetches use up to ~20s; keep a margin so the
+        # last wave does not wipe Knotel/Workplace Plus enrichment time.
+        if deadline is not None and time.monotonic() >= deadline - 4.0:
             for brochure_url in pending[wave_start:]:
                 for _, prop, _ in by_url[brochure_url]:
                     _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
@@ -644,6 +650,10 @@ def enrich_properties(
                 result = exc
             _apply_result(brochure_url, result)
             continue
+        # Wait for the wave to finish (requests timeouts already respect
+        # `deadline`). Abandoned wait=False workers kept downloading UNION /
+        # Drive PDFs into the next file's enrichment window and starved
+        # Knotel's lighter HTML gallery fetches (confirmed 2026-07 4-file batch).
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
             futures = {
                 pool.submit(_retrieve, brochure_url, fetcher, extractor, deadline): brochure_url
@@ -676,8 +686,20 @@ def _retrieve(url, fetcher, extractor, deadline=None):
     combined = extractor(resource.payload, resource.content_type, resource.final_url)
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
-    # as a PDF link. Follow at most two unique document assets, once each.
-    documents = [a.url for a in combined.assets if a.classification == AssetType.BROCHURE and a.url != resource.final_url][:2]
+    # as a PDF link. Follow at most two unique document assets, once each —
+    # but skip nested PDFs when the page itself already supplies enough
+    # High Res candidates (Knotel property pages: ~13s for 16 galleries from
+    # HTML alone; following PDFs burned the multi-file enrichment window).
+    page_photos = sum(
+        1 for a in combined.assets
+        if a.classification == AssetType.PROPERTY_IMAGE and (a.url or a.content)
+    )
+    documents = []
+    if page_photos < 2:
+        documents = [
+            a.url for a in combined.assets
+            if a.classification == AssetType.BROCHURE and a.url != resource.final_url
+        ][:2]
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(

@@ -651,6 +651,30 @@ def _is_local_download_url(url, batch_id):
     )
 
 
+def _accept_image_url_under_deadline(url):
+    """Keep already-discovered property photos when HTTP validation is cut.
+
+    Confirmed real (2026-07 MetSpace+Knotel+WP+Union): Knotel enrichment
+    produced 5 Directus photo URLs per row, then Union Box PDFs overran
+    batch_deadline; finalize marked every non-source URL
+    OPTIONAL_IMAGE_VALIDATION_SKIPPED and left email-only singles. Trust
+    image-like URLs already found during enrichment rather than erasing them.
+    """
+    text = str(url or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(text)
+    path = (parsed.path or "").lower()
+    if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+        return True
+    host = (parsed.netloc or "").lower()
+    if "directus" in host or "cloudinary" in host or "imgix" in host:
+        return True
+    if "/assets/" in path or "/image/" in path or "/images/" in path:
+        return True
+    return False
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -701,10 +725,17 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 # every row of a building after its first.
                 result = cached
             elif deadline is not None and time.monotonic() >= deadline - 5:
-                result = {
-                    "ok": False, "url": candidate,
-                    "status": "OPTIONAL_IMAGE_VALIDATION_SKIPPED",
-                }
+                if _accept_image_url_under_deadline(candidate):
+                    result = {
+                        "ok": True,
+                        "url": candidate,
+                        "status": "VALID_IMAGE_ACCEPTED_UNDER_DEADLINE",
+                    }
+                else:
+                    result = {
+                        "ok": False, "url": candidate,
+                        "status": "OPTIONAL_IMAGE_VALIDATION_SKIPPED",
+                    }
             else:
                 validator_kwargs = {"cache": validation_cache}
                 if deadline is not None:

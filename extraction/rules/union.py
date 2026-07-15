@@ -1,11 +1,12 @@
 """Rule-based parser for UNION availability spreadsheets.
 
 UNION sheets are a plain availability grid (header mid-sheet, one row per
-floor) with Brochure cells labeled "CLICK HERE" whose real destinations are
-Box shared links — invisible to pandas' value-only read and previously only
-recoverable after an LLM parse + xlsx_links enrichment. Without GEMINI_API_KEY
-that path fails entirely ("doesn't process") and High Res / Brochure stay
-blank even though the hyperlinks were always present.
+floor) with Brochure cells labeled "CLICK HERE" / "Landlord Brochure" /
+"FLOOR PLAN" whose real destinations are Box shared links — invisible to
+pandas' value-only read and previously only recoverable after an LLM parse
++ xlsx_links enrichment. Without GEMINI_API_KEY that path fails entirely
+("doesn't process") and High Res / Brochure stay blank even though the
+hyperlinks were always present.
 
 Layout (per sheet — City, Shoreditch, …):
     intro / instruction rows
@@ -14,6 +15,11 @@ Layout (per sheet — City, Shoreditch, …):
 
 Column "City" holds the building name (UNION's own header wording); the sheet
 name / Area column value is the sub-market, not a UK city name.
+
+Confirmed real (2026-07): some UNION rows label the Box landlord PDF
+"FLOOR PLAN" even when no separate brochure link exists — treating that as
+Floor-Plan-only left Brochure PDF blank. Those Box URLs are also filed as
+Brochure PDF so enrichment can still pull High Res images.
 """
 import re
 
@@ -36,6 +42,7 @@ _UNION_HINT_RE = re.compile(
     r"\bunion\b|sub-market\s+avai?ability|short form all inclusive lease",
     re.I,
 )
+_FLOOR_TOKEN_RE = re.compile(r"(\d+)(?:st|nd|rd|th)?|\b(ground|lower\s*ground|basement|mezzanine)\b", re.I)
 
 
 def detect(content):
@@ -134,42 +141,61 @@ def _cell(row, index):
     return "" if text.lower() in {"nan", "none", "click here"} else text
 
 
+def _floor_token(value):
+    """Normalize '7th' / '7th Floor' / '19th (can split…)' to a stable token."""
+    text = _normalize_for_matching(value or "")
+    match = _FLOOR_TOKEN_RE.search(text)
+    if not match:
+        return text
+    if match.group(1):
+        return match.group(1)
+    return re.sub(r"\s+", " ", (match.group(2) or "").strip().lower())
+
+
 def _attach_row_links(records, row_links):
     """Recover Box (etc.) hyperlinks hidden behind CLICK HERE display text."""
     if not records or not row_links:
         return
     available = [
-        {"row_text": _normalize_for_matching(row["row_text"]), "links": row["links"]}
+        {
+            "sheet_name": _normalize_for_matching(row.get("sheet_name") or ""),
+            "row_text": _normalize_for_matching(row["row_text"]),
+            "links": row["links"],
+        }
         for row in row_links
     ]
-    for record in records:
+
+    def find_match(record, require_floor):
         building = (record.get("Building") or "").strip()
         if not building:
-            continue
+            return None
         building_l = _normalize_for_matching(building)
-        floor_l = _normalize_for_matching(record.get("Floor/Unit") or "")
-        match_idx = None
+        floor_token = _floor_token(record.get("Floor/Unit") or "")
+        area_l = _normalize_for_matching(record.get("Area") or "")
         for i, row in enumerate(available):
+            if area_l and row["sheet_name"] and area_l != row["sheet_name"]:
+                continue
             if building_l not in row["row_text"]:
                 continue
-            if floor_l and floor_l not in row["row_text"]:
+            if require_floor and floor_token and floor_token not in row["row_text"]:
                 continue
-            match_idx = i
-            break
-        if match_idx is None:
-            match_idx = next(
-                (i for i, row in enumerate(available) if building_l in row["row_text"]),
-                None,
-            )
-        if match_idx is None:
-            continue
-        row = available.pop(match_idx)
+            return i
+        return None
+
+    def apply_links(record, row):
         floorplan_url = None
         brochure_candidates = []
         for display_text, url in row["links"]:
+            if not url:
+                continue
             if is_floorplan_link(display_text):
                 if floorplan_url is None:
                     floorplan_url = url
+                # Confirmed real (2026-07): UNION often labels the Box
+                # landlord PDF "FLOOR PLAN" with no separate Brochure
+                # cell — that URL is still the brochure for High Res
+                # enrichment, so keep it as a brochure candidate too.
+                brochure_candidates.append(url)
             else:
                 brochure_candidates.append(url)
         brochure_url = _best_brochure_candidate(brochure_candidates)
@@ -177,3 +203,14 @@ def _attach_row_links(records, row_links):
             record["Floor Plan"] = floorplan_url
         if brochure_url and not record.get("Brochure PDF"):
             record["Brochure PDF"] = brochure_url
+
+    # Pass 1: building + floor (+ sheet) so multi-floor buildings keep
+    # their own Box link. Pass 2: building-only for leftovers.
+    for require_floor in (True, False):
+        for record in records:
+            if record.get("Brochure PDF"):
+                continue
+            match_idx = find_match(record, require_floor=require_floor)
+            if match_idx is None:
+                continue
+            apply_links(record, available.pop(match_idx))
