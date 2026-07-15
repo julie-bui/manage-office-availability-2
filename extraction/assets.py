@@ -1,6 +1,7 @@
 """Deterministic asset discovery, normalization, classification and assignment."""
 import re
 import hashlib
+import time
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Callable, Dict, Iterable, List, Sequence
@@ -8,6 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
+from .html_images import _IMAGE_FETCH_TIMEOUT_SECONDS
 from .models import AssetCandidate, AssetType
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -164,13 +166,74 @@ def merge_candidate_urls(*groups: Iterable[str]) -> List[str]:
     return result
 
 
+def _fetch_and_evaluate(url: str, timeout: float, requester: Callable) -> dict:
+    """One real fetch attempt. Raises on network/HTTP failure; returns a
+    result dict for every outcome that did reach a response (too large, not
+    an image, too small, valid)."""
+    response = requester(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "OfficeAvailability/1.0", "Range": f"bytes=0-{MAX_VALIDATION_BYTES - 1}"},
+        allow_redirects=True,
+        stream=True,
+    )
+    response.raise_for_status()
+    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+    if hasattr(response, "iter_content"):
+        chunks, total = [], 0
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_VALIDATION_BYTES:
+                break
+        payload = b"".join(chunks)
+    else:
+        payload = response.content
+    if len(payload) > MAX_VALIDATION_BYTES:
+        return {"ok": False, "status": "IMAGE_TOO_LARGE", "url": url}
+    if not content_type.startswith("image/"):
+        return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "content_type": content_type}
+    from PIL import Image
+    with Image.open(BytesIO(payload)) as image:
+        width, height = image.size
+        image.verify()
+    final_url = normalize_url(response.url or url)
+    ok = width >= MIN_PROPERTY_IMAGE_WIDTH and height >= MIN_PROPERTY_IMAGE_HEIGHT
+    return {
+        "ok": ok,
+        "status": "VALID_IMAGE" if ok else "IMAGE_TOO_SMALL",
+        "url": final_url or url,
+        "width": width,
+        "height": height,
+        "content_type": content_type,
+        "unstable": bool(_UNSTABLE_RE.search(response.url or url)),
+    }
+
+
 def validate_image_url(
     url: str,
-    timeout: float = 3.0,
+    timeout: float = _IMAGE_FETCH_TIMEOUT_SECONDS,
     requester: Callable = requests.get,
     cache: Dict[str, dict] = None,
+    deadline: float = None,
 ) -> dict:
-    """Bounded, cached validation used once per canonical external image URL."""
+    """Bounded, cached validation used once per canonical external image URL.
+
+    Shares its timeout budget with extraction.html_images.is_floorplan_image_url
+    (the classification-time fetch of these same URLs) rather than duplicating
+    a shorter one of its own — confirmed real (2026-07, MetSpace mcusercontent.com
+    photos): a real, live image that classification's own longer timeout
+    tolerated was still being rejected here as "expired/inaccessible" for
+    needing a few more seconds than this function alone was willing to wait.
+
+    A timeout specifically (as opposed to a real 404/DNS failure/other error)
+    gets one retry — but only when `deadline` (the caller's own batch/
+    enrichment deadline, a time.monotonic() timestamp) leaves enough budget
+    for a full second attempt; never risk overrunning a deadline this app
+    already depends on elsewhere just to retry an optional image fetch.
+    """
     normalized = normalize_url(url)
     cache = cache if cache is not None else {}
     if not normalized:
@@ -178,46 +241,17 @@ def validate_image_url(
     if normalized in cache:
         return cache[normalized]
     try:
-        response = requester(
-            normalized,
-            timeout=timeout,
-            headers={"User-Agent": "OfficeAvailability/1.0", "Range": f"bytes=0-{MAX_VALIDATION_BYTES - 1}"},
-            allow_redirects=True,
-            stream=True,
-        )
-        response.raise_for_status()
-        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
-        if hasattr(response, "iter_content"):
-            chunks, total = [], 0
-            for chunk in response.iter_content(64 * 1024):
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > MAX_VALIDATION_BYTES:
-                    break
-            payload = b"".join(chunks)
+        result = _fetch_and_evaluate(normalized, timeout, requester)
+    except requests.exceptions.Timeout as exc:
+        if deadline is None or time.monotonic() + timeout <= deadline:
+            try:
+                result = _fetch_and_evaluate(normalized, timeout, requester)
+            except requests.exceptions.Timeout as retry_exc:
+                result = {"ok": False, "status": "LINK_TIMED_OUT", "url": normalized, "detail": str(retry_exc)}
+            except Exception as retry_exc:
+                result = {"ok": False, "status": "LINK_EXPIRED_OR_INACCESSIBLE", "url": normalized, "detail": str(retry_exc)}
         else:
-            payload = response.content
-        if len(payload) > MAX_VALIDATION_BYTES:
-            result = {"ok": False, "status": "IMAGE_TOO_LARGE", "url": normalized}
-        elif not content_type.startswith("image/"):
-            result = {"ok": False, "status": "NOT_AN_IMAGE", "url": normalized, "content_type": content_type}
-        else:
-            from PIL import Image
-            with Image.open(BytesIO(payload)) as image:
-                width, height = image.size
-                image.verify()
-            final_url = normalize_url(response.url or normalized)
-            result = {
-                "ok": width >= MIN_PROPERTY_IMAGE_WIDTH and height >= MIN_PROPERTY_IMAGE_HEIGHT,
-                "status": "VALID_IMAGE" if width >= MIN_PROPERTY_IMAGE_WIDTH and height >= MIN_PROPERTY_IMAGE_HEIGHT else "IMAGE_TOO_SMALL",
-                "url": final_url or normalized,
-                "width": width,
-                "height": height,
-                "content_type": content_type,
-                "unstable": bool(_UNSTABLE_RE.search(response.url or normalized)),
-            }
+            result = {"ok": False, "status": "LINK_TIMED_OUT", "url": normalized, "detail": str(exc)}
     except Exception as exc:
         result = {"ok": False, "status": "LINK_EXPIRED_OR_INACCESSIBLE", "url": normalized, "detail": str(exc)}
     cache[normalized] = result

@@ -438,7 +438,17 @@ def enrich_properties(
             continue
         if not brochure_url:
             continue
-        if deadline is not None and time.monotonic() >= deadline:
+        # Confirmed real (2026-07, GPE "16 Dufour's Place"): a building
+        # repeated across several rows (one per floor) shares the exact
+        # same Brochure PDF URL, fetched/extracted once and cached. This
+        # deadline check used to run before the cache lookup below, so
+        # once the (deliberately short, ~15s) enrichment budget for the
+        # whole file was used up by the FIRST row's own real network
+        # fetch, every later row sharing that already-cached URL got
+        # skipped too -- even though reusing a cache hit costs nothing
+        # and there was no real budget reason to skip it. Only a genuinely
+        # new fetch (not yet in cache) is gated on the deadline now.
+        if brochure_url not in cache and deadline is not None and time.monotonic() >= deadline:
             _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
             prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             continue

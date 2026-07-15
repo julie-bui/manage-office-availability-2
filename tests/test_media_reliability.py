@@ -3,10 +3,12 @@ from io import BytesIO
 import time
 
 import pytest
+import requests
 from PIL import Image
 
 from extraction import brochure as brochure_module, pipeline
 from extraction.assets import classify_candidate, merge_candidate_urls, normalize_url, validate_image_url
+from extraction.html_images import _IMAGE_FETCH_TIMEOUT_SECONDS
 from extraction.identity import IdentityDecision, compare_property_identity
 from extraction.brochure import _embedded_http_target, enrich_properties
 from extraction.models import AssetCandidate, AssetType, BrochureExtraction, BrochureResource, Property
@@ -109,7 +111,7 @@ def test_image_validation_is_bounded_cached_and_typed():
     assert first["url"] == "https://img.test/final.jpg"
     assert second == first
     assert len(calls) == 1
-    assert calls[0][1]["timeout"] == 3.0
+    assert calls[0][1]["timeout"] == _IMAGE_FETCH_TIMEOUT_SECONDS
     assert calls[0][1]["headers"]["Range"].startswith("bytes=0-")
 
 
@@ -120,6 +122,64 @@ def test_image_validation_rejects_html_small_and_inaccessible():
     assert html["ok"] is False and html["status"] == "NOT_AN_IMAGE"
     assert small["ok"] is False and small["status"] == "IMAGE_TOO_SMALL"
     assert failed["ok"] is False and failed["status"] == "LINK_EXPIRED_OR_INACCESSIBLE"
+
+
+def test_timeout_is_retried_once_within_deadline_budget_and_can_succeed():
+    """Confirmed real (2026-07, MetSpace mcusercontent.com): a real, live
+    image can take longer than one attempt's timeout to transfer (larger
+    file, cold CDN cache). A bare requests timeout shouldn't permanently
+    blank it if there's deadline budget left for one more try."""
+    calls = []
+    def flaky_then_ok(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.exceptions.ReadTimeout("slow CDN")
+        return FakeResponse(image_bytes())
+    result = validate_image_url(
+        "https://img.test/slow.jpg", requester=flaky_then_ok, cache={},
+        deadline=time.monotonic() + 100,
+    )
+    assert len(calls) == 2
+    assert result["ok"] is True
+    assert result["status"] == "VALID_IMAGE"
+
+
+def test_timeout_gets_its_own_status_distinct_from_a_real_dead_link():
+    """LINK_TIMED_OUT (a slow/uncertain fetch) must stay distinguishable
+    from LINK_EXPIRED_OR_INACCESSIBLE (a real 404/DNS/connection failure)
+    on the QA sheet, even after retrying once and still timing out."""
+    def always_slow(url, **kwargs):
+        raise requests.exceptions.ConnectTimeout("too slow")
+    result = validate_image_url(
+        "https://img.test/slow.jpg", requester=always_slow, cache={},
+        deadline=time.monotonic() + 100,
+    )
+    assert result["ok"] is False
+    assert result["status"] == "LINK_TIMED_OUT"
+
+    dead = validate_image_url(
+        "https://img.test/dead.jpg",
+        requester=lambda *a, **k: (_ for _ in ()).throw(requests.exceptions.ConnectionError("refused")),
+        cache={},
+    )
+    assert dead["status"] == "LINK_EXPIRED_OR_INACCESSIBLE"
+
+
+def test_timeout_retry_never_risks_the_callers_own_deadline():
+    """A caller's own batch/enrichment deadline (see app.py's
+    BATCH_DEADLINE_SECONDS and _finalize_high_res_images) must win over a
+    retry: no second attempt if it could run past that deadline."""
+    calls = []
+    def always_slow(url, **kwargs):
+        calls.append(url)
+        raise requests.exceptions.ReadTimeout("too slow")
+    result = validate_image_url(
+        "https://img.test/slow.jpg", requester=always_slow, cache={},
+        deadline=time.monotonic() - 1,
+    )
+    assert len(calls) == 1
+    assert result["ok"] is False
+    assert result["status"] == "LINK_TIMED_OUT"
 
 
 def test_workplace_assets_are_joined_by_same_card_tracking_url():

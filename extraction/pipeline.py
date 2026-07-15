@@ -294,8 +294,39 @@ def process_files(
                         report.record("PARTIAL_EXTRACTION", "WARNING", "Successful chunks retained", len(raw_records))
                         result["warning"] = "Some spreadsheet sections could not be extracted; successful sections are included. Please review this output for missing rows."
                 else:
-                    raw_records, llm_source_name = extract_with_llm(content["text"], source_hint=filename)
-                    result["method"] = "llm"
+                    try:
+                        raw_records, llm_source_name = extract_with_llm(content["text"], source_hint=filename)
+                        result["method"] = "llm"
+                    except LLMExtractionError as e:
+                        if is_spreadsheet(content) and "not valid JSON" in str(e):
+                            # The single-call response was truncated (hit
+                            # MAX_OUTPUT_TOKENS) before the row count crossed
+                            # LARGE_SPREADSHEET_ROWS — confirmed real
+                            # ("Workplace Plus - London.xlsx", 2026-07): under
+                            # 80 rows, but verbose enough per-row text that
+                            # the JSON output still overran the token budget
+                            # mid-string. Retrying the SAME full-text prompt
+                            # would truncate at the same point again (this is
+                            # exactly what extract_with_llm's own
+                            # retry_malformed already tried and still failed),
+                            # so fall back to bounded per-chunk extraction —
+                            # the same path a >80-row file already uses —
+                            # instead of failing the whole file.
+                            raw_records, llm_source_name, diagnostics = extract_in_chunks(content, source_hint=filename)
+                            result["method"] = "llm:chunked"
+                            result["spreadsheet_diagnostics"] = diagnostics
+                            report.record("LARGE_FILE_CHUNKED", "PASS", item_count=diagnostics["chunks"])
+                            report.record("LLM_CHUNK_SUCCESS", "PASS", item_count=diagnostics["successful_chunks"])
+                            result["warning"] = (
+                                "This file's single-call extraction exceeded Gemini's output size limit "
+                                "(more/denser listing text than its row count suggested), so it was "
+                                "automatically re-processed in smaller chunks instead."
+                            )
+                            if diagnostics["failed_chunks"]:
+                                report.record("LLM_CHUNK_FAILED", "WARNING", item_count=len(diagnostics["failed_chunks"]))
+                                result["warning"] += " Some spreadsheet sections could not be extracted; please review this output for missing rows."
+                        else:
+                            raise
                 report.record("EXTRACTION", "PASS", "llm fallback", len(raw_records))
             except LLMExtractionError as e:
                 memlog.log("after LLM call (raised LLMExtractionError)", filename)

@@ -19,7 +19,7 @@ load_dotenv()
 import storage
 from extraction import address_lookup, geocode as geocode_module, html_images, memlog, pdf_images, xlsx_links
 from extraction.naming import make_unique_names
-from extraction.assets import merge_candidate_urls, validate_image_url
+from extraction.assets import merge_candidate_urls, normalize_url, validate_image_url
 from extraction.models import AssetType, LinkDiagnostic
 from extraction.pipeline import BATCH_DEADLINE_SECONDS, process_files
 from spreadsheet import write_xlsx
@@ -664,15 +664,30 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         valid = []
         rejected = []
         for candidate in candidates:
+            cached = validation_cache.get(normalize_url(candidate))
             if _is_local_download_url(candidate, batch_id) or candidate in trusted:
                 result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+            elif cached is not None:
+                # Confirmed real (2026-07, GPE): a building repeated across
+                # several rows (one per floor) shares the exact same photo
+                # URL(s) — already validated and cached on that building's
+                # FIRST row. Without this check, once the shared batch
+                # deadline (below) got close, every LATER row for the same
+                # building hit the deadline branch and was marked skipped
+                # even though its answer was already known for free, right
+                # here in the cache — silently blanking High Res Images for
+                # every row of a building after its first.
+                result = cached
             elif deadline is not None and time.monotonic() >= deadline - 5:
                 result = {
                     "ok": False, "url": candidate,
                     "status": "OPTIONAL_IMAGE_VALIDATION_SKIPPED",
                 }
             else:
-                result = image_validator(candidate, cache=validation_cache)
+                validator_kwargs = {"cache": validation_cache}
+                if deadline is not None:
+                    validator_kwargs["deadline"] = deadline
+                result = image_validator(candidate, **validator_kwargs)
             if result.get("ok"):
                 resolved = result.get("url") or candidate
                 if resolved not in valid:

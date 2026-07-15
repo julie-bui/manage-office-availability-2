@@ -157,7 +157,7 @@ def _write_qa_sheet(workbook, records):
             "LINK_IDENTITY_MATCH", "LINK_IDENTITY_PROBABLE_MATCH",
             "LINK_IDENTITY_AMBIGUOUS", "LINK_IDENTITY_HARD_CONFLICT",
             "NO_IMAGES_DISCOVERED", "IMAGES_DISCOVERED_BUT_REJECTED", "GALLERY_CREATION_FAILED",
-            "LINK_EXPIRED_OR_INACCESSIBLE", "IMAGE_CANDIDATES_CLASSIFIED", "GALLERY_CREATED", "DIRECT_IMAGE_ASSIGNED",
+            "LINK_EXPIRED_OR_INACCESSIBLE", "LINK_TIMED_OUT", "IMAGE_CANDIDATES_CLASSIFIED", "GALLERY_CREATED", "DIRECT_IMAGE_ASSIGNED",
         }
         for diagnostic in record.get("_link_diagnostics") or []:
             if isinstance(diagnostic, dict):
@@ -175,7 +175,7 @@ def _write_qa_sheet(workbook, records):
                     record.get("Building", ""),
                     "Linked Media",
                     f"{status}: {detail}".rstrip(": "),
-                    "WARNING" if status in {"LINK_IDENTITY_AMBIGUOUS", "LINK_IDENTITY_HARD_CONFLICT", "IMAGES_DISCOVERED_BUT_REJECTED", "GALLERY_CREATION_FAILED", "LINK_EXPIRED_OR_INACCESSIBLE"} else "INFO",
+                    "WARNING" if status in {"LINK_IDENTITY_AMBIGUOUS", "LINK_IDENTITY_HARD_CONFLICT", "IMAGES_DISCOVERED_BUT_REJECTED", "GALLERY_CREATION_FAILED", "LINK_EXPIRED_OR_INACCESSIBLE", "LINK_TIMED_OUT"} else "INFO",
                     get("final_url", "") or get("original_url", ""),
                     f"Identity: {identity}" if identity else "No action required unless the linked media is missing or incorrect.",
                 ]
