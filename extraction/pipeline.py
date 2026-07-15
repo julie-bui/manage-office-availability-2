@@ -327,8 +327,8 @@ def process_files(
                 kwargs["extractor"] = brochure_extractor
             kwargs["deadline"] = min(deadline - 15, time.monotonic() + 20)
             properties = brochure.enrich_properties(properties, **kwargs)
-            brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith("brochure_")]
-            report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} brochure issue(s)" if brochure_issues else "Brochure enrichment complete", len(properties))
+            brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith(("brochure_", "linked_source_"))]
+            report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} linked-source issue(s)" if brochure_issues else "Optional linked-source enrichment complete", len(properties))
         normalized = [prop.values for prop in properties]
 
         quota_exhausted, deadline_hit = _geocode_records(normalized, filename, provider_name, deadline)

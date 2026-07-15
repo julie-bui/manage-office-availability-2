@@ -235,11 +235,43 @@ Semantic conflicts become validation issues rather than silent category reuse.
 Classification is deterministic but heuristic; ambiguous assets can still
 require review.
 
-### Brochure enrichment flow
+### Generic linked-property-source enrichment flow
 
 The implemented provider-neutral flow is:
 
-`brochure asset → bounded retrieval/redirect resolution → PDF or HTML extraction → optional downloadable-PDF follow → typed text evidence + visual candidates → URL/content deduplication → classification → confidence-aware merge → final validation`
+`candidate link → HTTP(S)-only validation → bounded redirect resolution → final payload inspection → PDF, HTML, or image extraction → identity validation → typed text/media evidence → atomic confidence-aware merge → final validation`
+
+`Brochure PDF` is the legacy spreadsheet field that triggers this shared stage;
+it does not imply that the linked resource is a PDF. The resolver preserves the
+original and final URLs and determines resource type from response headers plus
+payload signatures. A misleading `.pdf` suffix cannot force PDF parsing, and an
+extensionless URL remains usable when its actual content is supported. HTML
+pages may contribute lightweight visible text/media and may lead to at most two
+downloadable documents. Direct images are decoded and classified before they
+can enter either media field.
+
+Only public `http://` and `https://` references are followed. `mailto:`, `tel:`,
+`javascript:`, `data:`, local files, custom schemes, private literal IPs, and
+malformed references are never executed or fetched. Adding another scheme in
+future requires an explicit safe resolver. Redirect loops/excess chains,
+oversized responses, unsupported/corrupt content, login or JavaScript-only
+pages, HTTP access/not-found/rate-limit/server errors, timeouts, SSL/DNS errors,
+and anti-bot responses produce a structured skip/failure diagnostic while the
+primary property remains usable.
+
+Before merge, hard property-identity conflicts are checked using available
+postcode and numbered-street evidence. A mismatching destination is rejected
+with `LINK_IDENTITY_MISMATCH`; ambiguous evidence is not invented. Successful
+enrichment is merged into a copy of the property and published atomically, so
+an unexpected failure cannot expose a partially changed record. Strong primary
+values still take precedence and credible conflicts still enter QA Review.
+
+Internal observability records `LINK_RESOLVED`, `LINK_REDIRECT_RESOLVED`,
+`LINK_RESOURCE_PDF`, `LINK_RESOURCE_HTML`, `LINK_RESOURCE_IMAGE`,
+`LINK_UNSUPPORTED`, `LINK_ACCESS_DENIED`, `LINK_NOT_FOUND`, `LINK_TIMEOUT`,
+`LINK_RATE_LIMITED`, `LINK_IDENTITY_MISMATCH`, `LINK_ENRICHMENT_SKIPPED`,
+`LINK_ENRICHMENT_SUCCESS`, and `LINK_ENRICHMENT_FAILED`. Spreadsheet users see
+only warnings that are meaningful for review.
 
 Brochure media is collection-oriented: every relevant HTML image (including
 lazy-load, responsive `srcset`, and social-preview attributes) and every
@@ -264,19 +296,24 @@ and applies equally to dedicated parsers, generic extraction, and future
 unknown providers.
 
 It runs for deterministic provider records and LLM/generic records alike because
-the trigger is a valid `Brochure PDF` value. Retrieved destinations are cached
+the trigger is a valid linked resource in `Brochure PDF`, not a provider name.
+Retrieved destinations are cached
 within the batch so several rows sharing one brochure do not refetch/reparse it.
 At most two linked document assets are followed from one HTML page, and each
 retrieval is subject to a six-second request timeout and 20MB brochure limit.
 The pipeline also caps the brochure stage to approximately 20 seconds per batch
 and preserves an informational diagnostic for rows skipped after that budget.
 
-External property-image URLs and embedded photo bytes are added to the
+Linked-source enrichment is optional. External property-image URLs and embedded photo bytes are added to the
 property's media candidates. Existing direct property photos are retained and
 combined into the application's gallery candidate list; an existing opaque
 gallery URL is not blindly replaced. Floorplans are assigned only to `Floor
 Plan`, while logos, maps, decorative assets, and unknowns remain excluded from
 `High Res Images`.
+
+Unsupported, difficult, expensive, inaccessible, or unsafe resources are
+skipped without browser automation or bypass attempts. The primary uploaded
+source and its extraction always remain authoritative.
 
 ## 9. Source-file provenance and `Link to File`
 
@@ -462,13 +499,6 @@ yet all expose granular confidence.
 
 ## 18. Testing and regression strategy
 
-The latest completed local verification on this branch was:
-
-```text
-42 passed
-All example files extracted successfully.
-```
-
 The pytest suite covers postcode extraction/normalisation, address parsing and
 query generation, wrong-building-number/street rejection, the `49 Southwark
 Bridge Road` candidate regression, preservation of source evidence, address
@@ -477,7 +507,9 @@ deduplication, semantic media separation, source-file provenance, `Link to
 File`, named spreadsheet mapping, hyperlink output, validation issues, QA,
 redirected HTML/downloadable-PDF brochure handling, brochure text provenance,
 embedded/external brochure media classification, unknown-provider brochure
-enrichment, and recoverable enrichment failures.
+enrichment, actual-content resource typing, direct images, redirect provenance,
+unsupported URI schemes, HTTP/network failure isolation, identity rejection,
+atomic merging, structured link statuses, and recoverable enrichment failures.
 
 The real-example script pins deterministic provider behaviour and record counts,
 address/postcode flags, asset separation, link matching, provider sanity

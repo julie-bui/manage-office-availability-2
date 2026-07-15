@@ -4,6 +4,7 @@ Brochures are secondary evidence.  Failure is isolated per brochure and a
 strong primary value is never silently replaced.
 """
 from collections import Counter
+from copy import deepcopy
 import hashlib
 import ipaddress
 from io import BytesIO
@@ -23,12 +24,14 @@ from .models import (
     BrochureResource,
     ExtractedValue,
     FieldProvenance,
+    LinkDiagnostic,
     Property,
     Severity,
     ValidationIssue,
 )
 
 MAX_BROCHURE_BYTES = 20 * 1024 * 1024
+MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
 
@@ -54,47 +57,74 @@ _HEADING_RE = re.compile(
 _SIZE_RE = re.compile(r"\b([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)\b", re.I)
 
 
+class LinkedResourceError(Exception):
+    def __init__(self, message, status="LINK_ENRICHMENT_FAILED", final_url=None):
+        super().__init__(message)
+        self.status = status
+        self.final_url = final_url
+
+
 def fetch_brochure(url: str, timeout: float = 6.0) -> BrochureResource:
     current = url
-    for _ in range(6):
+    redirects = []
+    for _ in range(MAX_REDIRECTS + 1):
         _validate_remote_url(current)
-        response = requests.get(current, timeout=timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
+        try:
+            response = requests.get(current, timeout=timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
+        except requests.Timeout as exc:
+            raise LinkedResourceError("Linked resource timed out", "LINK_TIMEOUT", current) from exc
+        except requests.RequestException as exc:
+            raise LinkedResourceError(f"Linked resource request failed: {exc}", "LINK_ENRICHMENT_FAILED", current) from exc
         if response.status_code in {301, 302, 303, 307, 308}:
             location = response.headers.get("Location")
             if not location:
-                raise ValueError("Brochure redirect did not provide a destination")
-            current = urljoin(current, location)
+                raise LinkedResourceError("Linked-resource redirect did not provide a destination", "LINK_ENRICHMENT_FAILED", current)
+            destination = urljoin(current, location)
+            if destination in redirects or destination == current:
+                raise LinkedResourceError("Linked-resource redirect loop detected", "LINK_ENRICHMENT_FAILED", current)
+            redirects.append(destination)
+            current = destination
             continue
-        response.raise_for_status()
+        if response.status_code in {401, 403}:
+            raise LinkedResourceError("Linked resource denied access", "LINK_ACCESS_DENIED", current)
+        if response.status_code in {404, 410}:
+            raise LinkedResourceError("Linked resource was not found", "LINK_NOT_FOUND", current)
+        if response.status_code == 429:
+            raise LinkedResourceError("Linked resource rate limited enrichment", "LINK_RATE_LIMITED", current)
+        if response.status_code >= 400:
+            raise LinkedResourceError(f"Linked resource returned HTTP {response.status_code}", "LINK_ENRICHMENT_FAILED", current)
         break
     else:
-        raise ValueError("Brochure exceeded the redirect limit")
+        raise LinkedResourceError("Linked resource exceeded the redirect limit", "LINK_ENRICHMENT_FAILED", current)
     payload = response.content
     if len(payload) > MAX_BROCHURE_BYTES:
-        raise ValueError("Brochure exceeds the 20MB enrichment limit")
-    return BrochureResource(payload, response.headers.get("Content-Type", ""), response.url or url)
+        raise LinkedResourceError("Linked resource exceeds the 20MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
+    return BrochureResource(payload, response.headers.get("Content-Type", ""), response.url or current, url, tuple(redirects))
 
 
 def _validate_remote_url(url):
-    parsed = urlparse(normalize_url(url))
+    normalized = normalize_url(url)
+    parsed = urlparse(normalized)
     host = (parsed.hostname or "").lower()
     if not host or host == "localhost" or host.endswith(".local"):
-        raise ValueError("Brochure destination is not a public HTTP(S) host")
+        raise LinkedResourceError("Linked destination is not a public HTTP(S) host", "LINK_UNSUPPORTED", url)
     try:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return
     if not address.is_global:
-        raise ValueError("Brochure destination is not a public HTTP(S) host")
+        raise LinkedResourceError("Linked destination is not a public HTTP(S) host", "LINK_UNSUPPORTED", url)
 
 
 def extract_brochure(payload: bytes, content_type: str, source_document: str) -> BrochureExtraction:
-    """Best-effort deterministic PDF or HTML brochure extraction."""
-    kind = (content_type or "").lower()
-    if "html" in kind or payload.lstrip().lower().startswith((b"<!doctype html", b"<html")):
+    """Best-effort extraction based on actual response content, not suffix."""
+    resource_type = _resource_type(payload, content_type)
+    if resource_type == "html":
         return _extract_html(payload, source_document)
-    if "pdf" not in kind and not payload.startswith(b"%PDF"):
-        raise ValueError("Brochure content is neither extractable PDF nor HTML")
+    if resource_type == "image":
+        return _extract_direct_image(payload, content_type, source_document)
+    if resource_type != "pdf":
+        raise LinkedResourceError("Linked resource type is unsupported", "LINK_UNSUPPORTED", source_document)
     import pdfplumber
 
     text_parts = []
@@ -108,7 +138,36 @@ def extract_brochure(payload: bytes, content_type: str, source_document: str) ->
                     links.append(AssetCandidate(uri, source_document, page_number=page_number))
     text = "\n".join(text_parts)
     fields = _extract_fields(text, source_document)
-    return BrochureExtraction(source_document, fields, classify_candidates(links) + _extract_pdf_visuals(payload, source_document, text_parts))
+    return BrochureExtraction(source_document, fields, classify_candidates(links) + _extract_pdf_visuals(payload, source_document, text_parts), identity_text=text)
+
+
+def _resource_type(payload: bytes, content_type: str) -> str:
+    kind = (content_type or "").split(";", 1)[0].strip().lower()
+    head = payload[:512].lstrip().lower()
+    if payload.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith((b"<!doctype html", b"<html")) or b"<html" in head or kind in {"text/html", "application/xhtml+xml"}:
+        return "html"
+    if kind.startswith("image/") or payload.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"RIFF")):
+        return "image"
+    return "unsupported"
+
+
+def _extract_direct_image(payload: bytes, content_type: str, source_document: str) -> BrochureExtraction:
+    try:
+        from PIL import Image
+        from . import pdf_images
+        with Image.open(BytesIO(payload)) as bitmap:
+            detected_format = (bitmap.format or "").lower()
+            bitmap.verify()
+    except Exception as exc:
+        raise LinkedResourceError("Linked image is corrupt or unsupported", "LINK_UNSUPPORTED", source_document) from exc
+    detected_mime = "image/jpeg" if detected_format in {"jpg", "jpeg"} else f"image/{detected_format or 'unknown'}"
+    candidate = classify_candidate(AssetCandidate(source_document, source_document, mime_type=detected_mime, filename=urlparse(source_document).path.rsplit("/", 1)[-1], content_hash=hashlib.sha256(payload).hexdigest()))
+    if candidate.classification == AssetType.PROPERTY_IMAGE and pdf_images.is_floorplan_image(payload):
+        candidate.classification = AssetType.FLOORPLAN
+        candidate.confidence = 0.9
+    return BrochureExtraction(source_document, assets=[candidate])
 
 
 def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
@@ -159,7 +218,13 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
         # description text (e.g. "Download brochure" under Amenities).
         link.decompose()
     text = soup.get_text("\n", strip=True)
-    return BrochureExtraction(source_document, _extract_fields(text, source_document), classify_candidates(candidates))
+    extraction = BrochureExtraction(source_document, _extract_fields(text, source_document), classify_candidates(candidates), identity_text=text)
+    visible = " ".join(text.split()).lower()
+    if not visible and not extraction.assets:
+        raise LinkedResourceError("Linked HTML page requires JavaScript or contains no usable content", "LINK_ENRICHMENT_SKIPPED", source_document)
+    if any(token in visible[:1500] for token in ("sign in to continue", "log in to continue", "access denied", "enable javascript")) and not any(a.classification in {AssetType.BROCHURE, AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN} for a in extraction.assets):
+        raise LinkedResourceError("Linked HTML page is inaccessible or requires login/JavaScript", "LINK_ACCESS_DENIED", source_document)
+    return extraction
 
 
 def _srcset_urls(value: str) -> List[str]:
@@ -287,24 +352,49 @@ def enrich_properties(
     properties = list(properties)
     cache = {}
     for prop in properties:
-        brochure_url = normalize_url(str(prop.values.get("Brochure PDF") or ""))
+        raw_url = str(prop.values.get("Brochure PDF") or "").strip()
+        brochure_url = normalize_url(raw_url)
+        if raw_url and not brochure_url:
+            status = "LINK_UNSUPPORTED" if urlparse(raw_url).scheme and urlparse(raw_url).scheme.lower() not in {"http", "https"} else "LINK_ENRICHMENT_SKIPPED"
+            _record_diagnostic(prop, status, raw_url, detail="Only valid public HTTP(S) linked resources are supported.")
+            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", raw_url, detail="Primary extraction preserved.")
+            continue
         if not brochure_url:
             continue
         if deadline is not None and time.monotonic() >= deadline:
-            prop.add_issue(ValidationIssue("Brochure PDF", "Brochure enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "brochure_enrichment"))
+            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
+            prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             continue
         try:
             if brochure_url not in cache:
                 cache[brochure_url] = _retrieve(brochure_url, fetcher, extractor)
-            _merge(prop, cache[brochure_url])
+            extraction = cache[brochure_url]
+            if not _identity_matches(prop, extraction.identity_text):
+                _record_diagnostic(prop, "LINK_IDENTITY_MISMATCH", brochure_url, extraction.source_document, detail="Resolved content conflicts with the source property identity.")
+                prop.add_issue(ValidationIssue("Brochure PDF", "Linked property content appears to belong to a different property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
+                continue
+            # Merge into a copy, then publish the result as one atomic unit.
+            # An unexpected merge error cannot leave half-applied enrichment.
+            staged = deepcopy(prop)
+            _merge(staged, extraction)
+            prop.values = staged.values
+            prop.provenance = staged.provenance
+            prop.assets = staged.assets
+            prop.issues = staged.issues
+            prop.review_required = staged.review_required
+            prop.link_diagnostics.extend(extraction.diagnostics)
+            _record_diagnostic(prop, "LINK_ENRICHMENT_SUCCESS", brochure_url, extraction.source_document, _diagnostic_resource_type(extraction))
         except Exception as exc:
+            status = getattr(exc, "status", "LINK_ENRICHMENT_FAILED")
+            _record_diagnostic(prop, status, brochure_url, getattr(exc, "final_url", None), detail=str(exc))
+            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, getattr(exc, "final_url", None), detail="Primary extraction preserved unchanged.")
             prop.add_issue(
                 ValidationIssue(
                     "Brochure PDF",
-                    f"Brochure enrichment was skipped: {exc}",
+                    f"Linked-source enrichment was skipped: {exc}",
                     Severity.INFO,
                     brochure_url,
-                    "Primary extraction remains valid; review the brochure manually if needed.",
+                    "Primary extraction remains valid; review the linked source manually if needed.",
                     "brochure_enrichment",
                 )
             )
@@ -313,7 +403,9 @@ def enrich_properties(
 
 def _retrieve(url, fetcher, extractor):
     resource = _coerce_resource(fetcher(url), url)
+    resource_type = _resource_type(resource.payload, resource.content_type)
     combined = extractor(resource.payload, resource.content_type, resource.final_url)
+    combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
     # as a PDF link. Follow at most two unique document assets, once each.
     documents = [a.url for a in combined.assets if a.classification == AssetType.BROCHURE and a.url != resource.final_url][:2]
@@ -321,10 +413,12 @@ def _retrieve(url, fetcher, extractor):
         try:
             nested = _coerce_resource(fetcher(document_url), document_url)
             nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
+            nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)
             combined.assets.extend(nested_extraction.assets)
             combined.warnings.extend(nested_extraction.warnings)
+            combined.diagnostics.extend(nested_extraction.diagnostics)
         except Exception as exc:
             combined.warnings.append(f"Linked brochure document could not be enriched: {exc}")
     combined.assets = classify_candidates(combined.assets)
@@ -339,6 +433,47 @@ def _coerce_resource(value, requested_url):
     if isinstance(value, tuple) and len(value) == 2:
         return BrochureResource(value[0], value[1], requested_url)
     raise TypeError("Brochure fetcher must return BrochureResource or a 2/3-item tuple")
+
+
+def _resolution_diagnostics(resource: BrochureResource, resource_type: str) -> List[LinkDiagnostic]:
+    original = resource.original_url or resource.final_url
+    diagnostics = [LinkDiagnostic("LINK_RESOLVED", original, resource.final_url, resource_type)]
+    if resource.redirects or normalize_url(original) != normalize_url(resource.final_url):
+        diagnostics.append(LinkDiagnostic("LINK_REDIRECT_RESOLVED", original, resource.final_url, resource_type, f"{len(resource.redirects)} redirect(s)"))
+    status = {"pdf": "LINK_RESOURCE_PDF", "html": "LINK_RESOURCE_HTML", "image": "LINK_RESOURCE_IMAGE"}.get(resource_type, "LINK_UNSUPPORTED")
+    diagnostics.append(LinkDiagnostic(status, original, resource.final_url, resource_type))
+    return diagnostics
+
+
+def _record_diagnostic(prop, status, original_url, final_url=None, resource_type=None, detail=""):
+    prop.link_diagnostics.append(LinkDiagnostic(status, original_url, final_url, resource_type, detail))
+
+
+def _diagnostic_resource_type(extraction):
+    for diagnostic in reversed(extraction.diagnostics):
+        if diagnostic.resource_type:
+            return diagnostic.resource_type
+    return None
+
+
+def _identity_matches(prop: Property, linked_text: str) -> bool:
+    """Reject only hard property conflicts; ambiguity simply limits merging."""
+    if not linked_text:
+        return True
+    primary = " ".join(str(prop.values.get(field) or "") for field in ("Building", "Property Address 1", "Property Address 2", "Property Postcode"))
+    primary_postcodes = set(re.findall(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", primary.upper()))
+    linked_postcodes = set(re.findall(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", linked_text.upper()))
+    normalize_postcode = lambda values: {re.sub(r"\s+", "", value) for value in values}
+    if primary_postcodes and len(linked_postcodes) == 1 and normalize_postcode(primary_postcodes).isdisjoint(normalize_postcode(linked_postcodes)):
+        return False
+    # A different numbered street is a hard conflict only when both sides
+    # provide street-like evidence; floor/unit numbers elsewhere are ignored.
+    street_pattern = re.compile(r"\b(\d+[A-Z]?(?:\s*-\s*\d+[A-Z]?)?)\s+([A-Z][A-Z'’-]+(?:\s+[A-Z][A-Z'’-]+){0,3})\s+(?:STREET|ST|ROAD|RD|LANE|LN|SQUARE|SQ|AVENUE|AVE|PLACE|PL|COURT|CT|WAY)\b", re.I)
+    primary_streets = {(m.group(1).lower(), re.sub(r"\W+", "", m.group(2).lower())) for m in street_pattern.finditer(primary)}
+    linked_streets = {(m.group(1).lower(), re.sub(r"\W+", "", m.group(2).lower())) for m in street_pattern.finditer(linked_text)}
+    if primary_streets and linked_streets and primary_streets.isdisjoint(linked_streets):
+        return False
+    return True
 
 
 def _merge(prop: Property, extraction: BrochureExtraction) -> None:

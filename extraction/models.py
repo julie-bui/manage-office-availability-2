@@ -52,6 +52,8 @@ class BrochureExtraction:
     fields: Dict[str, ExtractedValue] = field(default_factory=dict)
     assets: List["AssetCandidate"] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    identity_text: str = ""
+    diagnostics: List["LinkDiagnostic"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,17 @@ class BrochureResource:
     payload: bytes
     content_type: str
     final_url: str
+    original_url: Optional[str] = None
+    redirects: tuple = ()
+
+
+@dataclass(frozen=True)
+class LinkDiagnostic:
+    status: str
+    original_url: str
+    final_url: Optional[str] = None
+    resource_type: Optional[str] = None
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,7 @@ class Property:
     provenance: Dict[str, FieldProvenance] = field(default_factory=dict)
     assets: List[AssetCandidate] = field(default_factory=list)
     issues: List[ValidationIssue] = field(default_factory=list)
+    link_diagnostics: List[LinkDiagnostic] = field(default_factory=list)
     review_required: bool = False
 
     @classmethod
@@ -152,6 +166,7 @@ class Property:
             record["Link to File"] = self.source_file_url
         record["_provenance"] = self.provenance
         record["_validation_issues"] = list(self.issues)
+        record["_link_diagnostics"] = list(self.link_diagnostics)
         record["_review_required"] = self.review_required
         return record
 
