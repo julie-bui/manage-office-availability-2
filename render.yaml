@@ -11,7 +11,7 @@ services:
     # cold run (Crown Estate, ~26 distinct buildings) sits right at the old
     # limit even before counting Render's own network latency.
     #
-    # --max-requests 15 --max-requests-jitter 5: this app runs a single
+    # --max-requests 8 --max-requests-jitter 3: this app runs a single
     # worker (no --workers flag) for the lifetime of the service — PyMuPDF/
     # Pillow/google-genai (confirmed 2026-07: importing google.genai alone
     # costs ~53MB, permanently, the first time either Gemini call site is
@@ -20,20 +20,14 @@ services:
     # native/heavy dependencies that don't reliably return freed memory to
     # the OS, so RSS can ratchet upward across a session's worth of
     # requests even when each individual file is well-behaved on its own.
-    # Lowered from an initial 40 after Crown Estate still SIGKILLed post-fix
-    # — confirmed processing it in isolation, locally, peaks around 200MB,
-    # nowhere near the free tier's 512MB ceiling (see extraction/
-    # pdf_images.py's own memory-bounding fix), so either cumulative
-    # cross-request growth is worse than a 40-request budget allows for, or
-    # Linux's own allocator behavior for these C extensions is meaningfully
-    # worse than what local Windows testing can show — recycling more
-    # often is a cheap hedge against both. Gunicorn gracefully restarts the
-    # worker after this many requests (jittered so a multi-service deploy
-    # wouldn't restart every worker in lockstep, though only one worker
-    # exists here) — a standard mitigation for this class of memory creep,
-    # trading a bit more frequent ~1s worker-startup cost for a tighter
-    # cap on accumulated fragmentation.
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 15 --max-requests-jitter 5
+    # Lowered from 15 after MetSpace alone left RSS ~360MB and the next
+    # Knotel request started from that baseline (Render "undersized
+    # instance" / SIGKILL). Soft-capped embeds + no gallery inlining cut
+    # the peak; recycling sooner hedges allocator fragmentation.
+    # Gunicorn gracefully restarts the worker after this many requests
+    # (jittered so a multi-service deploy wouldn't restart every worker
+    # in lockstep, though only one worker exists here).
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 8 --max-requests-jitter 3
     envVars:
       - key: GEMINI_API_KEY
         sync: false

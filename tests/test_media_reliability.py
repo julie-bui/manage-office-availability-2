@@ -673,8 +673,8 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
     assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
 
 
-def test_finalize_keeps_all_distinct_hashed_photos_without_upper_cap(tmp_path):
-    urls = [f"https://img.test/{i}.jpg" for i in range(8)]
+def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
+    urls = [f"https://img.test/{i}.jpg" for i in range(18)]
     record = {
         "Building": "Many Photo House",
         "_source_high_res_candidates": urls,
@@ -687,8 +687,10 @@ def test_finalize_keeps_all_distinct_hashed_photos_without_upper_cap(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img") == 8
-    assert record["_high_res_image_count"] == 8
+    assert gallery.count("<img") == app_module.SOFT_MAX_HIGH_RES_IMAGES
+    assert record["_high_res_image_count"] == app_module.SOFT_MAX_HIGH_RES_IMAGES
+    assert any(item.status == "IMAGE_SOFT_CAP_REACHED" for item in record["_link_diagnostics"])
+    assert "data:image/" not in gallery
 
 
 def _solid_jpeg(color):
@@ -785,9 +787,9 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
     assert len(jobs) == 2  # photo + floorplan only
 
 
-def test_gallery_inlines_local_batch_bytes(tmp_path):
-    """MetSpace-style: gallery HTML embeds local photo bytes so clicks do not
-    depend on sibling /api/download objects being present in storage."""
+def test_gallery_uses_absolute_download_urls_not_data_uris(tmp_path):
+    """Galleries link to /api/download siblings; sync upload keeps them durable
+    without base64-inlining every JPEG into HTML (Render free-tier OOM)."""
     photo_a = _photo_jpeg(1)
     photo_b = _photo_jpeg(2)
     path_a = tmp_path / "Example_brochure_r1_aaaa.jpg"
@@ -811,8 +813,10 @@ def test_gallery_inlines_local_batch_bytes(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("data:image/") == 2
-    assert "api/download" not in gallery or gallery.count("<img") == 2
+    assert gallery.count("data:image/") == 0
+    assert gallery.count("<img") == 2
+    assert "api/download/batch/Example_brochure_r1_aaaa.jpg" in gallery
+    assert "api/download/batch/Example_brochure_r1_bbbb.jpg" in gallery
 
 
 def test_dense_spreadsheet_triggers_chunking_before_row_threshold():

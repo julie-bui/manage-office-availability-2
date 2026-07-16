@@ -703,10 +703,10 @@ def build_gallery_html(title, images):
     """A self-contained HTML page listing several photos.
 
     `images` is a sequence of URL strings and/or (url, raw_bytes) pairs.
-    When bytes are provided they are inlined as data URIs so the gallery
-    keeps working even if sibling /api/download objects are not yet on
-    durable storage (confirmed MetSpace Drive embeds → File not found).
-    Remote CDN URLs without bytes stay as ordinary <img src> links.
+    URL strings are preferred (absolute /api/download links with token).
+    Optional bytes are still accepted as data URIs for callers that need
+    offline HTML, but the web app path avoids inlining so free-tier RSS
+    does not double every MetSpace/UNION JPEG in gallery HTML.
     """
     import base64
     import html as _html

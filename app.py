@@ -47,9 +47,13 @@ BATCH_MAX_AGE_SECONDS = 60 * 60  # clean up old batch output dirs after an hour
 # table/link structure doesn't silently get double-processed here.
 PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
 # Target for High Res Images when the source/brochures actually contain
-# property photos. Keep every distinct validated photo (no upper cap);
-# warn when a non-exempt file finishes below MIN or with zero images.
+# property photos. Warn when a non-exempt file finishes below MIN.
+# SOFT_MAX is a memory bound for Render's free tier (~512MB): uncapped
+# MetSpace/UNION brochure embeds + inlined galleries pushed RSS past 360MB
+# and the next request started from that baseline (SIGKILL). Still well
+# above MIN; distinct photos beyond the soft max are dropped earliest-first.
 MIN_HIGH_RES_IMAGES = 5
+SOFT_MAX_HIGH_RES_IMAGES = 15
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
 IMAGE_EXEMPT_METHODS = {"rule:BC"}
@@ -290,7 +294,7 @@ def process():
         threading.Thread(target=_flush_caches, daemon=True).start()
 
         if upload_jobs:
-            # Hosted High Res galleries (and their inlined/local siblings) must
+            # Hosted High Res galleries (and sibling brochure images) must
             # be durable before the client can click a cell — async upload left
             # MetSpace Drive embeds returning {"error":"File not found"} when
             # the worker's local disk was already gone. Sync here; cache flush
@@ -762,18 +766,6 @@ def _is_replaceable_viewer_url(url):
     return False
 
 
-def _gallery_image_entries(urls, batch_dir, batch_id):
-    """Prefer local bytes (inlined into gallery HTML) over remote-only URLs."""
-    entries = []
-    for url in urls:
-        local_path = _local_download_path(url, batch_dir, batch_id) if _is_local_download_url(url, batch_id) else None
-        if local_path is not None:
-            entries.append((url, local_path.read_bytes()))
-        else:
-            entries.append(url)
-    return entries
-
-
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -783,7 +775,8 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     exact same image bytes (confirmed real: Knotel Directus asset IDs) count
     once. Unhashed soft-accepts never join a gallery that already has photos,
     so deadline pressure cannot reintroduce those duplicates. Local batch
-    assets are checked on disk and inlined into gallery HTML.
+    assets are validated from disk; gallery HTML uses absolute download URLs
+    (not base64 data URIs) so free-tier RSS stays bounded.
     """
     jobs = []
     gallery_url_by_candidates = {}
@@ -813,6 +806,9 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         seen_hashes = set()
         rejected = []
         for candidate in candidates:
+            if len(valid) >= SOFT_MAX_HIGH_RES_IMAGES:
+                rejected.append((candidate, "IMAGE_SOFT_CAP_REACHED"))
+                continue
             cached = validation_cache.get(normalize_url(candidate))
             if _is_local_download_url(candidate, batch_id):
                 local_path = _local_download_path(candidate, batch_dir, batch_id)
@@ -896,6 +892,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 "IMAGE_DUPLICATE_URL": "Duplicate URL after normalisation; kept only one copy.",
                 "IMAGE_BLANK_OR_EMPTY": "Near-solid/blank placeholder excluded from High Res Images.",
                 "IMAGE_UNHASHED_SKIPPED": "Skipped unhashed soft-accept after distinct photos already selected (prevents CDN duplicate galleries).",
+                "IMAGE_SOFT_CAP_REACHED": f"Kept first {SOFT_MAX_HIGH_RES_IMAGES} distinct photos (memory-safe soft cap).",
             }.get(status, "Candidate was excluded from High Res Images.")
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
         if not valid:
@@ -913,9 +910,13 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 gallery_filename = f"{name}_photos{gallery_count}.html"
                 gallery_path = batch_dir / gallery_filename
                 try:
+                    # Absolute /api/download URLs (token included) — not base64
+                    # data URIs. Inlining every MetSpace/UNION embed ballooned
+                    # gallery HTML and kept a second copy of each JPEG in RSS
+                    # on the free tier; sync upload (below) makes these durable.
                     gallery_html = pdf_images.build_gallery_html(
                         record.get("Building") or name,
-                        _gallery_image_entries(valid, batch_dir, batch_id),
+                        valid,
                     )
                     gallery_path.write_text(gallery_html, encoding="utf-8")
                     if gallery_path.exists() and gallery_path.stat().st_size and gallery_html.count("<img") >= len(valid):
@@ -1012,6 +1013,7 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         seen_photo_hashes = set()
         for candidate in ordered:
             if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
+                candidate.content = None
                 continue
             digest = candidate.content_hash or image_content_hash(candidate.content)
             # Floor-plan diagrams are naturally near-white — never apply the
@@ -1019,17 +1021,22 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
             # (MetSpace Drive packs) do get entropy-checked so near-black
             # placeholder pages cannot become High Res Images.
             if candidate.classification == AssetType.PROPERTY_IMAGE:
+                if len(photo_urls) >= SOFT_MAX_HIGH_RES_IMAGES:
+                    candidate.content = None
+                    continue
                 width = candidate.width or 0
                 height = candidate.height or 0
                 if width and height and (width < MIN_PROPERTY_IMAGE_WIDTH or height < MIN_PROPERTY_IMAGE_HEIGHT):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_TOO_SMALL", detail="Embedded brochure photo excluded before gallery materialisation.")
                     )
+                    candidate.content = None
                     continue
                 if is_blank_or_empty_image(candidate.content):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_BLANK_OR_EMPTY", detail="Near-solid/blank placeholder excluded from High Res Images.")
                     )
+                    candidate.content = None
                     continue
             if digest not in saved:
                 extension = (candidate.extension or "png").lower().lstrip(".")
@@ -1038,6 +1045,8 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 path.write_bytes(candidate.content)
                 jobs.append((f"{batch_id}/{filename}", path))
                 saved[digest] = _download_url(batch_id, filename)
+            # Bytes are on disk now — free RSS before the next listing.
+            candidate.content = None
             url = saved[digest]
             if candidate.classification == AssetType.FLOORPLAN:
                 existing_plan = str(record.get("Floor Plan") or "")
@@ -1062,8 +1071,10 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         # candidate and must survive the brochure merge.
         if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
             existing_candidates.insert(0, existing)
-        # No upper cap — keep every distinct photo URL for finalize.
-        record["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + photo_urls))
+        # Soft-cap matches finalize; keep first N distinct hosted photo URLs.
+        record["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + photo_urls))[
+            :SOFT_MAX_HIGH_RES_IMAGES
+        ]
     return jobs
 
 

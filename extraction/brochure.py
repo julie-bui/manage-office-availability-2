@@ -42,6 +42,11 @@ MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
 _ENRICHMENT_FETCH_WORKERS = 3
+# Soft cap on embedded property photos retained per brochure PDF. Floor plans
+# stay uncapped (usually 1–2). Matches app.SOFT_MAX_HIGH_RES_IMAGES so
+# free-tier RSS does not hold 14× uncapped MetSpace Drive embeds until
+# materialise. Still above the gallery MIN target of 5.
+_SOFT_MAX_EMBEDDED_PHOTOS = 15
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -428,9 +433,11 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     extracted = []
     counts = Counter()
     seen_digests = set()
+    photo_kept = 0
     # Scan every page so floor plans later in UNION/Workplace Plus brochures
     # are not skipped after early photo pages. Exact content hashes prevent
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
+    # Soft-cap property-photo bitmaps (still scan for later floor plans).
     try:
         for page_number, page in enumerate(document):
             for image in page.get_images(full=True):
@@ -455,8 +462,13 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         classification = AssetType.FLOORPLAN
                     elif width < 300 or height < 200 or is_blank_or_empty_image(content):
                         classification = AssetType.DECORATIVE
+                        # Drop bytes immediately — merge never hosts decorative.
+                        content = None
                     else:
+                        if photo_kept >= _SOFT_MAX_EMBEDDED_PHOTOS:
+                            continue
                         classification = AssetType.UNKNOWN
+                        photo_kept += 1
                     extracted.append(
                         AssetCandidate(
                             "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
@@ -596,8 +608,13 @@ def enrich_properties(
     # PDF when possible — three parallel 22MB Box downloads still spike
     # past the free tier's ~512MB even after per-file finishing.
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
+    # Large Box/Drive PDFs in parallel spike past ~512MB on free tier
+    # (MetSpace: 14 unique Drive packs; UNION: multi-MB Box statics).
     if any(
-        "/shared/static/" in (urlparse(url).path or "") or _box_shared_name(url)
+        "/shared/static/" in (urlparse(url).path or "")
+        or _box_shared_name(url)
+        or (urlparse(url).hostname or "").endswith("google.com")
+        or (urlparse(url).hostname or "").endswith("googleusercontent.com")
         for url in pending
     ):
         workers = 1
@@ -674,6 +691,14 @@ def enrich_properties(
                         "brochure_enrichment",
                     )
                 )
+        # Release extraction-owned bitmaps that were not retained on
+        # shared_embeds (decorative / capped photos / unused assets).
+        if not isinstance(extraction, Exception):
+            kept = set(id(a) for a in (shared_embeds or []))
+            for asset in extraction.assets:
+                if id(asset) not in kept:
+                    asset.content = None
+            extraction.identity_text = ""
 
     for wave_start in range(0, len(pending), wave_size):
         # Stop before starting a wave that cannot finish inside this file's
@@ -812,12 +837,17 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         _add_asset(prop, candidate)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
-        # Keep every distinct embedded photo plus every floor-plan bitmap.
-        # Exact content-hash dedupe already happened in classify_candidates /
-        # _extract_pdf_visuals; the web layer inlines these into galleries.
-        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE]
+        # Soft-cap photos (floor plans uncapped). Exact content-hash dedupe
+        # already happened in classify_candidates / _extract_pdf_visuals;
+        # materialise writes bytes to disk then clears content.
+        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:_SOFT_MAX_EMBEDDED_PHOTOS]
         plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN]
         prop.values["_brochure_embedded_assets"] = photos + plans
+        # Drop bytes from assets not kept for materialise.
+        kept = set(id(a) for a in photos + plans)
+        for asset in prop.assets:
+            if asset.content and id(asset) not in kept:
+                asset.content = None
     property_images = [
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
     ]
