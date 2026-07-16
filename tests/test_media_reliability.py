@@ -877,3 +877,159 @@ def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
     assert app_module._accept_image_url_under_deadline(
         "https://anything.example/assets/opaque-id"
     )
+
+
+def test_free_tier_skips_pdf_embeds_when_listing_already_has_photos(monkeypatch):
+    """Nuclear mode: keep Brochure PDF link, do not extract bitmaps if photos exist."""
+    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+    extract_calls = []
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
+
+    def extract(payload, content_type, source, extract_embedded_images=True):
+        extract_calls.append(extract_embedded_images)
+        assets = []
+        if extract_embedded_images:
+            assets.append(
+                AssetCandidate(
+                    "", source, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                    content=_photo_jpeg(1), content_hash="emb1", extension="jpg",
+                    width=640, height=400, association_confidence=0.9,
+                )
+            )
+        return BrochureExtraction(source, identity_text="Example House, EC1A 1AA", assets=assets)
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "High Res Images": "https://source.test/a.jpg",
+            "_source_high_res_candidates": [
+                "https://source.test/a.jpg",
+                "https://source.test/b.jpg",
+                "https://source.test/c.jpg",
+                "https://source.test/d.jpg",
+                "https://source.test/e.jpg",
+            ],
+            "Brochure PDF": "https://drive.test/file.pdf",
+        }),
+        "metspace.eml", "MetSpace", "rule:MetSpace",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    # Already at soft-cap (5) → brochure fetch skipped entirely.
+    assert extract_calls == []
+    assert not (prop.values.get("_brochure_embedded_assets") or [])
+
+
+def test_free_tier_extracts_embeds_only_when_zero_source_photos(monkeypatch, tmp_path):
+    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+    extract_flags = []
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
+
+    def extract(payload, content_type, source, extract_embedded_images=True):
+        extract_flags.append(extract_embedded_images)
+        photo = AssetCandidate(
+            "", source, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+            content=_photo_jpeg(3), content_hash="needphoto", extension="jpg",
+            width=640, height=400, association_confidence=0.9,
+        )
+        return BrochureExtraction(
+            source,
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+            assets=[photo] if extract_embedded_images else [],
+        )
+
+    blank = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "Brochure PDF": "https://drive.test/needs-photos.pdf",
+        }),
+        "metspace.eml", "MetSpace", "rule:MetSpace",
+    )
+    enrich_properties([blank], fetcher=fetch, extractor=extract, spill_dir=tmp_path)
+    assert extract_flags == [True]
+    embeds = blank.values.get("_brochure_embedded_assets") or []
+    assert embeds
+    # Spill cleared bytes immediately; materialise reads local_path.
+    assert embeds[0].content is None
+    assert embeds[0].local_path and Path(embeds[0].local_path).exists()
+
+
+def test_free_tier_skips_nested_pdf_when_page_has_one_photo(monkeypatch):
+    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        assert "brochure.pdf" not in url
+        return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        return BrochureExtraction(
+            final_url,
+            assets=[
+                classify_candidate(AssetCandidate(f"{final_url}/only.jpg", final_url, alt_text="Office")),
+                classify_candidate(AssetCandidate(f"{final_url}/brochure.pdf", final_url, anchor_text="Download brochure")),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "Brochure PDF": "https://property.test/listing-one-photo",
+        }),
+        "knotel.eml", "Knotel", "rule:Knotel",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    assert fetched == ["https://property.test/listing-one-photo"]
+
+
+def test_materialize_reads_spilled_local_path(tmp_path):
+    spill = tmp_path / "spill"
+    spill.mkdir()
+    photo_bytes = _photo_jpeg(4)
+    spilled = spill / "spilled.jpg"
+    spilled.write_bytes(photo_bytes)
+    photo = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+        content=None, content_hash="spilledhash", extension="jpg",
+        width=640, height=400, local_path=str(spilled),
+    )
+    record = {"Building": "Spill House", "High Res Images": "", "_brochure_embedded_assets": [photo]}
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
+    assert jobs
+    assert record.get("_high_res_candidates")
+    assert photo.content is None
+    assert photo.local_path is None
+
+
+def test_memlog_tracks_peak(monkeypatch):
+    from extraction import memlog
+
+    class Info:
+        def __init__(self, rss):
+            self.rss = rss
+
+    class FakeProc:
+        def __init__(self):
+            self._rss = 100 * 1024 * 1024
+
+        def memory_info(self):
+            return Info(self._rss)
+
+    proc = FakeProc()
+    memlog.reset_peak()
+    monkeypatch.setattr(memlog, "_process", proc)
+    monkeypatch.setattr(memlog, "_peak_rss_mb", 0.0)
+    proc._rss = 200 * 1024 * 1024
+    memlog.log("mid")
+    proc._rss = 150 * 1024 * 1024
+    memlog.log("later")
+    assert memlog.peak_mb() == pytest.approx(200.0, abs=0.1)

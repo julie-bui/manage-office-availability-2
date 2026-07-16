@@ -128,6 +128,10 @@ class AssetCandidate:
     content: Optional[bytes] = None
     content_hash: Optional[str] = None
     extension: Optional[str] = None
+    # When set, image bytes were spilled to disk during enrichment so RSS
+    # does not hold every brochure's embeds until materialise. Materialise
+    # reads this path then clears it.
+    local_path: Optional[str] = None
 
 
 @dataclass

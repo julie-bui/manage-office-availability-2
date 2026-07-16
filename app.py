@@ -150,7 +150,14 @@ def version():
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=BASE_DIR, text=True, timeout=5).strip()
         except Exception:
             commit = "unknown"
-    return jsonify({"commit": commit, "commit_short": commit[:7]})
+    from extraction.brochure import free_tier_memory_mode
+
+    return jsonify({
+        "commit": commit,
+        "commit_short": commit[:7],
+        "free_tier_memory_mode": free_tier_memory_mode(),
+        "soft_max_high_res_images": SOFT_MAX_HIGH_RES_IMAGES,
+    })
 
 
 @app.route("/api/cache/invalidate", methods=["GET", "POST"])
@@ -224,6 +231,7 @@ def process():
     # Render SIGKILL, 2026-07).
     batch_deadline = time.monotonic() + BATCH_DEADLINE_SECONDS
 
+    memlog.reset_peak()
     memlog.log("request start")
     _cleanup_old_batches()
     batch_id = uuid.uuid4().hex
@@ -281,12 +289,20 @@ def process():
             one["pages_text"] = None
             one["html_items"] = None
             one["row_links"] = None
+            spill_dirs = set()
             for rec in one.get("records") or []:
+                spill = rec.pop("_embed_spill_dir", None)
+                if spill:
+                    spill_dirs.add(spill)
                 rec.pop("_brochure_embedded_assets", None)
                 rec.pop("_high_res_candidates", None)
                 rec.pop("_source_high_res_candidates", None)
                 rec.pop("_link_diagnostics", None)
+                rec.pop("_address_resolution", None)
+            for spill in spill_dirs:
+                shutil.rmtree(spill, ignore_errors=True)
             gc.collect()
+            memlog.log("after file finish + free", one.get("filename") or "")
 
         results = processed_results + unsupported_results
 
@@ -444,7 +460,9 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
     # photos, one from a promotional blurb and one from its own
     # listing card). Turns 2+ into a small gallery page, 1 into a
     # direct link, same as the PDF path above.
-    upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
+    upload_jobs.extend(
+        _materialize_brochure_assets(r["records"], batch_dir, batch_id, name, upload_immediately=True)
+    )
     upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=deadline))
     image_warning = _image_coverage_warning(r["records"], r.get("method") or "")
     if image_warning:
@@ -997,7 +1015,7 @@ def _image_coverage_warning(records, method):
     return "Image coverage check: " + "; ".join(parts) + "."
 
 
-def _materialize_brochure_assets(records, batch_dir, batch_id, name):
+def _materialize_brochure_assets(records, batch_dir, batch_id, name, upload_immediately=False):
     """Persist classified embedded brochure visuals after batch URLs exist.
 
     Provider-neutral: every listing with brochure-embedded bytes (MetSpace
@@ -1006,6 +1024,11 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
     Plan first, then distinct non-blank property photos. Blank/near-solid
     slides and exact content duplicates are dropped here so they never
     reach gallery finalisation.
+
+    Candidates may carry `content` bytes or a `local_path` spilled during
+    enrichment (free-tier mode). When upload_immediately is True, each JPEG
+    is mirrored to object storage as soon as it hits disk so the later
+    bulk upload pass does not re-read the whole set into RSS.
     """
     jobs = []
     saved = {}
@@ -1025,10 +1048,19 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         photo_urls = []
         seen_photo_hashes = set()
         for candidate in ordered:
-            if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
+            has_bytes = bool(candidate.content) or bool(getattr(candidate, "local_path", None))
+            if not has_bytes or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
                 candidate.content = None
+                candidate.local_path = None
                 continue
-            digest = candidate.content_hash or image_content_hash(candidate.content)
+            payload = candidate.content
+            if payload is None and candidate.local_path:
+                try:
+                    payload = Path(candidate.local_path).read_bytes()
+                except OSError:
+                    candidate.local_path = None
+                    continue
+            digest = candidate.content_hash or image_content_hash(payload)
             # Floor-plan diagrams are naturally near-white — never apply the
             # blank-slide rejector to them. Property photos from the same PDF
             # (MetSpace Drive packs) do get entropy-checked so near-black
@@ -1036,6 +1068,7 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
             if candidate.classification == AssetType.PROPERTY_IMAGE:
                 if len(photo_urls) >= SOFT_MAX_HIGH_RES_IMAGES:
                     candidate.content = None
+                    candidate.local_path = None
                     continue
                 width = candidate.width or 0
                 height = candidate.height or 0
@@ -1044,29 +1077,38 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                         LinkDiagnostic("IMAGE_TOO_SMALL", detail="Embedded brochure photo excluded before gallery materialisation.")
                     )
                     candidate.content = None
+                    candidate.local_path = None
                     continue
-                if is_blank_or_empty_image(candidate.content):
+                if is_blank_or_empty_image(payload):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_BLANK_OR_EMPTY", detail="Near-solid/blank placeholder excluded from High Res Images.")
                     )
                     candidate.content = None
+                    candidate.local_path = None
                     continue
             if digest not in saved:
                 extension = (candidate.extension or "png").lower().lstrip(".")
                 filename = f"{name}_brochure_r{record_index}_{digest[:10]}.{extension}"
                 path = batch_dir / filename
-                payload = candidate.content
+                write_payload = payload
                 if candidate.classification == AssetType.PROPERTY_IMAGE:
                     # Key `saved` by the pre-write digest so identical embeds
                     # share one file; downscale only shrinks what we write.
-                    payload, new_w, new_h = downscale_image_bytes(payload, extension=extension)
+                    write_payload, new_w, new_h = downscale_image_bytes(write_payload, extension=extension)
                     if new_w and new_h:
                         candidate.width, candidate.height = new_w, new_h
-                path.write_bytes(payload)
-                jobs.append((f"{batch_id}/{filename}", path))
+                path.write_bytes(write_payload)
+                storage_key = f"{batch_id}/{filename}"
+                if upload_immediately:
+                    storage.upload(storage_key, path)
+                    gc.collect()
+                else:
+                    jobs.append((storage_key, path))
                 saved[digest] = _download_url(batch_id, filename)
             # Bytes are on disk now — free RSS before the next listing.
             candidate.content = None
+            candidate.local_path = None
+            del payload
             url = saved[digest]
             if candidate.classification == AssetType.FLOORPLAN:
                 existing_plan = str(record.get("Floor Plan") or "")
@@ -1104,13 +1146,13 @@ def _upload_all(jobs):
     Called synchronously before /api/process returns so High Res gallery
     links do not 404 when ephemeral local disk is gone. Best-effort per
     job — one failing upload (logged inside storage.upload) doesn't stop
-    the rest. Upload one file at a time and periodically collect so a
+    the rest. Upload one file at a time and collect after each so a
     MetSpace-sized job list cannot keep every large JPEG mapped at once.
+    Brochure JPEGs may already have been uploaded during materialise.
     """
-    for index, (key, path) in enumerate(jobs):
+    for key, path in jobs:
         storage.upload(key, path)
-        if index % 4 == 3:
-            gc.collect()
+        gc.collect()
     gc.collect()
 
 

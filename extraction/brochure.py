@@ -12,9 +12,11 @@ import ipaddress
 import json
 from io import BytesIO
 import os
+from pathlib import Path
 import re
+import tempfile
 import time
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Optional
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -45,6 +47,8 @@ from .models import (
 # as ~22MB PDFs via app.box.com/shared/static/{id}.pdf — the previous
 # hard cap skipped those downloads and left High Res blank despite a
 # real public PDF existing behind the "CLICK HERE" cell.
+# Free-tier mode keeps the same ceiling (UNION ~22MB) but skips bitmap
+# extraction unless a listing has zero photos — see free_tier_memory_mode().
 MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
@@ -57,6 +61,18 @@ _ENRICHMENT_FETCH_WORKERS = 1
 # = MIN target) so free-tier RSS does not hold 14× large MetSpace Drive embeds
 # until materialise.
 _SOFT_MAX_EMBEDDED_PHOTOS = max(1, int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", "5")))
+
+
+def free_tier_memory_mode() -> bool:
+    """Aggressive RSS caps for ~512MB hosts (Render free tier).
+
+    Default ON. Set FREE_TIER_MEMORY_MODE=0 on a larger instance to restore
+    full brochure PDF image extraction for every listing.
+    """
+    raw = os.environ.get("FREE_TIER_MEMORY_MODE")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return True
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -222,8 +238,19 @@ def _validate_remote_url(url):
         raise LinkedResourceError("Linked destination is not a public HTTP(S) host", "LINK_UNSUPPORTED", url)
 
 
-def extract_brochure(payload: bytes, content_type: str, source_document: str) -> BrochureExtraction:
-    """Best-effort extraction based on actual response content, not suffix."""
+def extract_brochure(
+    payload: bytes,
+    content_type: str,
+    source_document: str,
+    *,
+    extract_embedded_images: bool = True,
+) -> BrochureExtraction:
+    """Best-effort extraction based on actual response content, not suffix.
+
+    extract_embedded_images: when False (free-tier nuclear mode for listings
+    that already have photos), keep text/fields/link annotations only —
+    skip PyMuPDF bitmap extraction that drove MetSpace 14×PDF RSS spikes.
+    """
     resource_type = _resource_type(payload, content_type)
     if resource_type == "html":
         return _extract_html(payload, source_document)
@@ -246,7 +273,9 @@ def extract_brochure(payload: bytes, content_type: str, source_document: str) ->
     fields = _extract_fields(text, source_document)
     # Extract visuals before the caller drops the PDF payload; do not keep a
     # second live reference to `payload` on the returned extraction.
-    visuals = _extract_pdf_visuals(payload, source_document, text_parts)
+    visuals = []
+    if extract_embedded_images:
+        visuals = _extract_pdf_visuals(payload, source_document, text_parts)
     return BrochureExtraction(
         source_document, fields, classify_candidates(links) + visuals, identity_text=text,
     )
@@ -491,9 +520,13 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     ext = base.get("ext", "png")
                     if content and classification in {AssetType.FLOORPLAN, AssetType.UNKNOWN}:
                         # Shrink before enrichment holds embeds across listings.
-                        content, width, height = downscale_image_bytes(
-                            content, extension=ext,
-                        )
+                        # Tighter edge on free tier — 14 MetSpace Drive packs
+                        # at 1600px still stacked past ~360MB before spill.
+                        max_edge = 1200 if free_tier_memory_mode() else None
+                        kwargs = {"extension": ext}
+                        if max_edge is not None:
+                            kwargs["max_edge"] = max_edge
+                        content, width, height = downscale_image_bytes(content, **kwargs)
                         digest = hashlib.sha256(content).hexdigest()
                     occurrence_keys.append(original_digest)
                     extracted.append(
@@ -516,9 +549,49 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
             fitz.TOOLS.store_shrink(100)
         except Exception:
             pass
+        gc.collect()
     for candidate, key in zip(extracted, occurrence_keys):
         candidate.occurrence_count = counts[key]
     return classify_candidates(extracted)
+
+
+def _spill_embeds_to_disk(embeds: List[AssetCandidate], spill_dir: Path) -> None:
+    """Write retained embed bytes to disk and clear content immediately.
+
+    MetSpace alone can attach ~14 unique Drive brochures; holding soft-capped
+    bitmaps for every URL until materialise ratcheted RSS 57→364 MiB. Spill
+    after each brochure URL so only one pack's bytes live in RSS at a time.
+    """
+    if not embeds or spill_dir is None:
+        return
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    for asset in embeds:
+        if not asset.content:
+            continue
+        digest = asset.content_hash or hashlib.sha256(asset.content).hexdigest()
+        asset.content_hash = digest
+        ext = (asset.extension or "jpg").lower().lstrip(".") or "jpg"
+        path = spill_dir / f"{digest[:16]}.{ext}"
+        if not path.exists():
+            path.write_bytes(asset.content)
+        asset.local_path = str(path)
+        asset.content = None
+    gc.collect()
+
+
+def _bind_extractor(extractor, extract_embedded_images: bool):
+    """Call extractors that may or may not accept extract_embedded_images."""
+
+    def wrapped(payload, content_type, source):
+        try:
+            return extractor(
+                payload, content_type, source,
+                extract_embedded_images=extract_embedded_images,
+            )
+        except TypeError:
+            return extractor(payload, content_type, source)
+
+    return wrapped
 
 
 def _extract_fields(text: str, source_document: str):
@@ -588,8 +661,14 @@ def enrich_properties(
     fetcher: Callable = fetch_brochure,
     extractor: Callable[[bytes, str, str], BrochureExtraction] = extract_brochure,
     deadline: float = None,
+    spill_dir: Optional[Path] = None,
 ) -> List[Property]:
     properties = list(properties)
+    free_tier = free_tier_memory_mode()
+    own_spill = False
+    if spill_dir is None and free_tier:
+        spill_dir = Path(tempfile.mkdtemp(prefix="brochure-spill-"))
+        own_spill = True
     # Group by brochure URL first so each unique linked document is fetched
     # once, then applied to every listing that shares it (Workplace Plus
     # London has 231 rows / ~140 unique Drive PDFs — serial fetches under a
@@ -623,10 +702,30 @@ def enrich_properties(
                 _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
                 prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             continue
+        # Free tier: do not download a brochure PDF at all when every listing
+        # sharing it already meets the High Res soft cap from the source.
+        if free_tier and all(
+            _source_photo_count(prop) >= _SOFT_MAX_EMBEDDED_PHOTOS
+            for _, prop, _ in by_url[brochure_url]
+        ):
+            for _, prop, _ in by_url[brochure_url]:
+                _record_diagnostic(
+                    prop, "LINK_EMBEDS_SKIPPED_FREE_TIER", brochure_url,
+                    detail=f"Brochure fetch skipped; listing already has ≥{_SOFT_MAX_EMBEDDED_PHOTOS} source photos.",
+                )
+            continue
         pending.append(brochure_url)
 
     if not pending:
+        if own_spill and spill_dir is not None:
+            # Nothing fetched — drop empty spill dir immediately.
+            try:
+                spill_dir.rmdir()
+            except OSError:
+                pass
         return properties
+
+    spilled_any = False
 
     # Fetch one brochure at a time and apply immediately. Holding every UNION
     # Box PDF (~22MB) plus extracted page images in one giant cache (the old
@@ -648,6 +747,14 @@ def enrich_properties(
         finally:
             for asset, content in stashed:
                 asset.content = content
+
+    def _needs_embedded_images(brochure_url: str) -> bool:
+        """Nuclear free-tier rule: only pull PDF bitmaps when a listing has
+        zero source photos. Otherwise keep Brochure PDF + Floor Plan links."""
+        members = by_url[brochure_url]
+        if not free_tier:
+            return True
+        return any(_source_photo_count(prop) == 0 for _, prop, _ in members)
 
     def _apply_result(brochure_url, extraction):
         shared_embeds = None
@@ -729,7 +836,27 @@ def enrich_properties(
                     asset.content = None
             extraction.identity_text = ""
             extraction.assets = [a for a in extraction.assets if id(a) in kept] or []
+        # Spill retained embeds to disk BEFORE the next brochure URL is
+        # fetched so MetSpace's 14 Drive packs never coexist in RSS.
+        nonlocal spilled_any
+        if shared_embeds and spill_dir is not None:
+            _spill_embeds_to_disk(shared_embeds, Path(spill_dir))
+            spilled_any = True
+            if own_spill and properties:
+                # First property carries the spill path for app cleanup.
+                properties[0].values["_embed_spill_dir"] = str(spill_dir)
         gc.collect()
+
+    def _run_one(brochure_url):
+        extract_embeds = _needs_embedded_images(brochure_url)
+        bound = _bind_extractor(extractor, extract_embeds)
+        try:
+            return _retrieve(
+                brochure_url, fetcher, bound, deadline,
+                extract_embedded_images=extract_embeds,
+            )
+        except Exception as exc:
+            return exc
 
     for wave_start in range(0, len(pending), wave_size):
         # Stop before starting a wave that cannot finish inside this file's
@@ -744,10 +871,7 @@ def enrich_properties(
         wave = pending[wave_start : wave_start + wave_size]
         if len(wave) == 1:
             brochure_url = wave[0]
-            try:
-                result = _retrieve(brochure_url, fetcher, extractor, deadline)
-            except Exception as exc:
-                result = exc
+            result = _run_one(brochure_url)
             _apply_result(brochure_url, result)
             continue
         # Wait for the wave to finish (requests timeouts already respect
@@ -756,7 +880,7 @@ def enrich_properties(
         # Knotel's lighter HTML gallery fetches (confirmed 2026-07 4-file batch).
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
             futures = {
-                pool.submit(_retrieve, brochure_url, fetcher, extractor, deadline): brochure_url
+                pool.submit(_run_one, brochure_url): brochure_url
                 for brochure_url in wave
             }
             for future in as_completed(futures):
@@ -766,6 +890,11 @@ def enrich_properties(
                 except Exception as exc:
                     result = exc
                 _apply_result(brochure_url, result)
+    if own_spill and spill_dir is not None and not spilled_any:
+        try:
+            spill_dir.rmdir()
+        except OSError:
+            pass
     return properties
 
 
@@ -780,7 +909,7 @@ def _fetch_resource(fetcher, url, deadline):
     return fetcher(url)
 
 
-def _retrieve(url, fetcher, extractor, deadline=None):
+def _retrieve(url, fetcher, extractor, deadline=None, extract_embedded_images: bool = True):
     resource = _coerce_resource(_fetch_resource(fetcher, url, deadline), url)
     payload = resource.payload
     content_type = resource.content_type
@@ -793,23 +922,33 @@ def _retrieve(url, fetcher, extractor, deadline=None):
         combined = extractor(payload, content_type, final_url)
     finally:
         # Release Drive/Box PDF bytes as soon as page text + embeds exist.
+        # Never keep the full PDF alongside extracted bitmaps.
+        del payload
         payload = b""
+        gc.collect()
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
     # as a PDF link. Follow at most two unique document assets, once each —
     # but skip nested PDFs when the page itself already supplies enough
     # High Res candidates (Knotel property pages: ~13s for 16 galleries from
     # HTML alone; following PDFs burned the multi-file enrichment window).
+    # Free tier: skip nested follow when the page already has ≥1 photo, and
+    # follow at most one nested PDF (MetSpace Drive viewer → usercontent).
     page_photos = sum(
         1 for a in combined.assets
-        if a.classification == AssetType.PROPERTY_IMAGE and (a.url or a.content)
+        if a.classification == AssetType.PROPERTY_IMAGE and (a.url or a.content or a.local_path)
     )
+    free_tier = free_tier_memory_mode()
+    skip_nested_at = 1 if free_tier else 2
+    max_nested = 1 if free_tier else 2
     documents = []
-    if page_photos < 2:
+    if page_photos < skip_nested_at:
         documents = [
             a.url for a in combined.assets
             if a.classification == AssetType.BROCHURE and a.url != resource.final_url
-        ][:2]
+        ][:max_nested]
+    # When nuclear mode says "no embeds needed", still follow one nested PDF
+    # for Floor Plan / field links, but the bound extractor skips bitmaps.
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(
@@ -824,13 +963,25 @@ def _retrieve(url, fetcher, extractor, deadline=None):
             try:
                 nested_extraction = extractor(nested_payload, nested.content_type, nested.final_url)
             finally:
+                del nested_payload
                 nested_payload = b""
+                gc.collect()
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, nested_type))
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)
             combined.assets.extend(nested_extraction.assets)
             combined.warnings.extend(nested_extraction.warnings)
             combined.diagnostics.extend(nested_extraction.diagnostics)
+            if not extract_embedded_images:
+                combined.diagnostics.append(
+                    LinkDiagnostic(
+                        "LINK_EMBEDS_SKIPPED_FREE_TIER",
+                        original_url=document_url,
+                        final_url=nested.final_url,
+                        resource_type=nested_type,
+                        detail="PDF embedded images skipped (listing already has source photos).",
+                    )
+                )
         except Exception as exc:
             combined.warnings.append(f"Linked brochure document could not be enriched: {exc}")
     combined.assets = classify_candidates(combined.assets)

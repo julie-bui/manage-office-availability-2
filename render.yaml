@@ -11,25 +11,18 @@ services:
     # cold run (Crown Estate, ~26 distinct buildings) sits right at the old
     # limit even before counting Render's own network latency.
     #
-    # --max-requests 5 --max-requests-jitter 2: this app runs a single
-    # worker (no --workers flag) for the lifetime of the service — PyMuPDF/
-    # Pillow/google-genai (confirmed 2026-07: importing google.genai alone
-    # costs ~53MB, permanently, the first time either Gemini call site is
-    # used in a worker's lifetime — it's a lazy import, so this hits
-    # whichever request triggers it first and never goes away after) are
-    # native/heavy dependencies that don't reliably return freed memory to
-    # the OS, so RSS can ratchet upward across a session's worth of
-    # requests even when each individual file is well-behaved on its own.
-    # Lowered again after soft-cap/embed fixes: MetSpace-class batches still
-    # left RSS near the free-tier ceiling, so recycle sooner. Soft-capped
-    # embeds (5) + downscaled materialise + no gallery inlining cut the
-    # peak; recycling hedges allocator fragmentation.
-    # Gunicorn gracefully restarts the worker after this many requests
-    # (jittered so a multi-service deploy wouldn't restart every worker
-    # in lockstep, though only one worker exists here).
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 5 --max-requests-jitter 2
+    # --max-requests 3 --max-requests-jitter 2: recycle after almost every
+    # heavy batch. A single MetSpace/UNION-class request can leave RSS near
+    # the free-tier ceiling; google.genai alone costs ~53MB permanently once
+    # imported. IMPORTANT: if the Render Dashboard "Start Command" is set,
+    # it OVERRIDES this file — update the dashboard to match, or clear it.
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 3 --max-requests-jitter 2
     envVars:
       - key: GEMINI_API_KEY
         sync: false
       - key: ACCESS_TOKEN
         sync: false
+      # Nuclear free-tier memory mode (default ON in code). Set to 0 only on
+      # a larger instance that can afford full brochure PDF image extraction.
+      - key: FREE_TIER_MEMORY_MODE
+        value: "1"

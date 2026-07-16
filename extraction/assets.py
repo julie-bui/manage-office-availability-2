@@ -210,6 +210,7 @@ def image_content_hash(payload: bytes) -> str:
 # Longest edge for brochure embeds kept in RSS / written to disk. MetSpace
 # Drive packs ship 4000×2250 pages; holding 14 unique brochures × soft-capped
 # photos at full res blows past Render free-tier ~512MB even after soft caps.
+# Free-tier callers pass 1200; materialise default stays 1600 for non-free.
 MAX_EMBED_EDGE_PX = 1600
 
 
@@ -238,14 +239,17 @@ def downscale_image_bytes(payload: bytes, max_edge: int = MAX_EMBED_EDGE_PX, ext
             resized = resized.resize(new_size, resample)
             buffer = BytesIO()
             ext = (extension or "jpg").lower().lstrip(".")
+            # Slightly lower JPEG quality below 1400px edge — free-tier spill
+            # path uses 1200 and needs smaller on-disk/RSS footprints.
+            jpeg_quality = 75 if max_edge <= 1200 else 85
             if ext in {"jpg", "jpeg"}:
-                resized.save(buffer, format="JPEG", quality=85, optimize=True)
+                resized.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
             elif ext == "png":
                 resized.save(buffer, format="PNG", optimize=True)
             elif ext == "webp":
-                resized.save(buffer, format="WEBP", quality=85)
+                resized.save(buffer, format="WEBP", quality=jpeg_quality)
             else:
-                resized.save(buffer, format="JPEG", quality=85, optimize=True)
+                resized.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
                 ext = "jpg"
             return buffer.getvalue(), new_size[0], new_size[1]
     except Exception:
