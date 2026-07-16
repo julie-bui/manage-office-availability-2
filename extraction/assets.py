@@ -37,6 +37,15 @@ _UNSTABLE_RE = re.compile(r"(?:^|[?&])(expires?|signature|token|x-amz-expires)="
 MIN_PROPERTY_IMAGE_WIDTH = 320
 MIN_PROPERTY_IMAGE_HEIGHT = 200
 MAX_VALIDATION_BYTES = 8 * 1024 * 1024
+# Near-solid slides (MetSpace Drive PDFs ship near-black placeholder pages)
+# have a dominant colour and very few distinct colours once downsampled.
+# Tuned against confirmed blank 4000×2250 Drive embeds (dominant ≥ 55%,
+# uniq ≤ 66) vs real interior photos from the same PDFs (uniq ≥ 1500,
+# dominant colour ≪ 5%).
+_BLANK_SAMPLE_SIZE = (64, 36)
+_BLANK_MAX_UNIQUE_COLORS = 80
+_BLANK_MAX_LUMINANCE_VARIANCE = 1500.0
+_BLANK_DOMINANT_FRACTION = 0.55
 
 
 def normalize_url(url: str) -> str:
@@ -186,10 +195,103 @@ def merge_candidate_urls(*groups: Iterable[str]) -> List[str]:
     return result
 
 
+def image_content_hash(payload: bytes) -> str:
+    """Exact content identity for gallery dedupe across distinct CDN/asset URLs."""
+    return hashlib.sha256(payload or b"").hexdigest()
+
+
+def is_blank_or_empty_image(payload: bytes) -> bool:
+    """True for near-solid placeholder slides that must never enter High Res.
+
+    Confirmed real (2026-07, MetSpace Drive brochure PDFs): several pages are
+    near-black / near-solid 4000×2250 embeds with almost no visual content.
+    URL/filename checks cannot see this; only pixel entropy can. Floor-plan
+    diagrams are intentionally NOT handled here — callers that need diagrams
+    use pdf_images.is_floorplan_image / Floor Plan assignment instead.
+    """
+    if not payload:
+        return True
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(payload)) as image:
+            sample = image.convert("RGB").resize(_BLANK_SAMPLE_SIZE)
+            # Pillow 10+ prefers get_flattened_data; keep getdata fallback.
+            getter = getattr(sample, "get_flattened_data", None) or sample.getdata
+            raw = list(getter())
+            if raw and not isinstance(raw[0], tuple):
+                pixels = list(zip(raw[0::3], raw[1::3], raw[2::3]))
+            else:
+                pixels = raw
+    except Exception:
+        return False
+    if not pixels:
+        return True
+    from collections import Counter
+
+    counts = Counter(pixels)
+    unique = len(counts)
+    dominant_fraction = counts.most_common(1)[0][1] / len(pixels)
+    if dominant_fraction >= _BLANK_DOMINANT_FRACTION and unique <= 120:
+        return True
+    if unique <= _BLANK_MAX_UNIQUE_COLORS:
+        luminances = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
+        mean = sum(luminances) / len(luminances)
+        variance = sum((value - mean) ** 2 for value in luminances) / len(luminances)
+        return variance <= _BLANK_MAX_LUMINANCE_VARIANCE
+    return False
+
+
+def evaluate_image_bytes(payload: bytes, url: str = "", content_type: str = "") -> dict:
+    """Shared decode/size/blank checks for remote validation and local batch assets."""
+    if not payload:
+        return {"ok": False, "status": "IMAGE_BLANK_OR_EMPTY", "url": url, "content_hash": image_content_hash(b"")}
+    if len(payload) > MAX_VALIDATION_BYTES:
+        return {"ok": False, "status": "IMAGE_TOO_LARGE", "url": url}
+    content_hash = image_content_hash(payload)
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(payload)) as image:
+            width, height = image.size
+            image.load()
+    except Exception as exc:
+        return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "detail": str(exc), "content_hash": content_hash}
+    if width < MIN_PROPERTY_IMAGE_WIDTH or height < MIN_PROPERTY_IMAGE_HEIGHT:
+        return {
+            "ok": False,
+            "status": "IMAGE_TOO_SMALL",
+            "url": url,
+            "width": width,
+            "height": height,
+            "content_hash": content_hash,
+            "content_type": content_type,
+        }
+    if is_blank_or_empty_image(payload):
+        return {
+            "ok": False,
+            "status": "IMAGE_BLANK_OR_EMPTY",
+            "url": url,
+            "width": width,
+            "height": height,
+            "content_hash": content_hash,
+            "content_type": content_type,
+        }
+    return {
+        "ok": True,
+        "status": "VALID_IMAGE",
+        "url": url,
+        "width": width,
+        "height": height,
+        "content_hash": content_hash,
+        "content_type": content_type,
+    }
+
+
 def _fetch_and_evaluate(url: str, timeout: float, requester: Callable) -> dict:
     """One real fetch attempt. Raises on network/HTTP failure; returns a
     result dict for every outcome that did reach a response (too large, not
-    an image, too small, valid)."""
+    an image, too small, blank, valid)."""
     response = requester(
         url,
         timeout=timeout,
@@ -215,21 +317,10 @@ def _fetch_and_evaluate(url: str, timeout: float, requester: Callable) -> dict:
         return {"ok": False, "status": "IMAGE_TOO_LARGE", "url": url}
     if not content_type.startswith("image/"):
         return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "content_type": content_type}
-    from PIL import Image
-    with Image.open(BytesIO(payload)) as image:
-        width, height = image.size
-        image.verify()
-    final_url = normalize_url(response.url or url)
-    ok = width >= MIN_PROPERTY_IMAGE_WIDTH and height >= MIN_PROPERTY_IMAGE_HEIGHT
-    return {
-        "ok": ok,
-        "status": "VALID_IMAGE" if ok else "IMAGE_TOO_SMALL",
-        "url": final_url or url,
-        "width": width,
-        "height": height,
-        "content_type": content_type,
-        "unstable": bool(_UNSTABLE_RE.search(response.url or url)),
-    }
+    final_url = normalize_url(response.url or url) or url
+    result = evaluate_image_bytes(payload, url=final_url, content_type=content_type)
+    result["unstable"] = bool(_UNSTABLE_RE.search(response.url or url))
+    return result
 
 
 def validate_image_url(

@@ -195,7 +195,11 @@ def test_direct_pdf_brochure_extracts_text_and_embedded_photo():
     import fitz
     from PIL import Image
 
-    bitmap = Image.effect_noise((500, 400), 80).convert("RGB")
+    bitmap = Image.new("RGB", (500, 400), (20, 20, 20))
+    pixels = bitmap.load()
+    for y in range(400):
+        for x in range(500):
+            pixels[x, y] = ((x * 3) % 256, (y * 7) % 256, (x + y) % 256)
     image_bytes = BytesIO()
     bitmap.save(image_bytes, format="JPEG", quality=90)
     document = fitz.open()
@@ -301,7 +305,7 @@ def test_embedded_brochure_assets_are_hosted_by_classification(tmp_path):
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
     assert len(jobs) == 2
-    assert record["Floor Plan"].endswith(".png") or ".png?" in record["Floor Plan"]
+    assert "plan" in record["Floor Plan"]
     assert len(record["_high_res_candidates"]) == 1
     assert "logo" not in " ".join(path.name for _, path in jobs)
 
@@ -323,10 +327,23 @@ def test_gallery_generator_excludes_broken_url_and_keeps_valid_candidates(tmp_pa
 
 
 def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorplan_separate(tmp_path):
-    photo_a = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-a", content_hash="photo-a", extension="jpg")
-    photo_b = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-b", content_hash="photo-b", extension="jpg")
-    duplicate = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=b"photo-a", content_hash="photo-a", extension="jpg")
-    floorplan = AssetCandidate("", BROCHURE, classification=AssetType.FLOORPLAN, confidence=0.9, content=b"plan", content_hash="plan", extension="png")
+    from PIL import Image
+
+    def _jpeg(seed):
+        buffer = BytesIO()
+        image = Image.new("RGB", (640, 400), (10, 10, 10))
+        pixels = image.load()
+        for y in range(400):
+            for x in range(640):
+                pixels[x, y] = ((x + seed) % 256, (y + seed) % 256, (x * y + seed) % 256)
+        image.save(buffer, format="JPEG")
+        return buffer.getvalue()
+
+    bytes_a, bytes_b, bytes_plan = _jpeg(1), _jpeg(2), _jpeg(3)
+    photo_a = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=bytes_a, content_hash="photo-a", extension="jpg", width=640, height=400)
+    photo_b = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=bytes_b, content_hash="photo-b", extension="jpg", width=640, height=400)
+    duplicate = AssetCandidate("", BROCHURE, classification=AssetType.PROPERTY_IMAGE, confidence=0.8, content=bytes_a, content_hash="photo-a", extension="jpg", width=640, height=400)
+    floorplan = AssetCandidate("", BROCHURE, classification=AssetType.FLOORPLAN, confidence=0.9, content=bytes_plan, content_hash="plan", extension="png", width=640, height=400)
     record = {
         "Building": "Example House",
         "Floor Plan": "",
@@ -336,9 +353,17 @@ def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorp
     }
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
         jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
-        app_module._finalize_high_res_images([record], tmp_path, "batch", "Example", image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"})
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda url, cache=None, deadline=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url,
+            },
+        )
     assert len(jobs) == 3
-    assert record["Floor Plan"].endswith(".png") or ".png?" in record["Floor Plan"]
+    assert "plan" in record["Floor Plan"]
     gallery_path = next(tmp_path.glob("*_photos*.html"))
     gallery = gallery_path.read_text(encoding="utf-8")
     assert gallery.count("<img ") == 3

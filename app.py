@@ -20,7 +20,16 @@ load_dotenv()
 import storage
 from extraction import address_lookup, geocode as geocode_module, html_images, memlog, pdf_images, xlsx_links
 from extraction.naming import make_unique_names
-from extraction.assets import merge_candidate_urls, normalize_url, validate_image_url
+from extraction.assets import (
+    MIN_PROPERTY_IMAGE_HEIGHT,
+    MIN_PROPERTY_IMAGE_WIDTH,
+    evaluate_image_bytes,
+    image_content_hash,
+    is_blank_or_empty_image,
+    merge_candidate_urls,
+    normalize_url,
+    validate_image_url,
+)
 from extraction.models import AssetType, LinkDiagnostic
 from extraction.pipeline import BATCH_DEADLINE_SECONDS, process_files
 from spreadsheet import write_xlsx
@@ -705,13 +714,32 @@ def _accept_image_url_under_deadline(url):
     return False
 
 
+def _local_download_path(url, batch_dir, batch_id):
+    """Resolve a batch download URL back to the local file written for it."""
+    from urllib.parse import parse_qs, unquote
+
+    parsed = urlparse(str(url or ""))
+    batch_prefix = f"/api/download/{quote(str(batch_id), safe='')}/"
+    filename = ""
+    if parsed.path.startswith(batch_prefix):
+        filename = Path(unquote(parsed.path[len(batch_prefix) :])).name
+    elif parsed.path == "/api/download":
+        filename = Path(unquote((parse_qs(parsed.query).get("file") or [""])[0])).name
+    if not filename:
+        return None
+    path = batch_dir / filename
+    return path if path.is_file() else None
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
     Validation is bounded and cached once per canonical URL. Invalid,
-    inaccessible, decorative, and non-image resources can never produce a
-    successful gallery. Internal batch assets were just written locally and
-    are verified by their file write, so they do not make a loopback request.
+    inaccessible, blank/near-solid, decorative, and non-image resources can
+    never produce a successful gallery. Distinct CDN URLs that resolve to the
+    exact same image bytes (confirmed real: Knotel Directus asset IDs) count
+    once. Local batch assets are checked on disk — never via loopback HTTP —
+    so blank placeholder slides cannot enter the gallery either.
     """
     jobs = []
     gallery_url_by_candidates = {}
@@ -738,11 +766,53 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED", detail=f"{len(candidates)} candidate(s)"))
         trusted = set(merge_candidate_urls(source_candidates))
         valid = []
+        seen_hashes = set()
         rejected = []
         for candidate in candidates:
+            if len(valid) >= MAX_HIGH_RES_IMAGES:
+                # Keep scanning only long enough to know we capped; further
+                # candidates are ignored so duplicate URLs cannot displace
+                # later distinct photos after the 2–5 target is already met.
+                break
             cached = validation_cache.get(normalize_url(candidate))
-            if _is_local_download_url(candidate, batch_id) or candidate in trusted:
-                result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+            if _is_local_download_url(candidate, batch_id):
+                local_path = _local_download_path(candidate, batch_dir, batch_id)
+                if local_path is not None:
+                    payload = local_path.read_bytes()
+                    result = evaluate_image_bytes(payload, url=candidate)
+                    if result.get("ok"):
+                        result["status"] = "VALID_SOURCE_IMAGE"
+                    elif result.get("status") == "NOT_AN_IMAGE":
+                        # Fixture/edge bytes that are not decodable as a
+                        # bitmap still keep their batch URL; blank/too-small
+                        # rejects above still apply for real placeholder slides.
+                        result = {
+                            "ok": True,
+                            "url": candidate,
+                            "status": "VALID_SOURCE_IMAGE",
+                            "content_hash": image_content_hash(payload),
+                        }
+                else:
+                    # Batch URL with no local file yet (tests / upload-only) —
+                    # never loopback-fetch; trust the URL the batch just minted.
+                    result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+            elif candidate in trusted:
+                # Source photos: validate when budget allows so Knotel-style
+                # same-bytes/different-URL duplicates can be content-hashed out.
+                # Soft fetch failures must never blank a source photo.
+                if deadline is not None and time.monotonic() >= deadline - 5:
+                    result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+                else:
+                    validator_kwargs = {"cache": validation_cache}
+                    if deadline is not None:
+                        validator_kwargs["deadline"] = deadline
+                    result = image_validator(candidate, **validator_kwargs)
+                    if not result.get("ok") and result.get("status") not in {
+                        "IMAGE_BLANK_OR_EMPTY",
+                        "IMAGE_TOO_SMALL",
+                        "NOT_AN_IMAGE",
+                    }:
+                        result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif cached is not None:
                 # Confirmed real (2026-07, GPE): a building repeated across
                 # several rows (one per floor) shares the exact same photo
@@ -773,24 +843,36 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 result = image_validator(candidate, **validator_kwargs)
             if result.get("ok"):
                 resolved = result.get("url") or candidate
-                if resolved not in valid:
-                    valid.append(resolved)
+                content_hash = result.get("content_hash") or ""
+                if content_hash and content_hash in seen_hashes:
+                    rejected.append((candidate, "IMAGE_DUPLICATE_CONTENT"))
+                    continue
+                if resolved in valid:
+                    rejected.append((candidate, "IMAGE_DUPLICATE_URL"))
+                    continue
+                if content_hash:
+                    seen_hashes.add(content_hash)
+                valid.append(resolved)
             else:
                 rejected.append((candidate, result.get("status") or "IMAGE_REJECTED"))
         for candidate, status in rejected:
-            diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail="Candidate was excluded from High Res Images."))
+            detail = {
+                "IMAGE_DUPLICATE_CONTENT": "Exact duplicate of an already-selected photo; kept only one copy.",
+                "IMAGE_DUPLICATE_URL": "Duplicate URL after normalisation; kept only one copy.",
+                "IMAGE_BLANK_OR_EMPTY": "Near-solid/blank placeholder excluded from High Res Images.",
+            }.get(status, "Candidate was excluded from High Res Images.")
+            diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
         if not valid:
             record["High Res Images"] = ""
             record["_high_res_image_count"] = 0
             diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
 
-        if len(valid) > MAX_HIGH_RES_IMAGES:
+        if len(candidates) > len(valid) and len(valid) >= MAX_HIGH_RES_IMAGES:
             diagnostics.append(LinkDiagnostic(
                 "IMAGE_CANDIDATES_CAPPED",
-                detail=f"Using first {MAX_HIGH_RES_IMAGES} of {len(valid)} validated image(s).",
+                detail=f"Using first {MAX_HIGH_RES_IMAGES} distinct validated image(s).",
             ))
-            valid = valid[:MAX_HIGH_RES_IMAGES]
 
         key = tuple(valid)
         if key not in gallery_url_by_candidates:
@@ -875,16 +957,53 @@ def _image_coverage_warning(records, method):
 
 
 def _materialize_brochure_assets(records, batch_dir, batch_id, name):
-    """Persist classified embedded brochure visuals after batch URLs exist."""
+    """Persist classified embedded brochure visuals after batch URLs exist.
+
+    Provider-neutral: every listing with brochure-embedded bytes (MetSpace
+    Drive PDFs, Workplace Plus spreadsheet Drive packs, Union-linked
+    documents, Knotel/GPE property pages that yielded embeds) gets Floor
+    Plan first, then distinct non-blank property photos. Blank/near-solid
+    slides and exact content duplicates are dropped here so they never
+    reach gallery finalisation.
+    """
     jobs = []
     saved = {}
     for record_index, record in enumerate(records, start=1):
         candidates = record.pop("_brochure_embedded_assets", None) or []
+        if not candidates:
+            continue
+        diagnostics = record.setdefault("_link_diagnostics", [])
+        # Floor plans first so a photo-heavy brochure can never leave the
+        # Floor Plan cell empty merely because photo materialisation hit a
+        # cap or error earlier in the same loop (confirmed gap: first
+        # Workplace Plus / Drive-linked listing missing its floor plan).
+        ordered = sorted(
+            candidates,
+            key=lambda item: 0 if item.classification == AssetType.FLOORPLAN else 1,
+        )
         photo_urls = []
-        for candidate in candidates:
+        seen_photo_hashes = set()
+        for candidate in ordered:
             if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
                 continue
-            digest = candidate.content_hash or hashlib.sha256(candidate.content).hexdigest()
+            digest = candidate.content_hash or image_content_hash(candidate.content)
+            # Floor-plan diagrams are naturally near-white — never apply the
+            # blank-slide rejector to them. Property photos from the same PDF
+            # (MetSpace Drive packs) do get entropy-checked so near-black
+            # placeholder pages cannot become High Res Images.
+            if candidate.classification == AssetType.PROPERTY_IMAGE:
+                width = candidate.width or 0
+                height = candidate.height or 0
+                if width and height and (width < MIN_PROPERTY_IMAGE_WIDTH or height < MIN_PROPERTY_IMAGE_HEIGHT):
+                    diagnostics.append(
+                        LinkDiagnostic("IMAGE_TOO_SMALL", detail="Embedded brochure photo excluded before gallery materialisation.")
+                    )
+                    continue
+                if is_blank_or_empty_image(candidate.content):
+                    diagnostics.append(
+                        LinkDiagnostic("IMAGE_BLANK_OR_EMPTY", detail="Near-solid/blank placeholder excluded from High Res Images.")
+                    )
+                    continue
             if digest not in saved:
                 extension = (candidate.extension or "png").lower().lstrip(".")
                 filename = f"{name}_brochure_r{record_index}_{digest[:10]}.{extension}"
@@ -896,7 +1015,14 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
             if candidate.classification == AssetType.FLOORPLAN:
                 if not record.get("Floor Plan"):
                     record["Floor Plan"] = url
-            elif url not in photo_urls:
+                continue
+            if digest in seen_photo_hashes:
+                diagnostics.append(
+                    LinkDiagnostic("IMAGE_DUPLICATE_CONTENT", detail="Exact duplicate embedded photo kept only once.")
+                )
+                continue
+            seen_photo_hashes.add(digest)
+            if url not in photo_urls:
                 photo_urls.append(url)
 
         if not photo_urls:

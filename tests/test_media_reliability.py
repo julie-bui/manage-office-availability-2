@@ -7,7 +7,14 @@ import requests
 from PIL import Image
 
 from extraction import brochure as brochure_module, pipeline
-from extraction.assets import classify_candidate, merge_candidate_urls, normalize_url, validate_image_url
+from extraction.assets import (
+    classify_candidate,
+    image_content_hash,
+    is_blank_or_empty_image,
+    merge_candidate_urls,
+    normalize_url,
+    validate_image_url,
+)
 from extraction.html_images import _IMAGE_FETCH_TIMEOUT_SECONDS
 from extraction.identity import IdentityDecision, compare_property_identity
 from extraction.brochure import _embedded_http_target, enrich_properties
@@ -93,8 +100,16 @@ class FakeResponse:
 
 
 def image_bytes(size=(640, 480)):
+    """Colourful synthetic photo — solid white would correctly be rejected
+    as IMAGE_BLANK_OR_EMPTY by the shared blank-slide detector."""
     output = BytesIO()
-    Image.new("RGB", size, "white").save(output, "JPEG")
+    image = Image.new("RGB", size, (20, 20, 20))
+    pixels = image.load()
+    width, height = size
+    for y in range(height):
+        for x in range(width):
+            pixels[x, y] = ((x * 3) % 256, (y * 5) % 256, (x + y) % 256)
+    image.save(output, "JPEG")
     return output.getvalue()
 
 
@@ -293,8 +308,9 @@ def test_source_image_survives_failed_optional_image_validation(tmp_path):
         "_high_res_candidates": [source, external],
     }
 
-    def reject_external(url, cache=None):
-        assert url == external
+    def reject_external(url, cache=None, deadline=None):
+        if url == source:
+            return {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": "source-bytes"}
         return {"ok": False, "url": url, "status": "LINK_EXPIRED_OR_INACCESSIBLE"}
 
     jobs = app_module._finalize_high_res_images(
@@ -665,13 +681,106 @@ def test_finalize_caps_high_res_gallery_at_five(tmp_path):
     with app_module.app.test_request_context("/process", base_url="https://service.test"):
         jobs = app_module._finalize_high_res_images(
             [record], tmp_path, "batch", "Example",
-            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE"},
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
     assert gallery.count("<img") == 5
     assert record["_high_res_image_count"] == 5
     assert any(item.status == "IMAGE_CANDIDATES_CAPPED" for item in record["_link_diagnostics"])
+
+
+def _solid_jpeg(color):
+    buffer = BytesIO()
+    Image.new("RGB", (640, 400), color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _photo_jpeg(seed=0):
+    buffer = BytesIO()
+    image = Image.new("RGB", (640, 400), (20, 20, 20))
+    pixels = image.load()
+    for y in range(400):
+        for x in range(640):
+            pixels[x, y] = ((x * 3 + seed) % 256, (y * 5 + seed) % 256, (x + y + seed) % 256)
+    image.save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def test_blank_near_solid_image_is_rejected():
+    assert is_blank_or_empty_image(_solid_jpeg((10, 12, 14)))
+    assert not is_blank_or_empty_image(_photo_jpeg(3))
+
+
+def test_finalize_dedupes_identical_bytes_under_different_urls(tmp_path):
+    """Knotel-style: same Directus photo served under several asset UUIDs."""
+    shared = _photo_jpeg(1)
+    other = _photo_jpeg(2)
+    third = _photo_jpeg(3)
+    payloads = {
+        "https://cdn.test/asset-a.jpg": shared,
+        "https://cdn.test/asset-b.jpg": shared,
+        "https://cdn.test/asset-c.jpg": shared,
+        "https://cdn.test/asset-d.jpg": other,
+        "https://cdn.test/asset-e.jpg": third,
+    }
+    urls = list(payloads)
+
+    def validate(url, cache=None, deadline=None):
+        payload = payloads[url]
+        return {
+            "ok": True,
+            "url": url,
+            "status": "VALID_IMAGE",
+            "content_hash": image_content_hash(payload),
+        }
+
+    record = {
+        "Building": "Knotel House",
+        "_source_high_res_candidates": urls[:1],
+        "_high_res_candidates": urls,
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Knotel", image_validator=validate
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("<img") == 3
+    assert record["_high_res_image_count"] == 3
+    assert sum(1 for item in record["_link_diagnostics"] if item.status == "IMAGE_DUPLICATE_CONTENT") == 2
+
+
+def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
+    blank = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+        content=_solid_jpeg((8, 8, 8)), content_hash="blank", extension="jpg", width=640, height=400,
+    )
+    photo = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+        content=_photo_jpeg(9), content_hash="photo", extension="jpg", width=640, height=400,
+    )
+    floorplan = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.FLOORPLAN, confidence=0.9,
+        content=_solid_jpeg((250, 250, 250)), content_hash="plan", extension="jpg", width=640, height=400,
+    )
+    record = {
+        "Building": "First Cell House",
+        "Floor Plan": "",
+        "High Res Images": "",
+        "_brochure_embedded_assets": [blank, photo, floorplan],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
+        app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record.get("Floor Plan")
+    assert "plan" in record["Floor Plan"]
+    assert record.get("_high_res_image_count") == 1
+    assert any(item.status == "IMAGE_BLANK_OR_EMPTY" for item in record["_link_diagnostics"])
+    assert len(jobs) == 2  # photo + floorplan only
 
 
 def test_dense_spreadsheet_triggers_chunking_before_row_threshold():

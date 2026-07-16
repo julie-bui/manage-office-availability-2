@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlpa
 
 import requests
 
-from .assets import classify_candidate, classify_candidates, normalize_url
+from .assets import classify_candidate, classify_candidates, is_blank_or_empty_image, normalize_url
 from .address import extract_postcode
 from .identity import IdentityDecision, compare_property_identity, property_key
 from .models import (
@@ -433,7 +433,15 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         width, height = bitmap.size
                     page_text = pages_text[page_number] if page_number < len(pages_text) else ""
                     is_floorplan = pdf_images.is_floorplan_page(page_text) or pdf_images.is_floorplan_image(content)
-                    classification = AssetType.FLOORPLAN if is_floorplan else (AssetType.DECORATIVE if width < 300 or height < 200 else AssetType.UNKNOWN)
+                    # Near-solid placeholder slides (confirmed MetSpace Drive
+                    # PDFs) must never become PROPERTY_IMAGE later via
+                    # classify_candidates' association_confidence path.
+                    if is_floorplan:
+                        classification = AssetType.FLOORPLAN
+                    elif width < 300 or height < 200 or is_blank_or_empty_image(content):
+                        classification = AssetType.DECORATIVE
+                    else:
+                        classification = AssetType.UNKNOWN
                     extracted.append(
                         AssetCandidate(
                             "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
