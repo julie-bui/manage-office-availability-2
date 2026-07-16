@@ -138,10 +138,10 @@ def test_finalize_accepts_unknown_assets_host_under_deadline(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
             deadline=past,
         )
-    # Source survives; the second unhashed soft-accept is skipped so CDN
-    # duplicate galleries cannot form without a content hash.
-    assert record["_high_res_image_count"] == 1
-    assert record.get("High Res Images") == url
+    # Under deadline, keep up to the High Res minimum of unhashed soft-accepts
+    # so multi-photo listings are not collapsed to a single featured image.
+    assert record["_high_res_image_count"] == 2
+    assert ".html" in (record.get("High Res Images") or "") or record.get("High Res Images") == url
 
 
 def test_enrichment_seed_and_brochure_helpers_are_label_agnostic():

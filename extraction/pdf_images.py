@@ -651,14 +651,47 @@ def is_floorplan_page(page_text):
 # decorative header/footer illustration (34.5% — low unique-color count
 # like a floor plan, but nowhere near as white). 0.5 sits with a wide
 # margin on both sides of that gap.
-# 0.5 missed some MetSpace Drive floor-plan pages (gray/cream boards) that
-# then leaked into High Res. 0.38 still sits well above real office photos
-# tested previously (~17% white) while catching lighter plan diagrams.
-FLOORPLAN_WHITE_FRACTION = 0.38
+#
+# 0.38 (tried 2026-07) false-positived bright MetSpace/WP interiors and
+# wiped High Res galleries. Stay at 0.5; cream/gray plan boards that sit
+# under 0.5 are caught by is_floorplan_page(page_text) during PDF extract
+# and by Floor Plan URL exclusion in finalize — not by lowering this.
+FLOORPLAN_WHITE_FRACTION = 0.5
+# Near-white AND low colour diversity (line drawings). Bright photos can
+# exceed ~40% white from walls/windows but still have rich colour counts.
+_FLOORPLAN_MAX_UNIQUE_COLORS = 900
 # Only need a rough estimate, so large images are downsampled first —
 # this keeps the check cheap even for a multi-megapixel source image.
 _MAX_SAMPLE_PIXELS = 400 * 400
 _SAMPLE_WIDTH = 200
+
+
+def _white_fraction_and_unique(image_bytes):
+    """Return (near-white fraction, unique-colour count) or (0.0, 0)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return 0.0, 0
+    try:
+        import io
+
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return 0.0, 0
+
+    w, h = im.size
+    if w * h > _MAX_SAMPLE_PIXELS and w > 0:
+        im = im.resize((_SAMPLE_WIDTH, max(1, int(_SAMPLE_WIDTH * h / w))))
+
+    total = 0
+    white = 0
+    unique = set()
+    for r, g, b in im.getdata():
+        total += 1
+        unique.add((r >> 3, g >> 3, b >> 3))  # 5-bit buckets — cheap diversity
+        if r > 235 and g > 235 and b > 235:
+            white += 1
+    return ((white / total) if total else 0.0), len(unique)
 
 
 def _white_fraction(image_bytes):
@@ -667,28 +700,7 @@ def _white_fraction(image_bytes):
     Pillow can't decode it, rather than raising — this is only ever an
     extra signal on top of the existing hash/size-based filtering, never
     something that should fail extraction."""
-    try:
-        from PIL import Image
-    except ImportError:
-        return 0.0
-    try:
-        import io
-
-        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        return 0.0
-
-    w, h = im.size
-    if w * h > _MAX_SAMPLE_PIXELS and w > 0:
-        im = im.resize((_SAMPLE_WIDTH, max(1, int(_SAMPLE_WIDTH * h / w))))
-
-    total = 0
-    white = 0
-    for r, g, b in im.getdata():
-        total += 1
-        if r > 235 and g > 235 and b > 235:
-            white += 1
-    return (white / total) if total else 0.0
+    return _white_fraction_and_unique(image_bytes)[0]
 
 
 def is_floorplan_image(image_bytes):
@@ -698,8 +710,13 @@ def is_floorplan_image(image_bytes):
     per-page one: confirmed on Breezblok's John Stow House brochure that
     a floor-plan diagram and a real desk photo can share the same PDF
     page, so classifying by page alone would wrongly keep or exclude
-    both together."""
-    return _white_fraction(image_bytes) > FLOORPLAN_WHITE_FRACTION
+    both together.
+
+    Requires both high white fraction AND low colour diversity so bright
+    office photos (white walls, windows) are not stripped from High Res.
+    """
+    white, unique = _white_fraction_and_unique(image_bytes)
+    return white > FLOORPLAN_WHITE_FRACTION and unique <= _FLOORPLAN_MAX_UNIQUE_COLORS
 
 
 def build_gallery_html(title, image_urls):

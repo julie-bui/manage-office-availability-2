@@ -50,18 +50,16 @@ _ENRICHMENT_FETCH_WORKERS = 1
 # Drive embeds until materialise. Floor plans capped separately (1–2 is
 # enough for the spreadsheet cell).
 _SOFT_MAX_EMBEDDED_PHOTOS = 8
-_SOFT_MAX_EMBEDDED_FLOORPLANS = 2
+_SOFT_MAX_EMBEDDED_FLOORPLANS = 4
 _MIN_HIGH_RES_TARGET = 5
-# Skip nested PDF downloads once the HTML page already exposes a small
-# gallery. Threshold is below the High Res min (5) on purpose: Knotel
-# property pages often have 2–4 HTML photos that are enough to avoid a
-# slow PDF fetch, freeing budget for later under-filled floors.
-_NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 2
-# Leave headroom on 512MB–1GB hosts. UNION Box PDFs (~22MB) plus pdfplumber
-# + PyMuPDF decode spiked past the ceiling and SIGKILL'd the worker
-# (misreported as "Perhaps out of memory?"). Skip further fetches when RSS
-# is already this high so spreadsheet write can still finish.
-_RSS_ENRICHMENT_CEILING_MB = 420.0
+# Skip *optional* nested PDFs on property HTML pages that already expose a
+# confident photo gallery (Knotel). Never used to skip Drive/Box/Dropbox
+# download targets — those viewer shells often have ≥2 chrome images and
+# are the ONLY photo/floorplan source for MetSpace / Workplace Plus.
+_NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
+# Leave headroom on 512MB–1GB hosts. Checked between waves and during PDF
+# image extract so a mid-decode spike can stop before SIGKILL.
+_RSS_ENRICHMENT_CEILING_MB = 360.0
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -433,6 +431,24 @@ def _box_shared_name(url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _is_hosted_document_download(url: str) -> bool:
+    """True for Drive/Box/Dropbox downloads that must be followed even when
+    the viewer HTML already shows chrome images.
+
+    Plain `.pdf` hrefs on property sites are optional (Knotel) and may be
+    skipped when the HTML page already has a photo gallery.
+    """
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    if host.endswith("drive.usercontent.google.com") or host in {"drive.google.com", "docs.google.com"}:
+        return True
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if _is_box_host(host):
+        return True
+    return False
+
+
 def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[str]) -> List[AssetCandidate]:
     """Extract embedded PDF visuals conservatively for later hosting."""
     try:
@@ -450,12 +466,18 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     seen_digests = set()
     photo_kept = 0
     floorplan_kept = 0
+    # Soft-cap photos tighter for large Box/Drive payloads on small hosts.
+    photo_cap = _SOFT_MAX_EMBEDDED_PHOTOS
+    if len(payload) >= 8 * 1024 * 1024 or _is_hosted_document_download(source_document):
+        photo_cap = min(photo_cap, 5)
     # Scan every page so floor plans later in UNION/Workplace Plus brochures
     # are not skipped after early photo pages. Exact content hashes prevent
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
     # Soft-cap property-photo bitmaps and floor-plan bitmaps (RSS bound).
     try:
         for page_number, page in enumerate(document):
+            if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB and (photo_kept >= 1 or floorplan_kept >= 1):
+                break
             for image in page.get_images(full=True):
                 try:
                     base = document.extract_image(image[0])
@@ -484,7 +506,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         # Drop bytes immediately — merge never hosts decorative.
                         content = None
                     else:
-                        if photo_kept >= _SOFT_MAX_EMBEDDED_PHOTOS:
+                        if photo_kept >= photo_cap:
                             continue
                         # PROPERTY_IMAGE directly — leaving UNKNOWN let
                         # classify_candidates promote near-white floor-plan
@@ -620,7 +642,11 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
         donor_count = _source_photo_count(donor)
         donor_embeds = donor.values.get("_brochure_embedded_assets") or []
         donor_candidates = list(donor.values.get("_high_res_candidates") or [])
-        if donor_count < 2 and not donor_embeds:
+        if donor_count < 1 and not donor_embeds:
+            continue
+        # Only share when the donor actually has more media than a lone
+        # email featured image (or has brochure embeds).
+        if donor_count < 2 and not donor_embeds and len(donor_candidates) < 2:
             continue
         for prop in props:
             if prop is donor:
@@ -869,23 +895,29 @@ def _retrieve(url, fetcher, extractor, deadline=None):
     del payload
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
-    # as a PDF link. Follow at most two unique document assets, once each —
-    # but skip nested PDFs when the page itself already supplies enough
-    # High Res candidates (Knotel property pages: ~13s for 16 galleries from
-    # HTML alone; following PDFs burned the multi-file enrichment window).
+    # as a PDF link. Always follow Drive/Box/Dropbox download targets
+    # (MetSpace/Workplace Plus: viewer chrome has ≥2 imgs but zero real
+    # photos). Optionally skip other nested PDFs when a Knotel-style
+    # property page already exposes a confident HTML photo gallery.
     page_photos = sum(
         1 for a in combined.assets
-        if a.classification in {AssetType.PROPERTY_IMAGE, AssetType.UNKNOWN} and (a.url or a.content)
+        if a.classification == AssetType.PROPERTY_IMAGE
+        and (a.url or a.content)
+        and (a.association_confidence or 0) >= 0.8
     )
-    documents = []
-    # Skip nested PDF downloads when the HTML page already has enough photo
-    # candidates — saves budget for later Knotel/GPE rows that would otherwise
-    # stay on a single featured image after the first buildings burn the clock.
+    brochure_urls = [
+        a.url for a in combined.assets
+        if a.classification == AssetType.BROCHURE and a.url and a.url != resource.final_url
+    ]
+    hosted_docs = [url for url in brochure_urls if _is_hosted_document_download(url)]
+    optional_docs = [url for url in brochure_urls if not _is_hosted_document_download(url)]
+    documents = list(dict.fromkeys(hosted_docs))[:2]
     if page_photos < _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS:
-        documents = [
-            a.url for a in combined.assets
-            if a.classification == AssetType.BROCHURE and a.url != resource.final_url
-        ][:2]
+        for url in optional_docs:
+            if url not in documents:
+                documents.append(url)
+            if len(documents) >= 2:
+                break
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(

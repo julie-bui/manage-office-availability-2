@@ -932,11 +932,11 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 if resolved in valid:
                     rejected.append((candidate, "IMAGE_DUPLICATE_URL"))
                     continue
-                # Soft-accepts without a content hash after we already have
-                # photos are the Knotel/GPE duplicate path under deadline
-                # pressure — skip them. Real VALID_IMAGE results may omit a
-                # hash in tests and still join the gallery by URL identity.
-                if soft_unhashed and valid:
+                # Soft-accepts without a content hash: allow up to the High
+                # Res minimum under deadline pressure so Knotel/GPE rows keep
+                # a real multi-image gallery. Beyond that, skip — otherwise
+                # same-bytes/different-UUID Directus URLs flood the cell.
+                if soft_unhashed and len(valid) >= MIN_HIGH_RES_IMAGES:
                     rejected.append((candidate, "IMAGE_UNHASHED_SKIPPED"))
                     continue
                 if content_hash:

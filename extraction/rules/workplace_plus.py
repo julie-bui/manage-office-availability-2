@@ -71,9 +71,13 @@ def _listing_assets(html_items):
     pairs = []
     for index, (kind, alt, url) in enumerate(html_items):
         decoded = unquote(url)
+        # Any eocampaign host (London uses gallery.eocampaign1.com;
+        # Manchester/other cities have used sibling eocampaign hosts).
+        # Do not broaden to arbitrary image URLs — signature/tracking
+        # pixels (wisestamp etc.) sit in the same HTML stream.
         if not (
             kind == "image"
-            and "gallery.eocampaign1.com" in decoded
+            and "eocampaign" in decoded.lower()
             and "logo" not in (alt or "").lower()
             and "tentacles/icons" not in decoded
             and "availability" not in decoded.lower()

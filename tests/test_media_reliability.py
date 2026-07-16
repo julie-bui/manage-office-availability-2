@@ -603,11 +603,22 @@ def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
         return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
 
     def extract(payload, content_type, final_url):
+        photos = [
+            classify_candidate(
+                AssetCandidate(
+                    f"{final_url}/{name}.jpg",
+                    final_url,
+                    alt_text=name,
+                    association_confidence=0.85,
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                )
+            )
+            for name in ("a", "b", "c")
+        ]
         return BrochureExtraction(
             final_url,
-            assets=[
-                classify_candidate(AssetCandidate(f"{final_url}/a.jpg", final_url, alt_text="Office")),
-                classify_candidate(AssetCandidate(f"{final_url}/b.jpg", final_url, alt_text="Reception")),
+            assets=photos + [
                 classify_candidate(AssetCandidate(f"{final_url}/brochure.pdf", final_url, anchor_text="Download brochure")),
             ],
             identity_text="Example House, 1 Example Street, EC1A 1AA",
@@ -626,6 +637,66 @@ def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
     enrich_properties([prop], fetcher=fetch, extractor=extract)
     assert fetched == ["https://property.test/listing"]
     assert len(prop.values.get("_high_res_candidates") or []) >= 2
+
+
+def test_retrieve_always_follows_drive_download_despite_viewer_chrome():
+    """MetSpace/WP Drive shells have chrome images — must still fetch the PDF."""
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if "usercontent" in url:
+            return BrochureResource(b"%PDF-1.4 fake", "application/pdf", url, url)
+        return BrochureResource(b"<html>Drive viewer</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        if payload.startswith(b"%PDF"):
+            return BrochureExtraction(
+                final_url,
+                assets=[
+                    AssetCandidate(
+                        "", final_url, classification=AssetType.PROPERTY_IMAGE, confidence=0.82,
+                        content=_photo_jpeg(1), content_hash="drivephoto1", extension="jpg",
+                        width=640, height=400, association_confidence=0.85,
+                    ),
+                    AssetCandidate(
+                        "", final_url, classification=AssetType.FLOORPLAN, confidence=0.9,
+                        content=_photo_jpeg(2), content_hash="driveplan1", extension="jpg",
+                        width=800, height=600,
+                    ),
+                ],
+                identity_text="9-10 Market Place EC1A 1AA",
+            )
+        drive_pdf = "https://drive.usercontent.google.com/download?id=abc&export=download"
+        return BrochureExtraction(
+            final_url,
+            assets=[
+                classify_candidate(AssetCandidate(f"{final_url}/chrome1.png", final_url, alt_text="")),
+                classify_candidate(AssetCandidate(f"{final_url}/chrome2.png", final_url, alt_text="")),
+                AssetCandidate(
+                    drive_pdf, final_url, mime_type="application/pdf",
+                    classification=AssetType.BROCHURE, confidence=0.9,
+                    anchor_text="Download brochure",
+                ),
+            ],
+            identity_text="9-10 Market Place EC1A 1AA",
+        )
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "9-10 Market Place",
+            "Property Postcode": "W1W 8AQ",
+            "Brochure PDF": "https://drive.google.com/file/d/abc/view",
+        }),
+        "metspace.eml",
+        "MetSpace",
+        "rule:MetSpace",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    assert any("usercontent" in url for url in fetched)
+    embeds = prop.values.get("_brochure_embedded_assets") or []
+    assert any(a.classification == AssetType.PROPERTY_IMAGE for a in embeds)
+    assert any(a.classification == AssetType.FLOORPLAN for a in embeds)
 
 
 def test_workplace_plus_address_accepts_manchester_and_other_cities():
@@ -648,12 +719,10 @@ def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
 
 
 def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
-    """Source photo survives a late deadline; unhashed CDN extras are skipped
-    so Knotel same-bytes/different-UUID duplicates cannot fill the gallery."""
+    """Under deadline, keep up to MIN_HIGH_RES unhashed photos; extras skip."""
     urls = [
-        "https://knotel.directus.app/assets/aaa11111-bbbb-cccc-dddd-eeeeeeeeeeee",
-        "https://knotel.directus.app/assets/fff22222-bbbb-cccc-dddd-eeeeeeeeeeee",
-        "https://knotel.directus.app/assets/ggg33333-bbbb-cccc-dddd-eeeeeeeeeeee",
+        f"https://knotel.directus.app/assets/{i:08d}-bbbb-cccc-dddd-eeeeeeeeeeee"
+        for i in range(8)
     ]
     record = {
         "Building": "Classic House",
@@ -668,9 +737,8 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
             deadline=past,
         )
-    assert record["_high_res_image_count"] == 1
-    assert record.get("High Res Images") == urls[0]
-    assert jobs == []
+    assert record["_high_res_image_count"] == app_module.MIN_HIGH_RES_IMAGES
+    assert jobs  # gallery HTML for 5+ images
     assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
 
 
