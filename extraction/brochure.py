@@ -338,6 +338,26 @@ def _is_box_host(host: str) -> bool:
     return host == "box.com" or host.endswith(".box.com")
 
 
+def _is_viewer_floorplan_url(url: str) -> bool:
+    """True when Floor Plan still points at a JS viewer rather than a bitmap."""
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if _is_box_host(host) and "/shared/static/" not in path:
+        return True
+    if host in {"drive.google.com", "docs.google.com"}:
+        return True
+    if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
+        return True
+    return False
+
+
 def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
     """Resolve public document-viewer pages to their downloadable document.
 
@@ -407,20 +427,12 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
         return []
     extracted = []
     counts = Counter()
-    # Large landlord brochures (UNION Box ~22MB) can carry dozens of pages;
-    # keep the first stretch that usually holds the property photos and stop
-    # once we already have enough High Res candidates for the gallery target.
-    max_pages = 6 if len(payload) > 5 * 1024 * 1024 else len(document)
+    seen_digests = set()
+    # Scan every page so floor plans later in UNION/Workplace Plus brochures
+    # are not skipped after early photo pages. Exact content hashes prevent
+    # the same bitmap being kept twice; blank/near-solid slides are dropped.
     try:
         for page_number, page in enumerate(document):
-            if page_number >= max_pages:
-                break
-            property_photos_so_far = sum(
-                1 for candidate in extracted
-                if candidate.classification in {AssetType.PROPERTY_IMAGE, AssetType.UNKNOWN}
-            )
-            if property_photos_so_far >= 5:
-                break
             for image in page.get_images(full=True):
                 try:
                     base = document.extract_image(image[0])
@@ -429,6 +441,9 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         continue
                     digest = hashlib.sha256(content).hexdigest()
                     counts[digest] += 1
+                    if digest in seen_digests:
+                        continue
+                    seen_digests.add(digest)
                     with Image.open(BytesIO(content)) as bitmap:
                         width, height = bitmap.size
                     page_text = pages_text[page_number] if page_number < len(pages_text) else ""
@@ -797,24 +812,19 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         _add_asset(prop, candidate)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
-        # Cap how many embedded bitmaps we carry into materialisation — a
-        # single UNION Box brochure can easily embed dozens of page images.
-        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:5]
-        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN][:1]
+        # Keep every distinct embedded photo plus every floor-plan bitmap.
+        # Exact content-hash dedupe already happened in classify_candidates /
+        # _extract_pdf_visuals; the web layer inlines these into galleries.
+        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE]
+        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN]
         prop.values["_brochure_embedded_assets"] = photos + plans
-    # Keep at most five property photos per listing so brochure dumps cannot
-    # flood High Res; the web layer targets 2-5 when photos exist.
-    _MAX_PROPERTY_IMAGES = 5
     property_images = [
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
-    ][:_MAX_PROPERTY_IMAGES]
+    ]
     floorplans = [a.url for a in prop.assets if a.classification == AssetType.FLOORPLAN and a.url]
     existing_images = str(prop.values.get("High Res Images") or "")
     if not existing_images and property_images:
         _apply(prop, "High Res Images", _evidence(property_images[0], extraction.source_document, 0.82))
-        # The web layer turns 2+ externally hosted candidates into its
-        # existing gallery page; direct/library callers still receive the
-        # safe first photo in the public spreadsheet field above.
         prop.values["_high_res_candidates"] = property_images
     elif property_images:
         # The primary parser may provide an extensionless CDN/tracking URL,
@@ -826,11 +836,16 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         existing_candidates = list(prop.values.get("_high_res_candidates") or [])
         if existing_images and not re.search(r"\.html(?:[?#]|$)", existing_images, re.I):
             existing_candidates.insert(0, existing_images)
-        prop.values["_high_res_candidates"] = list(
-            dict.fromkeys(existing_candidates + property_images)
-        )[:_MAX_PROPERTY_IMAGES]
-    if not prop.values.get("Floor Plan") and floorplans:
-        _apply(prop, "Floor Plan", _evidence(floorplans[0], extraction.source_document, 0.9))
+        prop.values["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + property_images))
+    existing_plan = str(prop.values.get("Floor Plan") or "")
+    if floorplans:
+        plan_evidence = _evidence(floorplans[0], extraction.source_document, 0.9)
+        if not existing_plan:
+            _apply(prop, "Floor Plan", plan_evidence)
+        elif _is_viewer_floorplan_url(existing_plan):
+            # Primary xlsx_links often pre-fills Box/Drive viewer URLs at
+            # confidence 1.0 — still replace them with a real plan asset URL.
+            _set_value(prop, "Floor Plan", plan_evidence)
     for field, evidence in extraction.fields.items():
         _apply(prop, field, evidence)
 

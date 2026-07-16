@@ -46,11 +46,10 @@ BATCH_MAX_AGE_SECONDS = 60 * 60  # clean up old batch output dirs after an hour
 # future rule-based PDF parser that DOES supply its own images from its own
 # table/link structure doesn't silently get double-processed here.
 PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
-# Target band for High Res Images when the source/brochures actually contain
-# property photos. Cap galleries at MAX so one brochure dump cannot flood a
-# listing; warn when a non-exempt file finishes below MIN or with zero images.
-MIN_HIGH_RES_IMAGES = 2
-MAX_HIGH_RES_IMAGES = 5
+# Target for High Res Images when the source/brochures actually contain
+# property photos. Keep every distinct validated photo (no upper cap);
+# warn when a non-exempt file finishes below MIN or with zero images.
+MIN_HIGH_RES_IMAGES = 5
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
 IMAGE_EXEMPT_METHODS = {"rule:BC"}
@@ -291,7 +290,12 @@ def process():
         threading.Thread(target=_flush_caches, daemon=True).start()
 
         if upload_jobs:
-            threading.Thread(target=_upload_all, args=(upload_jobs,), daemon=True).start()
+            # Hosted High Res galleries (and their inlined/local siblings) must
+            # be durable before the client can click a cell — async upload left
+            # MetSpace Drive embeds returning {"error":"File not found"} when
+            # the worker's local disk was already gone. Sync here; cache flush
+            # stays backgrounded below.
+            _upload_all(upload_jobs)
 
         response_files = [
             {
@@ -731,6 +735,45 @@ def _local_download_path(url, batch_dir, batch_id):
     return path if path.is_file() else None
 
 
+def _is_replaceable_viewer_url(url):
+    """True for JS/document viewers that should yield to a hosted floor-plan image.
+
+    UNION pre-fills Floor Plan with app.box.com/s/… and Workplace Plus /
+    MetSpace use Drive viewers — those block materialising a real plan
+    bitmap unless overwritten here.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return True
+    if "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "box.com" in host and "/shared/static/" not in path:
+        return True
+    if host in {"drive.google.com", "docs.google.com"}:
+        return True
+    if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
+        return True
+    return False
+
+
+def _gallery_image_entries(urls, batch_dir, batch_id):
+    """Prefer local bytes (inlined into gallery HTML) over remote-only URLs."""
+    entries = []
+    for url in urls:
+        local_path = _local_download_path(url, batch_dir, batch_id) if _is_local_download_url(url, batch_id) else None
+        if local_path is not None:
+            entries.append((url, local_path.read_bytes()))
+        else:
+            entries.append(url)
+    return entries
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -738,8 +781,9 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     inaccessible, blank/near-solid, decorative, and non-image resources can
     never produce a successful gallery. Distinct CDN URLs that resolve to the
     exact same image bytes (confirmed real: Knotel Directus asset IDs) count
-    once. Local batch assets are checked on disk — never via loopback HTTP —
-    so blank placeholder slides cannot enter the gallery either.
+    once. Unhashed soft-accepts never join a gallery that already has photos,
+    so deadline pressure cannot reintroduce those duplicates. Local batch
+    assets are checked on disk and inlined into gallery HTML.
     """
     jobs = []
     gallery_url_by_candidates = {}
@@ -769,11 +813,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         seen_hashes = set()
         rejected = []
         for candidate in candidates:
-            if len(valid) >= MAX_HIGH_RES_IMAGES:
-                # Keep scanning only long enough to know we capped; further
-                # candidates are ignored so duplicate URLs cannot displace
-                # later distinct photos after the 2–5 target is already met.
-                break
             cached = validation_cache.get(normalize_url(candidate))
             if _is_local_download_url(candidate, batch_id):
                 local_path = _local_download_path(candidate, batch_dir, batch_id)
@@ -783,9 +822,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     if result.get("ok"):
                         result["status"] = "VALID_SOURCE_IMAGE"
                     elif result.get("status") == "NOT_AN_IMAGE":
-                        # Fixture/edge bytes that are not decodable as a
-                        # bitmap still keep their batch URL; blank/too-small
-                        # rejects above still apply for real placeholder slides.
                         result = {
                             "ok": True,
                             "url": candidate,
@@ -793,13 +829,10 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                             "content_hash": image_content_hash(payload),
                         }
                 else:
-                    # Batch URL with no local file yet (tests / upload-only) —
-                    # never loopback-fetch; trust the URL the batch just minted.
                     result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif candidate in trusted:
                 # Source photos: validate when budget allows so Knotel-style
                 # same-bytes/different-URL duplicates can be content-hashed out.
-                # Soft fetch failures must never blank a source photo.
                 if deadline is not None and time.monotonic() >= deadline - 5:
                     result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
                 else:
@@ -814,15 +847,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     }:
                         result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif cached is not None:
-                # Confirmed real (2026-07, GPE): a building repeated across
-                # several rows (one per floor) shares the exact same photo
-                # URL(s) — already validated and cached on that building's
-                # FIRST row. Without this check, once the shared batch
-                # deadline (below) got close, every LATER row for the same
-                # building hit the deadline branch and was marked skipped
-                # even though its answer was already known for free, right
-                # here in the cache — silently blanking High Res Images for
-                # every row of a building after its first.
                 result = cached
             elif deadline is not None and time.monotonic() >= deadline - 5:
                 if _accept_image_url_under_deadline(candidate):
@@ -844,11 +868,22 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if result.get("ok"):
                 resolved = result.get("url") or candidate
                 content_hash = result.get("content_hash") or ""
+                soft_unhashed = (not content_hash) and result.get("status") in {
+                    "VALID_SOURCE_IMAGE",
+                    "VALID_IMAGE_ACCEPTED_UNDER_DEADLINE",
+                }
                 if content_hash and content_hash in seen_hashes:
                     rejected.append((candidate, "IMAGE_DUPLICATE_CONTENT"))
                     continue
                 if resolved in valid:
                     rejected.append((candidate, "IMAGE_DUPLICATE_URL"))
+                    continue
+                # Soft-accepts without a content hash after we already have
+                # photos are the Knotel/GPE duplicate path under deadline
+                # pressure — skip them. Real VALID_IMAGE results may omit a
+                # hash in tests and still join the gallery by URL identity.
+                if soft_unhashed and valid:
+                    rejected.append((candidate, "IMAGE_UNHASHED_SKIPPED"))
                     continue
                 if content_hash:
                     seen_hashes.add(content_hash)
@@ -860,6 +895,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 "IMAGE_DUPLICATE_CONTENT": "Exact duplicate of an already-selected photo; kept only one copy.",
                 "IMAGE_DUPLICATE_URL": "Duplicate URL after normalisation; kept only one copy.",
                 "IMAGE_BLANK_OR_EMPTY": "Near-solid/blank placeholder excluded from High Res Images.",
+                "IMAGE_UNHASHED_SKIPPED": "Skipped unhashed soft-accept after distinct photos already selected (prevents CDN duplicate galleries).",
             }.get(status, "Candidate was excluded from High Res Images.")
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
         if not valid:
@@ -867,12 +903,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             record["_high_res_image_count"] = 0
             diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
-
-        if len(candidates) > len(valid) and len(valid) >= MAX_HIGH_RES_IMAGES:
-            diagnostics.append(LinkDiagnostic(
-                "IMAGE_CANDIDATES_CAPPED",
-                detail=f"Using first {MAX_HIGH_RES_IMAGES} distinct validated image(s).",
-            ))
 
         key = tuple(valid)
         if key not in gallery_url_by_candidates:
@@ -883,7 +913,10 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 gallery_filename = f"{name}_photos{gallery_count}.html"
                 gallery_path = batch_dir / gallery_filename
                 try:
-                    gallery_html = pdf_images.build_gallery_html(record.get("Building") or name, valid)
+                    gallery_html = pdf_images.build_gallery_html(
+                        record.get("Building") or name,
+                        _gallery_image_entries(valid, batch_dir, batch_id),
+                    )
                     gallery_path.write_text(gallery_html, encoding="utf-8")
                     if gallery_path.exists() and gallery_path.stat().st_size and gallery_html.count("<img") >= len(valid):
                         jobs.append((f"{batch_id}/{gallery_filename}", gallery_path))
@@ -891,11 +924,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     else:
                         raise ValueError("generated gallery did not contain every validated image")
                 except Exception as exc:
-                    # Confirmed real (2026-07, GPE multi-photo buildings): a
-                    # failed gallery write used to leave High Res blank even
-                    # though validated candidates already existed. Fall back
-                    # to the first validated URL so a gallery failure never
-                    # erases source/linked photos.
                     diagnostics.append(LinkDiagnostic("GALLERY_CREATION_FAILED", detail=str(exc)))
                     gallery_url_by_candidates[key] = valid[0]
 
@@ -904,7 +932,6 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         if len(valid) == 1:
             status, detail = "DIRECT_IMAGE_ASSIGNED", "1 validated image(s)"
         elif record["High Res Images"] == valid[0]:
-            # Gallery write failed; public cell keeps the first validated URL.
             status, detail = (
                 "DIRECT_IMAGE_ASSIGNED",
                 f"Gallery creation failed; fell back to first of {len(valid)} validated image(s).",
@@ -915,7 +942,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         if 0 < len(valid) < MIN_HIGH_RES_IMAGES:
             diagnostics.append(LinkDiagnostic(
                 "IMAGE_COUNT_BELOW_TARGET",
-                detail=f"{len(valid)} image(s); target is {MIN_HIGH_RES_IMAGES}-{MAX_HIGH_RES_IMAGES} when source/brochures provide photos.",
+                detail=f"{len(valid)} image(s); target is at least {MIN_HIGH_RES_IMAGES} when source/brochures provide photos.",
             ))
 
     return jobs
@@ -949,7 +976,7 @@ def _image_coverage_warning(records, method):
     if below_target:
         parts.append(
             f"{below_target} listing(s) have fewer than {MIN_HIGH_RES_IMAGES} photos "
-            f"(target {MIN_HIGH_RES_IMAGES}-{MAX_HIGH_RES_IMAGES} when available)"
+            f"(target at least {MIN_HIGH_RES_IMAGES} when available)"
         )
     if not parts:
         return ""
@@ -1013,7 +1040,8 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 saved[digest] = _download_url(batch_id, filename)
             url = saved[digest]
             if candidate.classification == AssetType.FLOORPLAN:
-                if not record.get("Floor Plan"):
+                existing_plan = str(record.get("Floor Plan") or "")
+                if _is_replaceable_viewer_url(existing_plan):
                     record["Floor Plan"] = url
                 continue
             if digest in seen_photo_hashes:
@@ -1034,23 +1062,19 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         # candidate and must survive the brochure merge.
         if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
             existing_candidates.insert(0, existing)
-        combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
-        # Always publish merged candidates. A blank High Res with only
-        # embedded brochure bytes (MetSpace Drive / UNION Box / Workplace
-        # Plus spreadsheets) previously relied on `not existing` being
-        # true; a single email featured photo with no _high_res_candidates
-        # list also needs the embedded URLs merged in so finalize can
-        # build a 2-5 image gallery.
-        record["_high_res_candidates"] = combined
+        # No upper cap — keep every distinct photo URL for finalize.
+        record["_high_res_candidates"] = list(dict.fromkeys(existing_candidates + photo_urls))
     return jobs
 
 
 def _upload_all(jobs):
-    """Runs in a background thread (see process() above) so /api/process
-    can return as soon as local disk is ready, without waiting on however
-    many real network round-trips a batch's storage.upload calls add up
-    to. Best-effort per job — one failing upload (logged inside
-    storage.upload itself) doesn't stop the rest."""
+    """Mirror batch files to durable object storage.
+
+    Called synchronously before /api/process returns so High Res gallery
+    links do not 404 when ephemeral local disk is gone. Best-effort per
+    job — one failing upload (logged inside storage.upload) doesn't stop
+    the rest.
+    """
     for key, path in jobs:
         storage.upload(key, path)
 

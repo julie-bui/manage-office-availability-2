@@ -647,7 +647,8 @@ def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
 
 
 def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
-    """Knotel Directus candidates must survive finalize after a late Union wave."""
+    """Source photo survives a late deadline; unhashed CDN extras are skipped
+    so Knotel same-bytes/different-UUID duplicates cannot fill the gallery."""
     urls = [
         "https://knotel.directus.app/assets/aaa11111-bbbb-cccc-dddd-eeeeeeeeeeee",
         "https://knotel.directus.app/assets/fff22222-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -666,12 +667,13 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
             deadline=past,
         )
-    assert record["_high_res_image_count"] == 3
-    assert "photos" in (record.get("High Res Images") or "")
-    assert jobs
+    assert record["_high_res_image_count"] == 1
+    assert record.get("High Res Images") == urls[0]
+    assert jobs == []
+    assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
 
 
-def test_finalize_caps_high_res_gallery_at_five(tmp_path):
+def test_finalize_keeps_all_distinct_hashed_photos_without_upper_cap(tmp_path):
     urls = [f"https://img.test/{i}.jpg" for i in range(8)]
     record = {
         "Building": "Many Photo House",
@@ -685,9 +687,8 @@ def test_finalize_caps_high_res_gallery_at_five(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img") == 5
-    assert record["_high_res_image_count"] == 5
-    assert any(item.status == "IMAGE_CANDIDATES_CAPPED" for item in record["_link_diagnostics"])
+    assert gallery.count("<img") == 8
+    assert record["_high_res_image_count"] == 8
 
 
 def _solid_jpeg(color):
@@ -766,7 +767,7 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
     )
     record = {
         "Building": "First Cell House",
-        "Floor Plan": "",
+        "Floor Plan": "https://app.box.com/s/vieweronlyshare",
         "High Res Images": "",
         "_brochure_embedded_assets": [blank, photo, floorplan],
     }
@@ -778,9 +779,40 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
         )
     assert record.get("Floor Plan")
     assert "plan" in record["Floor Plan"]
+    assert "box.com" not in record["Floor Plan"]
     assert record.get("_high_res_image_count") == 1
     assert any(item.status == "IMAGE_BLANK_OR_EMPTY" for item in record["_link_diagnostics"])
     assert len(jobs) == 2  # photo + floorplan only
+
+
+def test_gallery_inlines_local_batch_bytes(tmp_path):
+    """MetSpace-style: gallery HTML embeds local photo bytes so clicks do not
+    depend on sibling /api/download objects being present in storage."""
+    photo_a = _photo_jpeg(1)
+    photo_b = _photo_jpeg(2)
+    path_a = tmp_path / "Example_brochure_r1_aaaa.jpg"
+    path_b = tmp_path / "Example_brochure_r1_bbbb.jpg"
+    path_a.write_bytes(photo_a)
+    path_b.write_bytes(photo_b)
+    url_a = "https://service.test/api/download/batch/Example_brochure_r1_aaaa.jpg"
+    url_b = "https://service.test/api/download/batch/Example_brochure_r1_bbbb.jpg"
+    record = {
+        "Building": "Market Place",
+        "_source_high_res_candidates": [url_a, url_b],
+        "_high_res_candidates": [url_a, url_b],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE",
+                "content_hash": image_content_hash(photo_a if "aaaa" in url else photo_b),
+            },
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("data:image/") == 2
+    assert "api/download" not in gallery or gallery.count("<img") == 2
 
 
 def test_dense_spreadsheet_triggers_chunking_before_row_threshold():

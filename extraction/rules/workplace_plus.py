@@ -51,7 +51,7 @@ def parse(content):
                     "Brochure PDF": brochure,
                     "High Res Images": photo,
                     # Seed candidates so brochure-page photos can expand this
-                    # into a 2-5 image gallery in app._finalize_high_res_images
+                    # into a multi-image gallery in app._finalize_high_res_images
                     # instead of leaving a solitary email card photo.
                     "_high_res_candidates": [photo] if photo else [],
                     "Contacts": "Workplace Plus, hello@workplaceplus.co.uk",

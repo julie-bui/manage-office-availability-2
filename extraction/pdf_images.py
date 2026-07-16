@@ -699,20 +699,36 @@ def is_floorplan_image(image_bytes):
     return _white_fraction(image_bytes) > FLOORPLAN_WHITE_FRACTION
 
 
-def build_gallery_html(title, image_urls):
-    """A minimal, self-contained HTML page listing several image URLs
-    stacked together — used when a listing has more than one real photo,
-    since a spreadsheet cell can only hold one hyperlink. No JS, no
-    external assets — just <img> tags pointing at each image's own
-    already-hosted download URL."""
+def build_gallery_html(title, images):
+    """A self-contained HTML page listing several photos.
+
+    `images` is a sequence of URL strings and/or (url, raw_bytes) pairs.
+    When bytes are provided they are inlined as data URIs so the gallery
+    keeps working even if sibling /api/download objects are not yet on
+    durable storage (confirmed MetSpace Drive embeds → File not found).
+    Remote CDN URLs without bytes stay as ordinary <img src> links.
+    """
+    import base64
     import html as _html
+    import mimetypes
 
     safe_title = _html.escape(title or "Photos")
-    imgs_html = "\n".join(
-        f'<img src="{_html.escape(url)}" alt="Photo {i + 1}" '
-        f'style="max-width:100%; height:auto; display:block; margin-bottom:16px; border-radius:6px;">'
-        for i, url in enumerate(image_urls)
-    )
+    parts = []
+    for index, item in enumerate(images or []):
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            url, payload = item[0], item[1]
+        else:
+            url, payload = item, None
+        if payload:
+            mime = mimetypes.guess_type(str(url or "photo.jpg"))[0] or "image/jpeg"
+            src = f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+        else:
+            src = _html.escape(str(url or ""))
+        parts.append(
+            f'<img src="{src}" alt="Photo {index + 1}" '
+            f'style="max-width:100%; height:auto; display:block; margin-bottom:16px; border-radius:6px;">'
+        )
+    imgs_html = "\n".join(parts)
     return (
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
         f"<title>{safe_title} — Photos</title>\n"

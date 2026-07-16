@@ -170,7 +170,7 @@ def check_knotel_links_and_images(failures, client):
         # knotel.com property page must expand this into a multi-image gallery.
         if "photos" not in highres and "directus.app" not in highres:
             failures.append(
-                f"{filename} {building!r}: expected High Res Images gallery (2-5 photos) or a Directus image, got {highres!r}"
+                f"{filename} {building!r}: expected High Res Images gallery or a Directus image, got {highres!r}"
             )
 
 
