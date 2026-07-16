@@ -657,9 +657,13 @@ def is_floorplan_page(page_text):
 # under 0.5 are caught by is_floorplan_page(page_text) during PDF extract
 # and by Floor Plan URL exclusion in finalize — not by lowering this.
 FLOORPLAN_WHITE_FRACTION = 0.5
+# Cream/gray MetSpace plan boards often sit ~0.35–0.45 white with very few
+# colours. Require low diversity so bright office photos still pass.
+_FLOORPLAN_SOFT_WHITE_FRACTION = 0.35
 # Near-white AND low colour diversity (line drawings). Bright photos can
 # exceed ~40% white from walls/windows but still have rich colour counts.
 _FLOORPLAN_MAX_UNIQUE_COLORS = 900
+_FLOORPLAN_SOFT_MAX_UNIQUE_COLORS = 150
 # Only need a rough estimate, so large images are downsampled first —
 # this keeps the check cheap even for a multi-megapixel source image.
 _MAX_SAMPLE_PIXELS = 400 * 400
@@ -712,11 +716,14 @@ def is_floorplan_image(image_bytes):
     page, so classifying by page alone would wrongly keep or exclude
     both together.
 
-    Requires both high white fraction AND low colour diversity so bright
-    office photos (white walls, windows) are not stripped from High Res.
+    Requires high white fraction AND low colour diversity so bright office
+    photos (white walls, windows) are not stripped from High Res. Soft band
+    catches cream MetSpace plan boards that sit under 0.5 white.
     """
     white, unique = _white_fraction_and_unique(image_bytes)
-    return white > FLOORPLAN_WHITE_FRACTION and unique <= _FLOORPLAN_MAX_UNIQUE_COLORS
+    if white > FLOORPLAN_WHITE_FRACTION and unique <= _FLOORPLAN_MAX_UNIQUE_COLORS:
+        return True
+    return white > _FLOORPLAN_SOFT_WHITE_FRACTION and unique <= _FLOORPLAN_SOFT_MAX_UNIQUE_COLORS
 
 
 def build_gallery_html(title, image_urls):

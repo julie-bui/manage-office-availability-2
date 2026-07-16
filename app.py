@@ -784,7 +784,22 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     gallery_count = 0
     validation_cache = {}
 
-    for record in records:
+    def _finalize_photo_need(record):
+        cands = list(record.get("_high_res_candidates") or [])
+        cands.extend(record.get("_source_high_res_candidates") or [])
+        existing = str(record.get("High Res Images") or "").strip()
+        if existing and ".html" not in existing.lower():
+            cands.insert(0, existing)
+        count = len({normalize_url(url) for url in cands if url})
+        if count <= 0:
+            return 0
+        if count < MIN_HIGH_RES_IMAGES:
+            return 1
+        return 2
+
+    # Under-filled listings first so deadline pressure cannot starve them
+    # after already-complete Knotel/GPE rows burn validation time.
+    for record in sorted(records, key=_finalize_photo_need):
         raw_candidates = record.pop("_high_res_candidates", None)
         source_candidates = list(record.pop("_source_high_res_candidates", None) or [])
         if source_candidates:
@@ -842,15 +857,11 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 if local_path is not None:
                     payload = local_path.read_bytes()
                     result = evaluate_image_bytes(payload, url=candidate)
-                    if result.get("ok") and pdf_images.is_floorplan_image(payload):
-                        result = {
-                            "ok": False,
-                            "url": candidate,
-                            "status": "IMAGE_IS_FLOORPLAN",
-                            "content_hash": image_content_hash(payload),
-                        }
-                    elif result.get("ok"):
+                    if result.get("ok"):
                         result["status"] = "VALID_SOURCE_IMAGE"
+                    elif result.get("status") == "IMAGE_IS_FLOORPLAN":
+                        if _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                            record["Floor Plan"] = candidate
                     elif result.get("status") == "NOT_AN_IMAGE":
                         # Fixture/edge bytes that are not decodable as a
                         # bitmap still keep their batch URL; blank/too-small
@@ -953,6 +964,8 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 "IMAGE_UNHASHED_SKIPPED": "Skipped unhashed soft-accept after distinct photos already selected (prevents CDN duplicate galleries).",
             }.get(status, "Candidate was excluded from High Res Images.")
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
+            if status == "IMAGE_IS_FLOORPLAN" and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                record["Floor Plan"] = candidate
         if not valid:
             record["High Res Images"] = ""
             record["_high_res_image_count"] = 0
@@ -1060,9 +1073,15 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
     Plan first, then distinct non-blank property photos. Blank/near-solid
     slides and exact content duplicates are dropped here so they never
     reach gallery finalisation.
+
+    Shared `_brochure_embedded_assets` lists (same brochure URL across
+    floors) clear `content` after the first write — later floors MUST still
+    assign High Res / Floor Plan from the digest→URL map, or siblings stay
+    blank (confirmed Union / WP Manchester / MetSpace multi-floor).
     """
     jobs = []
     saved = {}
+    saved_kind = {}  # digest -> "floorplan" | "photo"
     for record_index, record in enumerate(records, start=1):
         candidates = record.pop("_brochure_embedded_assets", None) or []
         if not candidates:
@@ -1079,10 +1098,31 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         photo_urls = []
         seen_photo_hashes = set()
         for candidate in ordered:
-            if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
+            if candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
                 candidate.content = None
                 continue
-            digest = candidate.content_hash or image_content_hash(candidate.content)
+            digest = candidate.content_hash or (
+                image_content_hash(candidate.content) if candidate.content else ""
+            )
+            if not digest:
+                candidate.content = None
+                continue
+            # Replay already-hosted digests for sibling floors (content wiped).
+            if digest in saved and not candidate.content:
+                url = saved[digest]
+                kind = saved_kind.get(digest) or (
+                    "floorplan" if candidate.classification == AssetType.FLOORPLAN else "photo"
+                )
+                if kind == "floorplan":
+                    if _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                        record["Floor Plan"] = url
+                elif digest not in seen_photo_hashes:
+                    seen_photo_hashes.add(digest)
+                    if url not in photo_urls:
+                        photo_urls.append(url)
+                continue
+            if not candidate.content:
+                continue
             # Floor-plan diagrams are naturally near-white — never apply the
             # blank-slide rejector to them. Property photos from the same PDF
             # (MetSpace Drive packs) do get entropy-checked so near-black
@@ -1119,14 +1159,19 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 path.write_bytes(candidate.content)
                 jobs.append((f"{batch_id}/{filename}", path))
                 saved[digest] = _download_url(batch_id, filename)
+                saved_kind[digest] = (
+                    "floorplan" if candidate.classification == AssetType.FLOORPLAN else "photo"
+                )
             # Bytes are on disk now — free RSS before the next listing.
             candidate.content = None
             url = saved[digest]
             if candidate.classification == AssetType.FLOORPLAN:
+                saved_kind[digest] = "floorplan"
                 existing_plan = str(record.get("Floor Plan") or "")
                 if _is_replaceable_viewer_url(existing_plan):
                     record["Floor Plan"] = url
                 continue
+            saved_kind[digest] = "photo"
             if digest in seen_photo_hashes:
                 diagnostics.append(
                     LinkDiagnostic("IMAGE_DUPLICATE_CONTENT", detail="Exact duplicate embedded photo kept only once.")
@@ -1136,24 +1181,80 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
             if url not in photo_urls:
                 photo_urls.append(url)
 
-        if not photo_urls:
-            continue
-        existing_candidates = list(record.get("_high_res_candidates") or [])
-        existing = str(record.get("High Res Images") or "")
-        # CDN and redirect image URLs frequently have no useful extension.
-        # A non-gallery value already assigned to this field is an image
-        # candidate and must survive the brochure merge.
-        if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
-            existing_candidates.insert(0, existing)
-        combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
-        # Always publish merged candidates. A blank High Res with only
-        # embedded brochure bytes (MetSpace Drive / UNION Box / Workplace
-        # Plus spreadsheets) previously relied on `not existing` being
-        # true; a single email featured photo with no _high_res_candidates
-        # list also needs the embedded URLs merged in so finalize can
-        # build a 5-8 image gallery.
-        record["_high_res_candidates"] = combined
+        if photo_urls:
+            existing_candidates = list(record.get("_high_res_candidates") or [])
+            existing = str(record.get("High Res Images") or "")
+            # CDN and redirect image URLs frequently have no useful extension.
+            # A non-gallery value already assigned to this field is an image
+            # candidate and must survive the brochure merge.
+            if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
+                existing_candidates.insert(0, existing)
+            combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
+            # Always publish merged candidates. A blank High Res with only
+            # embedded brochure bytes (MetSpace Drive / UNION Box / Workplace
+            # Plus spreadsheets) previously relied on `not existing` being
+            # true; a single email featured photo with no _high_res_candidates
+            # list also needs the embedded URLs merged in so finalize can
+            # build a 5-8 image gallery.
+            record["_high_res_candidates"] = combined
+
+    _share_materialized_media_across_buildings(records)
     return jobs
+
+
+def _share_materialized_media_across_buildings(records):
+    """Copy High Res candidates + Floor Plan across floors of the same building.
+
+    Generalized sibling fan-out after materialise so Union / Workplace Plus /
+    Knotel / GPE multi-floor rows do not leave later units blank when an
+    earlier floor already hosted brochure embeds.
+    """
+    by_building = defaultdict(list)
+    for record in records:
+        building = str(record.get("Building") or "").strip().lower()
+        if building:
+            by_building[building].append(record)
+
+    def _candidate_count(record):
+        cands = list(record.get("_high_res_candidates") or [])
+        existing = str(record.get("High Res Images") or "").strip()
+        if existing and ".html" not in existing.lower():
+            cands.insert(0, existing)
+        return len({normalize_url(url) for url in cands if url})
+
+    def _usable_floor_plan(record):
+        plan = str(record.get("Floor Plan") or "").strip()
+        if not plan or _is_replaceable_viewer_url(plan):
+            return ""
+        return plan
+
+    for group in by_building.values():
+        if len(group) < 2:
+            continue
+        donor = max(
+            group,
+            key=lambda item: (_candidate_count(item), 1 if _usable_floor_plan(item) else 0),
+        )
+        donor_candidates = list(donor.get("_high_res_candidates") or [])
+        donor_image = str(donor.get("High Res Images") or "").strip()
+        if donor_image and ".html" not in donor_image.lower():
+            donor_candidates.insert(0, donor_image)
+        donor_plan = _usable_floor_plan(donor)
+        if _candidate_count(donor) < 2 and not donor_plan:
+            continue
+        for record in group:
+            if record is donor:
+                continue
+            if _candidate_count(record) < MIN_HIGH_RES_IMAGES and donor_candidates:
+                existing = list(record.get("_high_res_candidates") or [])
+                existing_image = str(record.get("High Res Images") or "").strip()
+                if existing_image and ".html" not in existing_image.lower():
+                    existing.insert(0, existing_image)
+                record["_high_res_candidates"] = list(
+                    dict.fromkeys(existing + donor_candidates)
+                )[:MAX_HIGH_RES_IMAGES]
+            if donor_plan and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                record["Floor Plan"] = donor_plan
 
 
 def _upload_all(jobs):

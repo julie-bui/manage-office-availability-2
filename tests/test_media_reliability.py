@@ -801,6 +801,62 @@ def test_blank_near_solid_image_is_rejected():
     assert not is_blank_or_empty_image(_photo_jpeg(3))
 
 
+def test_sparse_large_png_wash_is_rejected_as_blank():
+    """MetSpace Drive sparse 4000×2250 washes (~0.007 bpp) must not enter High Res."""
+    image = Image.new("RGB", (2666, 1499), (240, 240, 238))
+    pixels = image.load()
+    for x in range(0, 2666, 80):
+        for y in range(100, 200):
+            pixels[x, y] = (40, 40, 40)
+    buf = BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    payload = buf.getvalue()
+    assert len(payload) / (2666 * 1499) < 0.02
+    assert is_blank_or_empty_image(payload) or evaluate_image_bytes(payload)["status"] in {
+        "IMAGE_BLANK_OR_EMPTY",
+        "IMAGE_IS_FLOORPLAN",
+    }
+    assert evaluate_image_bytes(payload).get("ok") is False
+
+
+def test_materialize_replays_shared_embeds_for_sibling_floors(tmp_path):
+    photo = _photo_jpeg(11)
+    digest = image_content_hash(photo)
+    shared = [
+        AssetCandidate(
+            "", "brochure", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+            content=photo, content_hash=digest, extension="jpg", width=640, height=400,
+        ),
+        AssetCandidate(
+            "", "brochure", classification=AssetType.FLOORPLAN, confidence=0.9,
+            content=_photo_jpeg(12), content_hash="planhash99", extension="jpg", width=800, height=600,
+        ),
+    ]
+    # Force floorplan-looking bytes for the plan candidate
+    plan = Image.new("RGB", (800, 600), (250, 250, 250))
+    px = plan.load()
+    for x in range(0, 800, 40):
+        for y in range(600):
+            px[x, y] = (30, 30, 30)
+    pbuf = BytesIO()
+    plan.save(pbuf, format="JPEG")
+    shared[1].content = pbuf.getvalue()
+    shared[1].content_hash = image_content_hash(shared[1].content)
+
+    records = [
+        {"Building": "Shared House", "Floor/Unit": "1st", "Floor Plan": "https://drive.google.com/file/d/x/view",
+         "_brochure_embedded_assets": shared},
+        {"Building": "Shared House", "Floor/Unit": "2nd", "Floor Plan": "https://drive.google.com/file/d/x/view",
+         "_brochure_embedded_assets": shared},
+    ]
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._materialize_brochure_assets(records, tmp_path, "batch", "Example")
+    assert len(records[0].get("_high_res_candidates") or []) >= 1
+    assert len(records[1].get("_high_res_candidates") or []) >= 1
+    assert "/api/download/" in (records[0].get("Floor Plan") or "")
+    assert records[0]["Floor Plan"] == records[1]["Floor Plan"]
+
+
 def test_evaluate_image_bytes_rejects_floorplan_diagram():
     plan = Image.new("RGB", (800, 600), (250, 250, 250))
     pixels = plan.load()

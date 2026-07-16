@@ -475,9 +475,10 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
     # Soft-cap property-photo bitmaps and floor-plan bitmaps (RSS bound).
     try:
+        rss_tight = False
         for page_number, page in enumerate(document):
-            if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB and (photo_kept >= 1 or floorplan_kept >= 1):
-                break
+            if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB:
+                rss_tight = True
             for image in page.get_images(full=True):
                 try:
                     base = document.extract_image(image[0])
@@ -499,6 +500,8 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     if is_floorplan:
                         if floorplan_kept >= _SOFT_MAX_EMBEDDED_FLOORPLANS:
                             continue
+                        # Keep collecting floor plans even when RSS is tight —
+                        # photos stop first so Floor Plan cells are not stranded.
                         classification = AssetType.FLOORPLAN
                         floorplan_kept += 1
                     elif width < 300 or height < 200 or is_blank_or_empty_image(content):
@@ -506,7 +509,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         # Drop bytes immediately — merge never hosts decorative.
                         content = None
                     else:
-                        if photo_kept >= photo_cap:
+                        if rss_tight or photo_kept >= photo_cap:
                             continue
                         # PROPERTY_IMAGE directly — leaving UNKNOWN let
                         # classify_candidates promote near-white floor-plan
@@ -623,6 +626,8 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
     only finish the first few unique brochure URLs before the deadline —
     without this, the bottom half of the sheet stays on a single featured
     email image even though a sibling floor already has a full gallery.
+    Also copies a real (non-viewer) Floor Plan when siblings still have a
+    Box/Drive viewer placeholder or blank cell.
     """
     by_building = defaultdict(list)
     for prop in properties:
@@ -637,32 +642,39 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
             key=lambda item: (
                 _source_photo_count(item),
                 len(item.values.get("_brochure_embedded_assets") or []),
+                0 if _is_viewer_floorplan_url(str(item.values.get("Floor Plan") or "")) else 1,
             ),
         )
         donor_count = _source_photo_count(donor)
         donor_embeds = donor.values.get("_brochure_embedded_assets") or []
         donor_candidates = list(donor.values.get("_high_res_candidates") or [])
+        donor_plan = str(donor.values.get("Floor Plan") or "").strip()
+        if _is_viewer_floorplan_url(donor_plan):
+            donor_plan = ""
         if donor_count < 1 and not donor_embeds:
             continue
         # Only share when the donor actually has more media than a lone
         # email featured image (or has brochure embeds).
-        if donor_count < 2 and not donor_embeds and len(donor_candidates) < 2:
+        if donor_count < 2 and not donor_embeds and len(donor_candidates) < 2 and not donor_plan:
             continue
         for prop in props:
             if prop is donor:
                 continue
             if _source_photo_count(prop) >= _MIN_HIGH_RES_TARGET:
-                continue
-            if donor_embeds and not prop.values.get("_brochure_embedded_assets"):
-                prop.values["_brochure_embedded_assets"] = donor_embeds
-            if donor_candidates:
-                existing = list(prop.values.get("_high_res_candidates") or [])
-                existing_image = str(prop.values.get("High Res Images") or "").strip()
-                if existing_image and ".html" not in existing_image.lower():
-                    existing.insert(0, existing_image)
-                prop.values["_high_res_candidates"] = list(
-                    dict.fromkeys(existing + donor_candidates)
-                )[:_SOFT_MAX_EMBEDDED_PHOTOS]
+                pass
+            else:
+                if donor_embeds and not prop.values.get("_brochure_embedded_assets"):
+                    prop.values["_brochure_embedded_assets"] = donor_embeds
+                if donor_candidates:
+                    existing = list(prop.values.get("_high_res_candidates") or [])
+                    existing_image = str(prop.values.get("High Res Images") or "").strip()
+                    if existing_image and ".html" not in existing_image.lower():
+                        existing.insert(0, existing_image)
+                    prop.values["_high_res_candidates"] = list(
+                        dict.fromkeys(existing + donor_candidates)
+                    )[:_SOFT_MAX_EMBEDDED_PHOTOS]
+            if donor_plan and _is_viewer_floorplan_url(str(prop.values.get("Floor Plan") or "")):
+                prop.values["Floor Plan"] = donor_plan
 
 
 def enrich_properties(

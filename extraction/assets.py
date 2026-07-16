@@ -46,6 +46,12 @@ _BLANK_SAMPLE_SIZE = (64, 36)
 _BLANK_MAX_UNIQUE_COLORS = 80
 _BLANK_MAX_LUMINANCE_VARIANCE = 1500.0
 _BLANK_DOMINANT_FRACTION = 0.55
+# MetSpace Drive PDFs embed 2666×1499 / 4000×2250 PNGs that look blank in
+# galleries but fail the dominant-colour blank check (sparse logos/lines on
+# a wash). Real photos of that size are ≫0.02 bytes/pixel; these sit ~0.007.
+_SPARSE_MIN_PIXELS = 800_000
+_SPARSE_MAX_BYTES_PER_PIXEL = 0.02
+_SPARSE_MAX_UNIQUE_COLORS = 120
 
 
 def normalize_url(url: str) -> str:
@@ -201,13 +207,14 @@ def image_content_hash(payload: bytes) -> str:
 
 
 def is_blank_or_empty_image(payload: bytes) -> bool:
-    """True for near-solid placeholder slides that must never enter High Res.
+    """True for near-solid / sparse placeholder slides that must never enter High Res.
 
     Confirmed real (2026-07, MetSpace Drive brochure PDFs): several pages are
-    near-black / near-solid 4000×2250 embeds with almost no visual content.
-    URL/filename checks cannot see this; only pixel entropy can. Floor-plan
-    diagrams are intentionally NOT handled here — callers that need diagrams
-    use pdf_images.is_floorplan_image / Floor Plan assignment instead.
+    near-black / near-solid 4000×2250 embeds with almost no visual content,
+    plus sparse PNG "wash" slides (~0.007 bytes/pixel, ≤120 colours) that
+    look blank in galleries but fail a pure dominant-colour check.
+    Floor-plan diagrams are intentionally NOT handled here — callers that
+    need diagrams use pdf_images.is_floorplan_image / Floor Plan assignment.
     """
     if not payload:
         return True
@@ -215,6 +222,7 @@ def is_blank_or_empty_image(payload: bytes) -> bool:
         from PIL import Image
 
         with Image.open(BytesIO(payload)) as image:
+            width, height = image.size
             sample = image.convert("RGB").resize(_BLANK_SAMPLE_SIZE)
             # Pillow 10+ prefers get_flattened_data; keep getdata fallback.
             getter = getattr(sample, "get_flattened_data", None) or sample.getdata
@@ -232,6 +240,15 @@ def is_blank_or_empty_image(payload: bytes) -> bool:
     counts = Counter(pixels)
     unique = len(counts)
     dominant_fraction = counts.most_common(1)[0][1] / len(pixels)
+    pixels_total = max(1, int(width or 0) * int(height or 0))
+    bytes_per_pixel = len(payload) / pixels_total
+    # Huge, extremely compressible embeds = empty marketing slides / washes.
+    if (
+        pixels_total >= _SPARSE_MIN_PIXELS
+        and bytes_per_pixel <= _SPARSE_MAX_BYTES_PER_PIXEL
+        and unique <= _SPARSE_MAX_UNIQUE_COLORS
+    ):
+        return True
     if dominant_fraction >= _BLANK_DOMINANT_FRACTION and unique <= 120:
         return True
     if unique <= _BLANK_MAX_UNIQUE_COLORS:
