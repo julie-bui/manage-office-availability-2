@@ -185,8 +185,8 @@ class Property:
         record["_source_file"] = self.source_file_name
         record["_source_file_name"] = self.source_file_name
         record["_source_file_url"] = self.source_file_url
-        if self.source_file_url:
-            record["Link to File"] = self.source_file_url
+        # Link to File is intentionally not a public spreadsheet column;
+        # provenance stays on the underscore-prefixed fields above.
         record["_provenance"] = self.provenance
         record["_validation_issues"] = list(self.issues)
         record["_link_diagnostics"] = list(self.link_diagnostics)

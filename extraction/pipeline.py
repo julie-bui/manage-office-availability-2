@@ -252,8 +252,8 @@ def process_files(
             result["warning"] = content["size_warning"]
 
         # An .eml's own HTML body (already parsed by file_readers, not
-        # re-rendered) — lets app.py link Link to File at that HTML
-        # directly instead of the raw .eml, so it opens in-browser with its
+        # re-rendered) — lets app.py persist that HTML as the downloadable
+        # source artifact instead of the raw .eml, so it opens in-browser with its
         # original images (the markup already points at the sender's
         # hosted image URLs) rather than downloading a mail file. Falls
         # back to None for a plain-text-only email, or anything else.

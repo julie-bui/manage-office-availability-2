@@ -84,10 +84,11 @@ def test_exact_fixtures_run_through_orchestrator_and_qa(monkeypatch, tmp_path):
         expected_url = source_urls[source.name]
         assert all(prop.source_file_name == source.name for prop in result["properties"])
         assert all(prop.source_file_url == expected_url for prop in result["properties"])
-        assert all(record["Link to File"] == expected_url for record in result["records"])
+        assert all("Link to File" not in record for record in result["records"])
+        assert all(record["_source_file_url"] == expected_url for record in result["records"])
         assert all(record["_source_file_name"] == source.name for record in result["records"])
         assert all(
-            record["Link to File"]
+            record["_source_file_url"]
             not in {record["Brochure PDF"], record["Floor Plan"], record["High Res Images"]}
             for record in result["records"]
         )
@@ -98,15 +99,11 @@ def test_exact_fixtures_run_through_orchestrator_and_qa(monkeypatch, tmp_path):
         workbook = load_workbook(path)
         listings = workbook[workbook.sheetnames[0]]
         assert [cell.value for cell in listings[1]] == COLUMNS
+        assert "Link to File" not in COLUMNS
         assert listings.max_column == len(COLUMNS)
         assert listings.max_row == result["record_count"] + 1
         # User-facing exports are Listings-only (QA Review is opt-in).
         assert "QA Review" not in workbook.sheetnames
-        link_column = COLUMNS.index("Link to File") + 1
-        source_name = METSPACE.name if result["provider_name"] == "MetSpace" else WORKPLACE.name
-        for row in range(2, listings.max_row + 1):
-            assert listings.cell(row, link_column).value == source_name
-            assert listings.cell(row, link_column).hyperlink is not None
 
     by_provider = {result["provider_name"]: result for result in results}
     write_xlsx(tmp_path / "MetSpace-qa.xlsx", by_provider["MetSpace"]["records"], include_qa_sheet=True)

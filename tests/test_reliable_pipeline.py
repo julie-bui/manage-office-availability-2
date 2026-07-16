@@ -96,17 +96,19 @@ def test_source_reference_survives_model_validation_and_spreadsheet_export(tmp_p
     exported = prop.to_record()
     assert prop.source_file_name == "source.eml"
     assert prop.source_file_url == source_url
-    assert exported["Link to File"] == source_url
+    assert "Link to File" not in COLUMNS
+    assert "Link to File" not in exported
+    assert exported["_source_file_url"] == source_url
     assert exported["_source_file_name"] == "source.eml"
-    assert exported["Link to File"] not in {
+    assert exported["_source_file_url"] not in {
         exported["Brochure PDF"], exported["Floor Plan"], exported["High Res Images"]
     }
 
     path = tmp_path / "source-link.xlsx"
     write_xlsx(path, [exported])
-    cell = load_workbook(path)["Listings"].cell(2, COLUMNS.index("Link to File") + 1)
-    assert cell.value == "source.eml"
-    assert cell.hyperlink.target == source_url
+    headers = [cell.value for cell in load_workbook(path)["Listings"][1]]
+    assert "Link to File" not in headers
+    assert headers == COLUMNS
 
 
 def test_missing_source_url_only_warns_when_one_was_expected():
@@ -115,5 +117,55 @@ def test_missing_source_url_only_warns_when_one_was_expected():
     expected = validate_property(
         Property.from_record(record, "hosted.pdf", "Example", "rule:test", source_url_expected=True)
     )
-    assert not any(issue.field == "Link to File" for issue in local.issues)
-    assert any(issue.field == "Link to File" for issue in expected.issues)
+    assert not any(issue.field == "Source file" for issue in local.issues)
+    assert any(issue.field == "Source file" for issue in expected.issues)
+
+
+def test_brochure_source_pdf_seeds_blank_brochure_pdf(tmp_path: Path):
+    import app as app_module
+
+    source_url = "https://files.example.test/batches/1/Clerkenwell%20Brochure.pdf"
+    brochure_pdf = tmp_path / "2nd Floor - 2-7 Clerkenwell Green Brochure.pdf"
+    brochure_pdf.write_bytes(b"%PDF-1.4")
+
+    # Single-listing brochure via LLM: blank Brochure PDF gets the hosted source.
+    records = [{"Building": "2-7 Clerkenwell Green", "Brochure PDF": ""}]
+    app_module._seed_brochure_from_source_pdf(
+        records, brochure_pdf, source_url, "llm", brochure_pdf.name
+    )
+    assert records[0]["Brochure PDF"] == source_url
+
+    # Existing Brochure PDF must not be overwritten.
+    records = [{"Building": "2-7 Clerkenwell Green", "Brochure PDF": "https://cdn.example/keep.pdf"}]
+    app_module._seed_brochure_from_source_pdf(
+        records, brochure_pdf, source_url, "llm", brochure_pdf.name
+    )
+    assert records[0]["Brochure PDF"] == "https://cdn.example/keep.pdf"
+
+    # BC multi-listing availability schedule must stay blank.
+    schedule = tmp_path / "BC Current Availability.pdf"
+    schedule.write_bytes(b"%PDF-1.4")
+    records = [
+        {"Building": "10-12 Alie Street", "Brochure PDF": ""},
+        {"Building": "Other Building", "Brochure PDF": ""},
+    ]
+    app_module._seed_brochure_from_source_pdf(
+        records, schedule, source_url, "rule:BC", schedule.name
+    )
+    assert all(not r["Brochure PDF"] for r in records)
+
+    # Email/xlsx-shaped paths never seed (suffix check).
+    eml = tmp_path / "note.eml"
+    eml.write_text("From: x")
+    records = [{"Building": "Example", "Brochure PDF": ""}]
+    app_module._seed_brochure_from_source_pdf(records, eml, source_url, "llm", eml.name)
+    assert records[0]["Brochure PDF"] == ""
+
+    # Breezblok single-property PDF seeds from source.
+    breez = tmp_path / "John Stow House.pdf"
+    breez.write_bytes(b"%PDF-1.4")
+    records = [{"Building": "John Stow House", "Brochure PDF": ""}]
+    app_module._seed_brochure_from_source_pdf(
+        records, breez, source_url, "rule:Breezblok", breez.name
+    )
+    assert records[0]["Brochure PDF"] == source_url

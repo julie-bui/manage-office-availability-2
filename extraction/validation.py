@@ -28,17 +28,15 @@ def validate_url_field(field: str, value: object, forbidden_kind: str = "") -> L
 def validate_property(prop: Property) -> Property:
     values = prop.values
     if not prop.source_file_name:
-        prop.add_issue(ValidationIssue("Link to File", "Source filename was lost before export.", Severity.ERROR, ""))
+        prop.add_issue(ValidationIssue("Source file", "Source filename was lost before export.", Severity.ERROR, ""))
     if prop.source_file_url:
-        source_url_issues = validate_url_field("Link to File", prop.source_file_url)
+        source_url_issues = validate_url_field("Source file", prop.source_file_url)
         for issue in source_url_issues:
             prop.add_issue(issue)
-        if not source_url_issues:
-            values["Link to File"] = prop.source_file_url
     elif prop.source_url_expected:
         prop.add_issue(
             ValidationIssue(
-                "Link to File",
+                "Source file",
                 "A hosted source URL was expected but is unavailable.",
                 Severity.WARNING,
                 prop.source_file_name,

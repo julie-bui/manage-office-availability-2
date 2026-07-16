@@ -26,8 +26,8 @@ ALL_FIELDS = LLM_FIELDS + EXTRA_FIELDS
 # Floor Plan and High Res Images are never trusted from the LLM's own text
 # extraction, unlike every other field — real links for these two are
 # always resolved afterwards from the source PDF's actual embedded images
-# (see app.py's _attach_pdf_images), the same way Link to File is always
-# overwritten regardless of what the LLM returns. Confirmed empirically on
+# (see app.py's _attach_pdf_images). Source-file provenance is set
+# separately by app.py on `_source_file_*` fields. Confirmed empirically on
 # a Business Cube brochure: without this, the LLM copied the brochure's
 # own "Example Floorplan" heading text into the Floor Plan field verbatim,
 # producing a plausible-looking but entirely non-clickable placeholder

@@ -83,7 +83,7 @@ CONTENT_TYPES = {
     ".gif": "image/gif",
 }
 # Extensions a browser can render natively — served as `inline` so
-# clicking Link to File opens it directly in-browser instead of
+# clicking a downloaded source artifact opens it directly in-browser instead of
 # downloading. PDFs use the browser's built-in PDF viewer. .html/.htm
 # covers the HTML brochure saved for .eml sources below (the email's own
 # HTML body, not a raw .eml) — it opens like the original email,
@@ -327,6 +327,51 @@ def process():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# Methods whose uploaded PDF is a multi-listing availability schedule, not a
+# per-property brochure. Seeding Brochure PDF from the source file would
+# wrongly point every row at the schedule PDF (e.g. BC Current Availability).
+_SOURCE_PDF_NOT_BROCHURE_METHODS = {"rule:BC"}
+
+
+def _should_seed_brochure_from_source_pdf(method, filename, records):
+    """True when the uploaded PDF itself is the marketing brochure.
+
+    Emails/xlsx never reach this helper (caller checks .pdf). Availability
+    tables are excluded; LLM brochure PDFs, Breezblok sheets, filenames
+    containing 'brochure', and single-building PDFs are included.
+    """
+    if (method or "") in _SOURCE_PDF_NOT_BROCHURE_METHODS:
+        return False
+    method = method or ""
+    if method.startswith("llm") or method == "rule:Breezblok":
+        return True
+    if "brochure" in (filename or "").lower():
+        return True
+    buildings = {
+        (record.get("Building") or "").strip().lower()
+        for record in records
+        if (record.get("Building") or "").strip()
+    }
+    return len(buildings) == 1
+
+
+def _seed_brochure_from_source_pdf(records, source_path, source_url, method, original_filename):
+    """If Brochure PDF is blank and the upload is the property brochure PDF,
+    point Brochure PDF at the hosted source download URL.
+
+    Replaces the old Link to File surface for brochure-source PDFs (BC
+    single-listing sheets, Breezblok, etc.) without stuffing every PDF
+    upload into Brochure PDF.
+    """
+    if not source_url or source_path.suffix.lower() != ".pdf":
+        return
+    if not _should_seed_brochure_from_source_pdf(method, original_filename, records):
+        return
+    for record in records:
+        if not (record.get("Brochure PDF") or "").strip():
+            record["Brochure PDF"] = source_url
+
+
 def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
     """Persist source + galleries + spreadsheet for one successful file.
 
@@ -335,19 +380,17 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
     stays bounded and finalize still has batch clock left.
     """
     upload_jobs = []
-    # Persist the source artifact alongside the generated
-    # spreadsheet, and point every extracted row's "Link to File"
-    # at it so the spreadsheet is traceable back to where the data
-    # came from. Reuses the same collision-free `name` the
-    # spreadsheet got, so it can't collide with another source
-    # file in this batch.
+    # Persist the source artifact alongside the generated spreadsheet for
+    # download/API provenance (_source_file_url). Reuses the same
+    # collision-free `name` the spreadsheet got, so it can't collide with
+    # another source file in this batch.
     #
-    # An .eml with an HTML body links to that HTML directly
+    # An .eml with an HTML body stores that HTML directly
     # (extraction.pipeline already parsed it out, unmodified) —
     # opens in-browser like the original email, images included,
     # since the markup already points at the sender's hosted image
     # URLs. There's nothing to render or convert. Everything else
-    # (PDF, DOCX, XLSX, CSV, a plain-text-only .eml) links to the
+    # (PDF, DOCX, XLSX, CSV, a plain-text-only .eml) stores the
     # original uploaded file as-is.
     source_path = r["_source_path"]
     email_html = r.get("email_html")
@@ -362,8 +405,8 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
     source_url = _download_url(batch_id, source_filename)
     # The hosted URL only exists after this source artifact has a
     # collision-safe batch filename. Update the canonical typed
-    # properties, then serialize them; never patch Link to File
-    # from an unrelated brochure/image field.
+    # properties, then serialize them (source URL stays on
+    # _source_file_url — not a public spreadsheet column).
     for prop in r.get("properties") or []:
         # Display the user's original uploaded filename for audit
         # traceability.  The URL may target a collision-safe stored
@@ -421,6 +464,14 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
         # hits chunked extraction and must still recover hyperlinks.
         xlsx_links.enrich_records(r["records"], r["row_links"])
 
+    # Brochure-source PDFs (BC single-listing sheets, Breezblok, LLM
+    # brochure uploads): when Brochure PDF is still blank, surface the
+    # hosted source PDF there. Skips availability schedules (rule:BC) and
+    # never applies to email/xlsx uploads.
+    _seed_brochure_from_source_pdf(
+        r["records"], source_path, source_url, r.get("method") or "", r.get("filename") or ""
+    )
+
     # Generic, source-agnostic finishing step: any rule (not just
     # PDF ones) can stash a list of real candidate photo URLs on a
     # record as "_high_res_candidates" instead of setting High Res
@@ -467,8 +518,8 @@ def _disambiguate_source_filename(source_filename, output_filename):
     path in batch_dir. shutil.copy2 (in the caller, below) would write the
     real source there first, but write_xlsx further down that same loop
     then silently overwrites that exact file with the GENERATED
-    spreadsheet, so Link to File ends up pointing at a second copy of the
-    output file instead of the real original, for every row. Only .xlsx
+    spreadsheet, so the persisted source artifact becomes a second copy of the
+    output file instead of the real original. Only .xlsx
     can actually collide today (an .eml's own extracted-HTML path always
     gets .html; every other format keeps its own distinct extension), but
     this is written generically rather than hardcoded to ".xlsx", so it

@@ -29,8 +29,8 @@ intro also flags one (_price_drop_notes) — otherwise blank. Brochure PDF prefe
 confirmed real (2026-07) that "View Brochure" often points at pitch.com,
 a JS-rendered viewer. When View Brochure is a high-trust HTTP(S) URL it
 is still kept on `_extra_brochure_urls` so enrichment can fetch it.
-Distinct from Link to File, which app.py always overwrites with the
-persisted source file link regardless of what this rule sets.
+Source-file provenance is set later by app.py on `_source_file_url`,
+not by this rule.
 """
 import re
 

@@ -1,9 +1,10 @@
-"""Real, permanent regression coverage for Link to File / Brochure PDF /
-Floor Plan / High Res Images across EVERY real source file collected in
+"""Real, permanent regression coverage for Brochure PDF / Floor Plan /
+High Res Images (and source-file provenance that must not collide with
+the generated spreadsheet) across EVERY real source file collected in
 this project so far.
 
-Added on request (2026-07) after a repeated pattern: UNION's Link to
-File self-reference collision, The Workplace Company's Canva-vs-Website
+Added on request (2026-07) after a repeated pattern: UNION's source-file
+self-reference collision, The Workplace Company's Canva-vs-Website
 mixup, Knotel's pitch.com-vs-knotel.com mixup, MetSpace's floor-plan-
 vs-photo mixup, and Workplace Plus's multi-building segmentation failure
 were each fixed only after a NEW file happened to surface them — never
@@ -11,7 +12,7 @@ caught by whichever file prompted the PREVIOUS fix, because nothing ran
 the full set together. This suite exercises the REAL app.py route
 (Flask's own test_client, not a reimplementation) against every real
 source file already collected, checking real, hand-verified values for
-these four fields specifically — not just "populated," but matching the
+these media fields specifically — not just "populated," but matching the
 actual real link/content confirmed by hand for each, the same standard
 applied throughout this project's own investigation.
 
@@ -109,32 +110,30 @@ def _link(row, field):
     return target or value or ""
 
 
-def check_link_to_file_never_self_references(failures, client, filename):
-    """Link to File must never point at the batch's own generated
-    output spreadsheet — the exact real collision confirmed (2026-07,
+def check_source_file_never_self_references(failures, client, filename):
+    """Persisted source artifact must never share the batch's generated
+    spreadsheet filename — the exact real collision confirmed (2026-07,
     UNION): when the original upload's own extension matched the output
     extension exactly, both resolved to the same on-disk path, and
     write_xlsx silently overwrote the just-copied real source with the
-    generated spreadsheet. Checked generically here (output filename
-    never appears in the Link to File URL) rather than re-deriving the
-    fix's own internal logic, so this catches ANY future regression of
-    this class, not just the exact .xlsx-sourced case that caused it."""
+    generated spreadsheet. Also assert the public XLSX has no
+    Link to File column (provenance stays on API/source download)."""
     fr, ws = _process(client, filename)
     if fr["status"] != "ok":
         failures.append(f"{filename}: expected status ok, got {fr['status']} ({fr.get('error')})")
         return
-    rows = list(_row_dict(ws))
-    if not rows:
-        failures.append(f"{filename}: expected at least one row to check Link to File on")
+    headers = [c.value for c in ws[1]]
+    if "Link to File" in headers:
+        failures.append(f"{filename}: public spreadsheet still has a Link to File column")
         return
-    link_target = _link(rows[0], "Link to File")
-    if not link_target:
-        failures.append(f"{filename}: expected a non-empty Link to File, got blank")
+    source_file = fr.get("source_file") or ""
+    if not source_file:
+        failures.append(f"{filename}: expected a non-empty source_file in the API result")
         return
-    if fr["output_file"] in link_target:
+    if source_file == fr["output_file"]:
         failures.append(
-            f"{filename}: Link to File ({link_target!r}) points at the batch's own output file "
-            f"({fr['output_file']!r}) instead of the real original source — the exact UNION collision bug"
+            f"{filename}: source_file ({source_file!r}) collides with the batch's own output file "
+            f"({fr['output_file']!r}) — the exact UNION collision bug"
         )
 
 
@@ -314,6 +313,13 @@ def check_breezblok_links_and_images(failures, client):
         failures.append(f"{filename}: expected a real Floor Plan link (the real floor-plan diagram page 6), got blank")
     if not _link(row, "High Res Images"):
         failures.append(f"{filename}: expected a real High Res Images gallery link, got blank")
+    brochure = _link(row, "Brochure PDF")
+    source_file = fr.get("source_file") or ""
+    if not brochure or (source_file and source_file not in brochure):
+        failures.append(
+            f"{filename}: expected Brochure PDF to be the hosted source PDF "
+            f"(source_file={source_file!r}), got {brochure!r}"
+        )
 
 
 def check_crown_estate_links_and_images(failures, client):
@@ -434,8 +440,8 @@ def main():
 
     failures = []
 
-    check_link_to_file_never_self_references(failures, client, "UNION - Availability - June 26 - City 2.xlsx")
-    check_link_to_file_never_self_references(failures, client, "The Workplace Company Availability.xlsx")
+    check_source_file_never_self_references(failures, client, "UNION - Availability - June 26 - City 2.xlsx")
+    check_source_file_never_self_references(failures, client, "The Workplace Company Availability.xlsx")
 
     check_knotel_links_and_images(failures, client)
     check_metspace_normal_links_and_images(failures, client)
@@ -454,7 +460,7 @@ def main():
         for f in failures:
             print(" -", f)
         sys.exit(1)
-    print("\nAll real source files' Link to File / Brochure PDF / Floor Plan / High Res Images values checked OK.")
+    print("\nAll real source files' Brochure PDF / Floor Plan / High Res Images values checked OK.")
 
 
 if __name__ == "__main__":
