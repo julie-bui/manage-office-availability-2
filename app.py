@@ -23,7 +23,7 @@ from extraction.naming import make_unique_names
 from extraction.assets import (
     MIN_PROPERTY_IMAGE_HEIGHT,
     MIN_PROPERTY_IMAGE_WIDTH,
-    evaluate_image_bytes,
+    downscale_image_bytes,
     image_content_hash,
     is_blank_or_empty_image,
     merge_candidate_urls,
@@ -48,12 +48,16 @@ BATCH_MAX_AGE_SECONDS = 60 * 60  # clean up old batch output dirs after an hour
 PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
 # Target for High Res Images when the source/brochures actually contain
 # property photos. Warn when a non-exempt file finishes below MIN.
-# SOFT_MAX is a memory bound for Render's free tier (~512MB): uncapped
-# MetSpace/UNION brochure embeds + inlined galleries pushed RSS past 360MB
-# and the next request started from that baseline (SIGKILL). Still well
-# above MIN; distinct photos beyond the soft max are dropped earliest-first.
+# SOFT_MAX == MIN on Render free tier (~512MB): MetSpace alone can ship
+# 14 unique Drive brochures; holding uncapped embeds + inlined galleries
+# pushed RSS past 360MB and the next request started from that baseline
+# (SIGKILL). Distinct photos beyond the soft max are dropped earliest-first.
+# Override via SOFT_MAX_HIGH_RES_IMAGES env if a larger instance can afford more.
 MIN_HIGH_RES_IMAGES = 5
-SOFT_MAX_HIGH_RES_IMAGES = 15
+SOFT_MAX_HIGH_RES_IMAGES = max(
+    MIN_HIGH_RES_IMAGES,
+    int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", str(MIN_HIGH_RES_IMAGES))),
+)
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
 IMAGE_EXEMPT_METHODS = {"rule:BC"}
@@ -276,8 +280,12 @@ def process():
             one["email_html"] = None
             one["pages_text"] = None
             one["html_items"] = None
+            one["row_links"] = None
             for rec in one.get("records") or []:
                 rec.pop("_brochure_embedded_assets", None)
+                rec.pop("_high_res_candidates", None)
+                rec.pop("_source_high_res_candidates", None)
+                rec.pop("_link_diagnostics", None)
             gc.collect()
 
         results = processed_results + unsupported_results
@@ -320,6 +328,13 @@ def process():
             }
             for r in results
         ]
+        # Drop per-file record payloads before JSON encode — they are not
+        # part of the HTTP response and only keep RSS elevated until return.
+        for r in processed_results:
+            r.pop("records", None)
+            r.pop("properties", None)
+            r.pop("_source_path", None)
+        gc.collect()
         memlog.log("request end, about to return response")
         return jsonify({"batch_id": batch_id, "files": response_files})
     finally:
@@ -812,18 +827,16 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             cached = validation_cache.get(normalize_url(candidate))
             if _is_local_download_url(candidate, batch_id):
                 local_path = _local_download_path(candidate, batch_dir, batch_id)
-                if local_path is not None:
-                    payload = local_path.read_bytes()
-                    result = evaluate_image_bytes(payload, url=candidate)
-                    if result.get("ok"):
-                        result["status"] = "VALID_SOURCE_IMAGE"
-                    elif result.get("status") == "NOT_AN_IMAGE":
-                        result = {
-                            "ok": True,
-                            "url": candidate,
-                            "status": "VALID_SOURCE_IMAGE",
-                            "content_hash": image_content_hash(payload),
-                        }
+                if local_path is not None and local_path.exists():
+                    # Already blank-checked / size-filtered at materialise.
+                    # Re-reading every JPEG here doubled peak RSS on MetSpace.
+                    digest_hint = local_path.stem.rsplit("_", 1)[-1]
+                    result = {
+                        "ok": True,
+                        "url": candidate,
+                        "status": "VALID_SOURCE_IMAGE",
+                        "content_hash": digest_hint,
+                    }
                 else:
                     result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif candidate in trusted:
@@ -1042,7 +1055,14 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 extension = (candidate.extension or "png").lower().lstrip(".")
                 filename = f"{name}_brochure_r{record_index}_{digest[:10]}.{extension}"
                 path = batch_dir / filename
-                path.write_bytes(candidate.content)
+                payload = candidate.content
+                if candidate.classification == AssetType.PROPERTY_IMAGE:
+                    # Key `saved` by the pre-write digest so identical embeds
+                    # share one file; downscale only shrinks what we write.
+                    payload, new_w, new_h = downscale_image_bytes(payload, extension=extension)
+                    if new_w and new_h:
+                        candidate.width, candidate.height = new_w, new_h
+                path.write_bytes(payload)
                 jobs.append((f"{batch_id}/{filename}", path))
                 saved[digest] = _download_url(batch_id, filename)
             # Bytes are on disk now — free RSS before the next listing.
@@ -1084,10 +1104,14 @@ def _upload_all(jobs):
     Called synchronously before /api/process returns so High Res gallery
     links do not 404 when ephemeral local disk is gone. Best-effort per
     job — one failing upload (logged inside storage.upload) doesn't stop
-    the rest.
+    the rest. Upload one file at a time and periodically collect so a
+    MetSpace-sized job list cannot keep every large JPEG mapped at once.
     """
-    for key, path in jobs:
+    for index, (key, path) in enumerate(jobs):
         storage.upload(key, path)
+        if index % 4 == 3:
+            gc.collect()
+    gc.collect()
 
 
 def _flush_caches():

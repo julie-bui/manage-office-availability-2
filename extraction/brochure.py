@@ -6,10 +6,12 @@ strong primary value is never silently replaced.
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+import gc
 import hashlib
 import ipaddress
 import json
 from io import BytesIO
+import os
 import re
 import time
 from typing import Callable, Iterable, List
@@ -17,7 +19,13 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlpa
 
 import requests
 
-from .assets import classify_candidate, classify_candidates, is_blank_or_empty_image, normalize_url
+from .assets import (
+    classify_candidate,
+    classify_candidates,
+    downscale_image_bytes,
+    is_blank_or_empty_image,
+    normalize_url,
+)
 from .address import extract_postcode
 from .identity import IdentityDecision, compare_property_identity, property_key
 from .models import (
@@ -41,12 +49,14 @@ MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
-_ENRICHMENT_FETCH_WORKERS = 3
+# Always serial on free tier: even two mid-size Drive/Box PDFs in flight
+# (plus their embeds) spike past ~512MB. Parallelism is not worth the RSS.
+_ENRICHMENT_FETCH_WORKERS = 1
 # Soft cap on embedded property photos retained per brochure PDF. Floor plans
-# stay uncapped (usually 1–2). Matches app.SOFT_MAX_HIGH_RES_IMAGES so
-# free-tier RSS does not hold 14× uncapped MetSpace Drive embeds until
-# materialise. Still above the gallery MIN target of 5.
-_SOFT_MAX_EMBEDDED_PHOTOS = 15
+# stay uncapped (usually 1–2). Matches app.SOFT_MAX_HIGH_RES_IMAGES (default 5
+# = MIN target) so free-tier RSS does not hold 14× large MetSpace Drive embeds
+# until materialise.
+_SOFT_MAX_EMBEDDED_PHOTOS = max(1, int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", "5")))
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -234,7 +244,12 @@ def extract_brochure(payload: bytes, content_type: str, source_document: str) ->
                     links.append(AssetCandidate(uri, source_document, page_number=page_number))
     text = "\n".join(text_parts)
     fields = _extract_fields(text, source_document)
-    return BrochureExtraction(source_document, fields, classify_candidates(links) + _extract_pdf_visuals(payload, source_document, text_parts), identity_text=text)
+    # Extract visuals before the caller drops the PDF payload; do not keep a
+    # second live reference to `payload` on the returned extraction.
+    visuals = _extract_pdf_visuals(payload, source_document, text_parts)
+    return BrochureExtraction(
+        source_document, fields, classify_candidates(links) + visuals, identity_text=text,
+    )
 
 
 def _resource_type(payload: bytes, content_type: str) -> str:
@@ -434,6 +449,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     counts = Counter()
     seen_digests = set()
     photo_kept = 0
+    occurrence_keys = []
     # Scan every page so floor plans later in UNION/Workplace Plus brochures
     # are not skipped after early photo pages. Exact content hashes prevent
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
@@ -451,6 +467,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     if digest in seen_digests:
                         continue
                     seen_digests.add(digest)
+                    original_digest = digest
                     with Image.open(BytesIO(content)) as bitmap:
                         width, height = bitmap.size
                     page_text = pages_text[page_number] if page_number < len(pages_text) else ""
@@ -466,19 +483,29 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         content = None
                     else:
                         if photo_kept >= _SOFT_MAX_EMBEDDED_PHOTOS:
+                            # Keep scanning later pages for floor plans; do not
+                            # retain more property-photo bitmaps in RSS.
                             continue
                         classification = AssetType.UNKNOWN
                         photo_kept += 1
+                    ext = base.get("ext", "png")
+                    if content and classification in {AssetType.FLOORPLAN, AssetType.UNKNOWN}:
+                        # Shrink before enrichment holds embeds across listings.
+                        content, width, height = downscale_image_bytes(
+                            content, extension=ext,
+                        )
+                        digest = hashlib.sha256(content).hexdigest()
+                    occurrence_keys.append(original_digest)
                     extracted.append(
                         AssetCandidate(
-                            "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
-                            filename=f"asset-p{page_number + 1}-{digest[:10]}.{base.get('ext', 'png')}",
+                            "", source_document, mime_type=f"image/{ext}",
+                            filename=f"asset-p{page_number + 1}-{digest[:10]}.{ext}",
                             page_number=page_number + 1, classification=classification,
                             confidence=0.9 if classification == AssetType.FLOORPLAN else (0.86 if classification == AssetType.DECORATIVE else 0.0),
                             surrounding_text=page_text[:800], discovery_method="pdf_embedded_image",
                             association_confidence=0.85 if classification == AssetType.UNKNOWN else 0.0,
                             width=width, height=height, content=content, content_hash=digest,
-                            extension=base.get("ext", "png"),
+                            extension=ext,
                         )
                     )
                 except Exception:
@@ -489,8 +516,8 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
             fitz.TOOLS.store_shrink(100)
         except Exception:
             pass
-    for candidate in extracted:
-        candidate.occurrence_count = counts[candidate.content_hash]
+    for candidate, key in zip(extracted, occurrence_keys):
+        candidate.occurrence_count = counts[key]
     return classify_candidates(extracted)
 
 
@@ -601,24 +628,26 @@ def enrich_properties(
     if not pending:
         return properties
 
-    # Fetch in small waves and apply immediately. Holding every UNION Box
-    # PDF (~22MB) plus extracted page images in one giant cache (the old
+    # Fetch one brochure at a time and apply immediately. Holding every UNION
+    # Box PDF (~22MB) plus extracted page images in one giant cache (the old
     # "fetch all, then merge" approach) blew past Render's free-tier RSS
-    # ceiling before spreadsheet write. Prefer a single in-flight large
-    # PDF when possible — three parallel 22MB Box downloads still spike
-    # past the free tier's ~512MB even after per-file finishing.
-    workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
-    # Large Box/Drive PDFs in parallel spike past ~512MB on free tier
-    # (MetSpace: 14 unique Drive packs; UNION: multi-MB Box statics).
-    if any(
-        "/shared/static/" in (urlparse(url).path or "")
-        or _box_shared_name(url)
-        or (urlparse(url).hostname or "").endswith("google.com")
-        or (urlparse(url).hostname or "").endswith("googleusercontent.com")
-        for url in pending
-    ):
-        workers = 1
+    # ceiling before spreadsheet write. Parallel Drive/Box downloads still
+    # spike past ~512MB even after soft caps — always serialise.
+    workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending), 1)
     wave_size = max(1, workers)
+
+    def _clone_for_merge(prop: Property) -> Property:
+        """Deep-copy metadata without duplicating embedded image bytes."""
+        stashed = []
+        for asset in prop.assets:
+            if asset.content is not None:
+                stashed.append((asset, asset.content))
+                asset.content = None
+        try:
+            return deepcopy(prop)
+        finally:
+            for asset, content in stashed:
+                asset.content = content
 
     def _apply_result(brochure_url, extraction):
         shared_embeds = None
@@ -655,7 +684,7 @@ def enrich_properties(
                     label = "conflicts with" if identity.decision == IdentityDecision.HARD_CONFLICT else "could not be confidently matched to"
                     prop.add_issue(ValidationIssue("Brochure PDF", f"Linked property content {label} this property and was not merged.", Severity.WARNING, extraction.source_document, "Confirm that the linked property source belongs to this record.", "linked_source_identity"))
                     continue
-                staged = deepcopy(prop)
+                staged = _clone_for_merge(prop)
                 _merge(staged, extraction)
                 # One brochure URL can span many floors (UNION, Workplace Plus
                 # sheets). Keep heavy embedded bitmaps once and reuse the same
@@ -699,6 +728,8 @@ def enrich_properties(
                 if id(asset) not in kept:
                     asset.content = None
             extraction.identity_text = ""
+            extraction.assets = [a for a in extraction.assets if id(a) in kept] or []
+        gc.collect()
 
     for wave_start in range(0, len(pending), wave_size):
         # Stop before starting a wave that cannot finish inside this file's
@@ -751,8 +782,18 @@ def _fetch_resource(fetcher, url, deadline):
 
 def _retrieve(url, fetcher, extractor, deadline=None):
     resource = _coerce_resource(_fetch_resource(fetcher, url, deadline), url)
-    resource_type = _resource_type(resource.payload, resource.content_type)
-    combined = extractor(resource.payload, resource.content_type, resource.final_url)
+    payload = resource.payload
+    content_type = resource.content_type
+    final_url = resource.final_url
+    # Drop the multi-MB PDF/HTML body off the resource immediately; extract
+    # holds its own temporary reference via the local `payload` name.
+    resource.payload = b""
+    resource_type = _resource_type(payload, content_type)
+    try:
+        combined = extractor(payload, content_type, final_url)
+    finally:
+        # Release Drive/Box PDF bytes as soon as page text + embeds exist.
+        payload = b""
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
     # as a PDF link. Follow at most two unique document assets, once each —
@@ -777,8 +818,14 @@ def _retrieve(url, fetcher, extractor, deadline=None):
             break
         try:
             nested = _coerce_resource(_fetch_resource(fetcher, document_url, deadline), document_url)
-            nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
-            nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
+            nested_payload = nested.payload
+            nested_type = _resource_type(nested_payload, nested.content_type)
+            nested.payload = b""
+            try:
+                nested_extraction = extractor(nested_payload, nested.content_type, nested.final_url)
+            finally:
+                nested_payload = b""
+            nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, nested_type))
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)
             combined.assets.extend(nested_extraction.assets)

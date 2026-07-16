@@ -57,8 +57,15 @@ class BrochureExtraction:
     diagnostics: List["LinkDiagnostic"] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
+@dataclass
 class BrochureResource:
+    """Mutable so callers can drop `payload` immediately after extract.
+
+    Freezing this used to pin multi-MB Drive/Box PDF bytes until the
+    whole BrochureResource fell out of scope, which stacked with
+    extracted embeds on Render's free-tier RSS ceiling.
+    """
+
     payload: bytes
     content_type: str
     final_url: str

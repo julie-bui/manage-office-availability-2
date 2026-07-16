@@ -674,7 +674,10 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
 
 
 def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
-    urls = [f"https://img.test/{i}.jpg" for i in range(18)]
+    """Soft cap (== MIN on free tier) keeps at most N distinct photos."""
+    cap = app_module.SOFT_MAX_HIGH_RES_IMAGES
+    assert cap == app_module.MIN_HIGH_RES_IMAGES == 5
+    urls = [f"https://img.test/{i}.jpg" for i in range(cap + 3)]
     record = {
         "Building": "Many Photo House",
         "_source_high_res_candidates": urls,
@@ -687,10 +690,24 @@ def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img") == app_module.SOFT_MAX_HIGH_RES_IMAGES
-    assert record["_high_res_image_count"] == app_module.SOFT_MAX_HIGH_RES_IMAGES
+    assert gallery.count("<img") == cap
+    assert record["_high_res_image_count"] == cap
     assert any(item.status == "IMAGE_SOFT_CAP_REACHED" for item in record["_link_diagnostics"])
     assert "data:image/" not in gallery
+
+
+def test_downscale_shrinks_large_property_photo_bytes():
+    from extraction.assets import MAX_EMBED_EDGE_PX, downscale_image_bytes
+
+    buffer = BytesIO()
+    Image.new("RGB", (3200, 1800), (40, 80, 120)).save(buffer, format="JPEG")
+    original = buffer.getvalue()
+    shrunk, width, height = downscale_image_bytes(original, extension="jpg")
+    assert max(width, height) == MAX_EMBED_EDGE_PX
+    assert len(shrunk) < len(original)
+    same, w2, h2 = downscale_image_bytes(shrunk, extension="jpg")
+    assert same == shrunk
+    assert (w2, h2) == (width, height)
 
 
 def _solid_jpeg(color):
