@@ -647,7 +647,8 @@ def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
 
 
 def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
-    """Knotel Directus candidates must survive finalize after a late Union wave."""
+    """Source photo survives a late deadline; unhashed CDN extras are skipped
+    so Knotel same-bytes/different-UUID duplicates cannot fill the gallery."""
     urls = [
         "https://knotel.directus.app/assets/aaa11111-bbbb-cccc-dddd-eeeeeeeeeeee",
         "https://knotel.directus.app/assets/fff22222-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -666,9 +667,10 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
             deadline=past,
         )
-    assert record["_high_res_image_count"] == 3
-    assert "photos" in (record.get("High Res Images") or "")
-    assert jobs
+    assert record["_high_res_image_count"] == 1
+    assert record.get("High Res Images") == urls[0]
+    assert jobs == []
+    assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
 
 
 def test_finalize_caps_high_res_gallery_at_five(tmp_path):
@@ -766,7 +768,7 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
     )
     record = {
         "Building": "First Cell House",
-        "Floor Plan": "",
+        "Floor Plan": "https://app.box.com/s/vieweronlyshare",
         "High Res Images": "",
         "_brochure_embedded_assets": [blank, photo, floorplan],
     }
@@ -778,9 +780,142 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
         )
     assert record.get("Floor Plan")
     assert "plan" in record["Floor Plan"]
+    assert "box.com" not in record["Floor Plan"]
     assert record.get("_high_res_image_count") == 1
     assert any(item.status == "IMAGE_BLANK_OR_EMPTY" for item in record["_link_diagnostics"])
     assert len(jobs) == 2  # photo + floorplan only
+    assert blank.content is None
+    assert photo.content is None
+    assert floorplan.content is None
+
+
+def test_gallery_uses_absolute_download_urls_not_data_uris(tmp_path):
+    """Galleries link to /api/download siblings; sync upload keeps them durable
+    without base64-inlining every JPEG into HTML (Render free-tier OOM)."""
+    photo_a = _photo_jpeg(1)
+    photo_b = _photo_jpeg(2)
+    path_a = tmp_path / "Example_brochure_r1_aaaa.jpg"
+    path_b = tmp_path / "Example_brochure_r1_bbbb.jpg"
+    path_a.write_bytes(photo_a)
+    path_b.write_bytes(photo_b)
+    url_a = "https://service.test/api/download/batch/Example_brochure_r1_aaaa.jpg"
+    url_b = "https://service.test/api/download/batch/Example_brochure_r1_bbbb.jpg"
+    record = {
+        "Building": "Market Place",
+        "_source_high_res_candidates": [url_a, url_b],
+        "_high_res_candidates": [url_a, url_b],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE",
+                "content_hash": image_content_hash(photo_a if "aaaa" in url else photo_b),
+            },
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("data:image/") == 0
+    assert gallery.count("<img") == 2
+    assert "api/download/batch/Example_brochure_r1_aaaa.jpg" in gallery
+    assert "api/download/batch/Example_brochure_r1_bbbb.jpg" in gallery
+
+
+def test_materialize_and_finalize_queue_gallery_and_sibling_uploads(tmp_path):
+    """MetSpace-style embeds: upload jobs must include photo siblings + gallery HTML."""
+    photo_a = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+        content=_photo_jpeg(1), content_hash="photoa1234", extension="jpg", width=640, height=400,
+    )
+    photo_b = AssetCandidate(
+        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+        content=_photo_jpeg(2), content_hash="photob5678", extension="jpg", width=640, height=400,
+    )
+    record = {
+        "Building": "Market Place",
+        "Floor Plan": "",
+        "High Res Images": "",
+        "_brochure_embedded_assets": [photo_a, photo_b],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "MetSpace")
+        jobs.extend(
+            app_module._finalize_high_res_images(
+                [record], tmp_path, "batch", "MetSpace",
+                image_validator=lambda url, cache=None: {
+                    "ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url,
+                },
+            )
+        )
+    keys = [key for key, _path in jobs]
+    assert sum(1 for key in keys if "brochure" in key) == 2
+    assert any("photos" in key and key.endswith(".html") for key in keys)
+    assert "photos" in (record.get("High Res Images") or "")
+    assert "data:image/" not in jobs[-1][1].read_text(encoding="utf-8")
+
+
+def test_process_uploads_jobs_synchronously_before_return(monkeypatch, tmp_path):
+    """Gallery/sibling uploads must finish before /api/process returns (MetSpace 404 fix)."""
+    upload_calls = []
+    thread_targets = []
+    response_seen_after_upload = []
+
+    real_jsonify = app_module.jsonify
+
+    def tracking_jsonify(*args, **kwargs):
+        response_seen_after_upload.append(list(upload_calls))
+        return real_jsonify(*args, **kwargs)
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            thread_targets.append(target)
+
+        def start(self):
+            return None
+
+    gallery = tmp_path / "g.html"
+    photo = tmp_path / "p.jpg"
+    gallery.write_text("<html><img src='/api/download/b/p.jpg'></html>", encoding="utf-8")
+    photo.write_bytes(_photo_jpeg(1))
+    jobs = [("batch/g.html", gallery), ("batch/p.jpg", photo)]
+
+    monkeypatch.setattr(app_module.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(app_module, "jsonify", tracking_jsonify)
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "_cleanup_old_batches", lambda: None)
+    monkeypatch.setattr(app_module, "_upload_all", lambda items: upload_calls.extend(items))
+    monkeypatch.setattr(
+        app_module,
+        "process_files",
+        lambda *_a, **_k: [{
+            "filename": "metspace.eml",
+            "status": "ok",
+            "method": "rule:MetSpace",
+            "record_count": 1,
+            "error": None,
+            "display_name": "MetSpace",
+            "records": [{"Building": "A", "High Res Images": ""}],
+            "properties": [],
+            "email_html": None,
+            "pages_text": None,
+            "html_items": None,
+        }],
+    )
+    monkeypatch.setattr(app_module, "_finish_ok_result", lambda *_a, **_k: list(jobs))
+    monkeypatch.setattr(app_module, "ACCESS_TOKEN", "test-token")
+
+    with app_module.app.test_client() as client:
+        resp = client.post(
+            "/api/process",
+            data={"files": (BytesIO(b"From: t\n\nbody"), "metspace.eml")},
+            headers={"X-Access-Token": "test-token"},
+            content_type="multipart/form-data",
+        )
+    assert resp.status_code == 200
+    assert upload_calls == jobs
+    assert response_seen_after_upload and response_seen_after_upload[0] == jobs
+    assert app_module._upload_all not in thread_targets
+    assert app_module._flush_caches in thread_targets
 
 
 def test_dense_spreadsheet_triggers_chunking_before_row_threshold():

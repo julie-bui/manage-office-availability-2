@@ -42,6 +42,10 @@ MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
 _ENRICHMENT_FETCH_WORKERS = 3
+# Soft cap on embedded property photos retained per brochure PDF. Floor plans
+# stay uncapped (usually 1–2). Matches app.MAX_HIGH_RES_IMAGES so free-tier
+# RSS does not hold uncapped MetSpace Drive embeds until materialise.
+_SOFT_MAX_EMBEDDED_PHOTOS = 5
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -338,6 +342,26 @@ def _is_box_host(host: str) -> bool:
     return host == "box.com" or host.endswith(".box.com")
 
 
+def _is_viewer_floorplan_url(url: str) -> bool:
+    """True when Floor Plan still points at a JS viewer rather than a bitmap."""
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if _is_box_host(host) and "/shared/static/" not in path:
+        return True
+    if host in {"drive.google.com", "docs.google.com"}:
+        return True
+    if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
+        return True
+    return False
+
+
 def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
     """Resolve public document-viewer pages to their downloadable document.
 
@@ -407,20 +431,14 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
         return []
     extracted = []
     counts = Counter()
-    # Large landlord brochures (UNION Box ~22MB) can carry dozens of pages;
-    # keep the first stretch that usually holds the property photos and stop
-    # once we already have enough High Res candidates for the gallery target.
-    max_pages = 6 if len(payload) > 5 * 1024 * 1024 else len(document)
+    seen_digests = set()
+    photo_kept = 0
+    # Scan every page so floor plans later in UNION/Workplace Plus brochures
+    # are not skipped after early photo pages. Exact content hashes prevent
+    # the same bitmap being kept twice; blank/near-solid slides are dropped.
+    # Soft-cap property-photo bitmaps (still scan for later floor plans).
     try:
         for page_number, page in enumerate(document):
-            if page_number >= max_pages:
-                break
-            property_photos_so_far = sum(
-                1 for candidate in extracted
-                if candidate.classification in {AssetType.PROPERTY_IMAGE, AssetType.UNKNOWN}
-            )
-            if property_photos_so_far >= 5:
-                break
             for image in page.get_images(full=True):
                 try:
                     base = document.extract_image(image[0])
@@ -429,6 +447,9 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         continue
                     digest = hashlib.sha256(content).hexdigest()
                     counts[digest] += 1
+                    if digest in seen_digests:
+                        continue
+                    seen_digests.add(digest)
                     with Image.open(BytesIO(content)) as bitmap:
                         width, height = bitmap.size
                     page_text = pages_text[page_number] if page_number < len(pages_text) else ""
@@ -440,8 +461,13 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         classification = AssetType.FLOORPLAN
                     elif width < 300 or height < 200 or is_blank_or_empty_image(content):
                         classification = AssetType.DECORATIVE
+                        # Drop bytes immediately — merge never hosts decorative.
+                        content = None
                     else:
+                        if photo_kept >= _SOFT_MAX_EMBEDDED_PHOTOS:
+                            continue
                         classification = AssetType.UNKNOWN
+                        photo_kept += 1
                     extracted.append(
                         AssetCandidate(
                             "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
@@ -581,8 +607,13 @@ def enrich_properties(
     # PDF when possible — three parallel 22MB Box downloads still spike
     # past the free tier's ~512MB even after per-file finishing.
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
+    # Large Box/Drive PDFs in parallel spike past ~512MB on free tier
+    # (MetSpace: 14 unique Drive packs; UNION: multi-MB Box statics).
     if any(
-        "/shared/static/" in (urlparse(url).path or "") or _box_shared_name(url)
+        "/shared/static/" in (urlparse(url).path or "")
+        or _box_shared_name(url)
+        or (urlparse(url).hostname or "").endswith("google.com")
+        or (urlparse(url).hostname or "").endswith("googleusercontent.com")
         for url in pending
     ):
         workers = 1
@@ -659,6 +690,14 @@ def enrich_properties(
                         "brochure_enrichment",
                     )
                 )
+        # Release extraction-owned bitmaps that were not retained on
+        # shared_embeds (decorative / capped photos / unused assets).
+        if not isinstance(extraction, Exception):
+            kept = set(id(a) for a in (shared_embeds or []))
+            for asset in extraction.assets:
+                if id(asset) not in kept:
+                    asset.content = None
+            extraction.identity_text = ""
 
     for wave_start in range(0, len(pending), wave_size):
         # Stop before starting a wave that cannot finish inside this file's
@@ -797,11 +836,17 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         _add_asset(prop, candidate)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
-        # Cap how many embedded bitmaps we carry into materialisation — a
-        # single UNION Box brochure can easily embed dozens of page images.
-        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:5]
-        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN][:1]
+        # Soft-cap photos (floor plans uncapped). Exact content-hash dedupe
+        # already happened in classify_candidates / _extract_pdf_visuals;
+        # materialise writes bytes to disk then clears content.
+        photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:_SOFT_MAX_EMBEDDED_PHOTOS]
+        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN]
         prop.values["_brochure_embedded_assets"] = photos + plans
+        # Drop bytes from assets not kept for materialise.
+        kept = set(id(a) for a in photos + plans)
+        for asset in prop.assets:
+            if asset.content and id(asset) not in kept:
+                asset.content = None
     # Keep at most five property photos per listing so brochure dumps cannot
     # flood High Res; the web layer targets 2-5 when photos exist.
     _MAX_PROPERTY_IMAGES = 5
@@ -829,8 +874,15 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         prop.values["_high_res_candidates"] = list(
             dict.fromkeys(existing_candidates + property_images)
         )[:_MAX_PROPERTY_IMAGES]
-    if not prop.values.get("Floor Plan") and floorplans:
-        _apply(prop, "Floor Plan", _evidence(floorplans[0], extraction.source_document, 0.9))
+    existing_plan = str(prop.values.get("Floor Plan") or "")
+    if floorplans:
+        plan_evidence = _evidence(floorplans[0], extraction.source_document, 0.9)
+        if not existing_plan:
+            _apply(prop, "Floor Plan", plan_evidence)
+        elif _is_viewer_floorplan_url(existing_plan):
+            # Primary xlsx_links often pre-fills Box/Drive viewer URLs at
+            # confidence 1.0 — still replace them with a real plan asset URL.
+            _set_value(prop, "Floor Plan", plan_evidence)
     for field, evidence in extraction.fields.items():
         _apply(prop, field, evidence)
 

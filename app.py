@@ -291,7 +291,12 @@ def process():
         threading.Thread(target=_flush_caches, daemon=True).start()
 
         if upload_jobs:
-            threading.Thread(target=_upload_all, args=(upload_jobs,), daemon=True).start()
+            # Hosted High Res galleries (and sibling brochure images) must
+            # be durable before the client can click a cell — async upload left
+            # MetSpace Drive embeds returning {"error":"File not found"} when
+            # the worker's local disk was already gone (max-requests recycle).
+            # Sync here; cache flush stays backgrounded above.
+            _upload_all(upload_jobs)
 
         response_files = [
             {
@@ -731,6 +736,33 @@ def _local_download_path(url, batch_dir, batch_id):
     return path if path.is_file() else None
 
 
+def _is_replaceable_viewer_url(url):
+    """True for JS/document viewers that should yield to a hosted floor-plan image.
+
+    UNION pre-fills Floor Plan with app.box.com/s/… and Workplace Plus /
+    MetSpace use Drive viewers — those block materialising a real plan
+    bitmap unless overwritten here.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return True
+    if "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "box.com" in host and "/shared/static/" not in path:
+        return True
+    if host in {"drive.google.com", "docs.google.com"}:
+        return True
+    if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
+        return True
+    return False
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -738,8 +770,10 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     inaccessible, blank/near-solid, decorative, and non-image resources can
     never produce a successful gallery. Distinct CDN URLs that resolve to the
     exact same image bytes (confirmed real: Knotel Directus asset IDs) count
-    once. Local batch assets are checked on disk — never via loopback HTTP —
-    so blank placeholder slides cannot enter the gallery either.
+    once. Unhashed soft-accepts never join a gallery that already has photos,
+    so deadline pressure cannot reintroduce those duplicates. Local batch
+    assets are validated from disk; gallery HTML uses absolute download URLs
+    (not base64 data URIs) so free-tier RSS stays bounded.
     """
     jobs = []
     gallery_url_by_candidates = {}
@@ -844,11 +878,22 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if result.get("ok"):
                 resolved = result.get("url") or candidate
                 content_hash = result.get("content_hash") or ""
+                soft_unhashed = (not content_hash) and result.get("status") in {
+                    "VALID_SOURCE_IMAGE",
+                    "VALID_IMAGE_ACCEPTED_UNDER_DEADLINE",
+                }
                 if content_hash and content_hash in seen_hashes:
                     rejected.append((candidate, "IMAGE_DUPLICATE_CONTENT"))
                     continue
                 if resolved in valid:
                     rejected.append((candidate, "IMAGE_DUPLICATE_URL"))
+                    continue
+                # Soft-accepts without a content hash after we already have
+                # photos are the Knotel/GPE duplicate path under deadline
+                # pressure — skip them. Real VALID_IMAGE results may omit a
+                # hash in tests and still join the gallery by URL identity.
+                if soft_unhashed and valid:
+                    rejected.append((candidate, "IMAGE_UNHASHED_SKIPPED"))
                     continue
                 if content_hash:
                     seen_hashes.add(content_hash)
@@ -860,6 +905,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 "IMAGE_DUPLICATE_CONTENT": "Exact duplicate of an already-selected photo; kept only one copy.",
                 "IMAGE_DUPLICATE_URL": "Duplicate URL after normalisation; kept only one copy.",
                 "IMAGE_BLANK_OR_EMPTY": "Near-solid/blank placeholder excluded from High Res Images.",
+                "IMAGE_UNHASHED_SKIPPED": "Skipped unhashed soft-accept after distinct photos already selected (prevents CDN duplicate galleries).",
             }.get(status, "Candidate was excluded from High Res Images.")
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
         if not valid:
@@ -883,6 +929,10 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 gallery_filename = f"{name}_photos{gallery_count}.html"
                 gallery_path = batch_dir / gallery_filename
                 try:
+                    # Absolute /api/download URLs (token included) — not base64
+                    # data URIs. Inlining every MetSpace/UNION embed ballooned
+                    # gallery HTML and kept a second copy of each JPEG in RSS
+                    # on the free tier; sync upload makes these durable.
                     gallery_html = pdf_images.build_gallery_html(record.get("Building") or name, valid)
                     gallery_path.write_text(gallery_html, encoding="utf-8")
                     if gallery_path.exists() and gallery_path.stat().st_size and gallery_html.count("<img") >= len(valid):
@@ -985,6 +1035,7 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         seen_photo_hashes = set()
         for candidate in ordered:
             if not candidate.content or candidate.classification not in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}:
+                candidate.content = None
                 continue
             digest = candidate.content_hash or image_content_hash(candidate.content)
             # Floor-plan diagrams are naturally near-white — never apply the
@@ -998,11 +1049,13 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_TOO_SMALL", detail="Embedded brochure photo excluded before gallery materialisation.")
                     )
+                    candidate.content = None
                     continue
                 if is_blank_or_empty_image(candidate.content):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_BLANK_OR_EMPTY", detail="Near-solid/blank placeholder excluded from High Res Images.")
                     )
+                    candidate.content = None
                     continue
             if digest not in saved:
                 extension = (candidate.extension or "png").lower().lstrip(".")
@@ -1011,9 +1064,12 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 path.write_bytes(candidate.content)
                 jobs.append((f"{batch_id}/{filename}", path))
                 saved[digest] = _download_url(batch_id, filename)
+            # Bytes are on disk now — free RSS before the next listing.
+            candidate.content = None
             url = saved[digest]
             if candidate.classification == AssetType.FLOORPLAN:
-                if not record.get("Floor Plan"):
+                existing_plan = str(record.get("Floor Plan") or "")
+                if _is_replaceable_viewer_url(existing_plan):
                     record["Floor Plan"] = url
                 continue
             if digest in seen_photo_hashes:
@@ -1046,11 +1102,13 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
 
 
 def _upload_all(jobs):
-    """Runs in a background thread (see process() above) so /api/process
-    can return as soon as local disk is ready, without waiting on however
-    many real network round-trips a batch's storage.upload calls add up
-    to. Best-effort per job — one failing upload (logged inside
-    storage.upload itself) doesn't stop the rest."""
+    """Mirror batch files to durable object storage.
+
+    Called synchronously before /api/process returns so High Res gallery
+    links do not 404 when ephemeral local disk is gone. Best-effort per
+    job — one failing upload (logged inside storage.upload) doesn't stop
+    the rest.
+    """
     for key, path in jobs:
         storage.upload(key, path)
 
