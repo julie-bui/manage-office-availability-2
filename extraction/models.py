@@ -57,15 +57,8 @@ class BrochureExtraction:
     diagnostics: List["LinkDiagnostic"] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(frozen=True)
 class BrochureResource:
-    """Mutable so callers can drop `payload` immediately after extract.
-
-    Freezing this used to pin multi-MB Drive/Box PDF bytes until the
-    whole BrochureResource fell out of scope, which stacked with
-    extracted embeds on Render's free-tier RSS ceiling.
-    """
-
     payload: bytes
     content_type: str
     final_url: str
@@ -128,10 +121,6 @@ class AssetCandidate:
     content: Optional[bytes] = None
     content_hash: Optional[str] = None
     extension: Optional[str] = None
-    # When set, image bytes were spilled to disk during enrichment so RSS
-    # does not hold every brochure's embeds until materialise. Materialise
-    # reads this path then clears it.
-    local_path: Optional[str] = None
 
 
 @dataclass

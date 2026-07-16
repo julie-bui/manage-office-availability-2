@@ -165,14 +165,7 @@ def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
 
 
 def classify_candidates(candidates: Iterable[AssetCandidate]) -> List[AssetCandidate]:
-    classified = [classify_candidate(item) for item in deduplicate_candidates(candidates)]
-    # Decorative / logo / map / unknown leftovers must not keep bitmap bytes
-    # through brochure merge — only property photos and floor plans are hosted.
-    keep = {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}
-    for item in classified:
-        if item.content is not None and item.classification not in keep:
-            item.content = None
-    return classified
+    return [classify_candidate(item) for item in deduplicate_candidates(candidates)]
 
 
 def candidates_from_html_items(items: Sequence[tuple], source: str) -> List[AssetCandidate]:
@@ -205,55 +198,6 @@ def merge_candidate_urls(*groups: Iterable[str]) -> List[str]:
 def image_content_hash(payload: bytes) -> str:
     """Exact content identity for gallery dedupe across distinct CDN/asset URLs."""
     return hashlib.sha256(payload or b"").hexdigest()
-
-
-# Longest edge for brochure embeds kept in RSS / written to disk. MetSpace
-# Drive packs ship 4000×2250 pages; holding 14 unique brochures × soft-capped
-# photos at full res blows past Render free-tier ~512MB even after soft caps.
-# Free-tier callers pass 1200; materialise default stays 1600 for non-free.
-MAX_EMBED_EDGE_PX = 1600
-
-
-def downscale_image_bytes(payload: bytes, max_edge: int = MAX_EMBED_EDGE_PX, extension: str = "jpg"):
-    """Return (bytes, width, height), shrinking when either edge exceeds max_edge.
-
-    No-op for already-small images or undecodable payloads (returns the
-    original bytes with best-effort dimensions). Used when materialising
-    brochure embeds so free-tier RSS/disk stay bounded.
-    """
-    if not payload or max_edge <= 0:
-        return payload, 0, 0
-    try:
-        from PIL import Image
-
-        with Image.open(BytesIO(payload)) as image:
-            image.load()
-            width, height = image.size
-            longest = max(width, height)
-            if longest <= max_edge:
-                return payload, width, height
-            scale = max_edge / float(longest)
-            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
-            resized = image.convert("RGB") if image.mode not in {"RGB", "L"} else image
-            resized = resized.resize(new_size, resample)
-            buffer = BytesIO()
-            ext = (extension or "jpg").lower().lstrip(".")
-            # Slightly lower JPEG quality below 1400px edge — free-tier spill
-            # path uses 1200 and needs smaller on-disk/RSS footprints.
-            jpeg_quality = 75 if max_edge <= 1200 else 85
-            if ext in {"jpg", "jpeg"}:
-                resized.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
-            elif ext == "png":
-                resized.save(buffer, format="PNG", optimize=True)
-            elif ext == "webp":
-                resized.save(buffer, format="WEBP", quality=jpeg_quality)
-            else:
-                resized.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
-                ext = "jpg"
-            return buffer.getvalue(), new_size[0], new_size[1]
-    except Exception:
-        return payload, 0, 0
 
 
 def is_blank_or_empty_image(payload: bytes) -> bool:

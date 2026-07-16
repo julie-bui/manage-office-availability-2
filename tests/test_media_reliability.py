@@ -647,8 +647,7 @@ def test_image_coverage_warns_when_non_exempt_file_has_no_photos():
 
 
 def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
-    """Source photo survives a late deadline; unhashed CDN extras are skipped
-    so Knotel same-bytes/different-UUID duplicates cannot fill the gallery."""
+    """Knotel Directus candidates must survive finalize after a late Union wave."""
     urls = [
         "https://knotel.directus.app/assets/aaa11111-bbbb-cccc-dddd-eeeeeeeeeeee",
         "https://knotel.directus.app/assets/fff22222-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -667,18 +666,13 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
             deadline=past,
         )
-    assert record["_high_res_image_count"] == 1
-    assert record.get("High Res Images") == urls[0]
-    assert jobs == []
-    assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
+    assert record["_high_res_image_count"] == 3
+    assert "photos" in (record.get("High Res Images") or "")
+    assert jobs
 
 
-def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
-    """Soft cap (default 8) keeps at most N distinct photos; MIN stays 5."""
-    cap = app_module.SOFT_MAX_HIGH_RES_IMAGES
-    assert app_module.MIN_HIGH_RES_IMAGES == 5
-    assert cap == 8
-    urls = [f"https://img.test/{i}.jpg" for i in range(cap + 3)]
+def test_finalize_caps_high_res_gallery_at_five(tmp_path):
+    urls = [f"https://img.test/{i}.jpg" for i in range(8)]
     record = {
         "Building": "Many Photo House",
         "_source_high_res_candidates": urls,
@@ -691,24 +685,9 @@ def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img") == cap
-    assert record["_high_res_image_count"] == cap
-    assert any(item.status == "IMAGE_SOFT_CAP_REACHED" for item in record["_link_diagnostics"])
-    assert "data:image/" not in gallery
-
-
-def test_downscale_shrinks_large_property_photo_bytes():
-    from extraction.assets import MAX_EMBED_EDGE_PX, downscale_image_bytes
-
-    buffer = BytesIO()
-    Image.new("RGB", (3200, 1800), (40, 80, 120)).save(buffer, format="JPEG")
-    original = buffer.getvalue()
-    shrunk, width, height = downscale_image_bytes(original, extension="jpg")
-    assert max(width, height) == MAX_EMBED_EDGE_PX
-    assert len(shrunk) < len(original)
-    same, w2, h2 = downscale_image_bytes(shrunk, extension="jpg")
-    assert same == shrunk
-    assert (w2, h2) == (width, height)
+    assert gallery.count("<img") == 5
+    assert record["_high_res_image_count"] == 5
+    assert any(item.status == "IMAGE_CANDIDATES_CAPPED" for item in record["_link_diagnostics"])
 
 
 def _solid_jpeg(color):
@@ -787,7 +766,7 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
     )
     record = {
         "Building": "First Cell House",
-        "Floor Plan": "https://app.box.com/s/vieweronlyshare",
+        "Floor Plan": "",
         "High Res Images": "",
         "_brochure_embedded_assets": [blank, photo, floorplan],
     }
@@ -799,42 +778,9 @@ def test_materialize_skips_blank_photos_keeps_floorplan_first(tmp_path):
         )
     assert record.get("Floor Plan")
     assert "plan" in record["Floor Plan"]
-    assert "box.com" not in record["Floor Plan"]
     assert record.get("_high_res_image_count") == 1
     assert any(item.status == "IMAGE_BLANK_OR_EMPTY" for item in record["_link_diagnostics"])
     assert len(jobs) == 2  # photo + floorplan only
-
-
-def test_gallery_uses_absolute_download_urls_not_data_uris(tmp_path):
-    """Galleries link to /api/download siblings; sync upload keeps them durable
-    without base64-inlining every JPEG into HTML (Render free-tier OOM)."""
-    photo_a = _photo_jpeg(1)
-    photo_b = _photo_jpeg(2)
-    path_a = tmp_path / "Example_brochure_r1_aaaa.jpg"
-    path_b = tmp_path / "Example_brochure_r1_bbbb.jpg"
-    path_a.write_bytes(photo_a)
-    path_b.write_bytes(photo_b)
-    url_a = "https://service.test/api/download/batch/Example_brochure_r1_aaaa.jpg"
-    url_b = "https://service.test/api/download/batch/Example_brochure_r1_bbbb.jpg"
-    record = {
-        "Building": "Market Place",
-        "_source_high_res_candidates": [url_a, url_b],
-        "_high_res_candidates": [url_a, url_b],
-    }
-    with app_module.app.test_request_context("/process", base_url="https://service.test"):
-        jobs = app_module._finalize_high_res_images(
-            [record], tmp_path, "batch", "Example",
-            image_validator=lambda url, cache=None: {
-                "ok": True, "url": url, "status": "VALID_IMAGE",
-                "content_hash": image_content_hash(photo_a if "aaaa" in url else photo_b),
-            },
-        )
-    assert len(jobs) == 1
-    gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("data:image/") == 0
-    assert gallery.count("<img") == 2
-    assert "api/download/batch/Example_brochure_r1_aaaa.jpg" in gallery
-    assert "api/download/batch/Example_brochure_r1_bbbb.jpg" in gallery
 
 
 def test_dense_spreadsheet_triggers_chunking_before_row_threshold():
@@ -878,188 +824,3 @@ def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
     assert app_module._accept_image_url_under_deadline(
         "https://anything.example/assets/opaque-id"
     )
-
-
-def test_free_tier_memory_mode_defaults_off(monkeypatch):
-    monkeypatch.delenv("FREE_TIER_MEMORY_MODE", raising=False)
-    assert brochure_module.free_tier_memory_mode() is False
-    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
-    assert brochure_module.free_tier_memory_mode() is True
-
-
-def test_enrichment_extracts_pdf_embeds_even_with_source_photos(monkeypatch, tmp_path):
-    """Brochure bitmaps still extract when listings already have source photos.
-
-    FREE_TIER_MEMORY_MODE must not skip PDF embeds or brochure fetch — that
-    nuclear path left Workplace Plus / MetSpace at 0–1 images per cell.
-    """
-    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
-    extract_calls = []
-
-    def fetch(url, deadline=None):
-        return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
-
-    def extract(payload, content_type, source, extract_embedded_images=True):
-        extract_calls.append(extract_embedded_images)
-        assets = []
-        if extract_embedded_images:
-            assets.append(
-                AssetCandidate(
-                    "", source, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
-                    content=_photo_jpeg(1), content_hash="emb1", extension="jpg",
-                    width=640, height=400, association_confidence=0.9,
-                )
-            )
-        return BrochureExtraction(
-            source,
-            identity_text="Example House, 1 Example Street, EC1A 1AA",
-            assets=assets,
-        )
-
-    prop = Property.from_record(
-        normalize_record({
-            "Building": "Example House, 1 Example Street",
-            "Property Postcode": "EC1A 1AA",
-            "High Res Images": "https://source.test/a.jpg",
-            "_source_high_res_candidates": [
-                "https://source.test/a.jpg",
-                "https://source.test/b.jpg",
-                "https://source.test/c.jpg",
-                "https://source.test/d.jpg",
-                "https://source.test/e.jpg",
-            ],
-            "Brochure PDF": "https://drive.test/file.pdf",
-        }),
-        "metspace.eml", "MetSpace", "rule:MetSpace",
-    )
-    enrich_properties([prop], fetcher=fetch, extractor=extract, spill_dir=tmp_path)
-    assert extract_calls == [True]
-    embeds = prop.values.get("_brochure_embedded_assets") or []
-    assert embeds
-    assert embeds[0].content is None
-    assert embeds[0].local_path and Path(embeds[0].local_path).exists()
-
-
-def test_enrichment_spills_embeds_for_blank_listings(tmp_path):
-    extract_flags = []
-
-    def fetch(url, deadline=None):
-        return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
-
-    def extract(payload, content_type, source, extract_embedded_images=True):
-        extract_flags.append(extract_embedded_images)
-        photo = AssetCandidate(
-            "", source, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
-            content=_photo_jpeg(3), content_hash="needphoto", extension="jpg",
-            width=640, height=400, association_confidence=0.9,
-        )
-        return BrochureExtraction(
-            source,
-            identity_text="Example House, 1 Example Street, EC1A 1AA",
-            assets=[photo] if extract_embedded_images else [],
-        )
-
-    blank = Property.from_record(
-        normalize_record({
-            "Building": "Example House, 1 Example Street",
-            "Property Postcode": "EC1A 1AA",
-            "Brochure PDF": "https://drive.test/needs-photos.pdf",
-        }),
-        "metspace.eml", "MetSpace", "rule:MetSpace",
-    )
-    enrich_properties([blank], fetcher=fetch, extractor=extract, spill_dir=tmp_path)
-    assert extract_flags == [True]
-    embeds = blank.values.get("_brochure_embedded_assets") or []
-    assert embeds
-    assert embeds[0].content is None
-    assert embeds[0].local_path and Path(embeds[0].local_path).exists()
-
-
-def test_nested_pdf_followed_when_page_has_one_photo():
-    """One HTML photo must not block nested brochure PDF (MetSpace Drive)."""
-    fetched = []
-
-    def fetch(url, deadline=None):
-        fetched.append(url)
-        if url.endswith(".pdf"):
-            return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
-        return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
-
-    def extract(payload, content_type, final_url, extract_embedded_images=True):
-        if final_url.endswith(".pdf"):
-            photo = AssetCandidate(
-                "", final_url, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
-                content=_photo_jpeg(5), content_hash="nestedphoto", extension="jpg",
-                width=640, height=400, association_confidence=0.9,
-            )
-            return BrochureExtraction(
-                final_url,
-                identity_text="Example House, 1 Example Street, EC1A 1AA",
-                assets=[photo] if extract_embedded_images else [],
-            )
-        return BrochureExtraction(
-            final_url,
-            assets=[
-                classify_candidate(AssetCandidate(f"{final_url}/only.jpg", final_url, alt_text="Office")),
-                classify_candidate(AssetCandidate(f"{final_url}/brochure.pdf", final_url, anchor_text="Download brochure")),
-            ],
-            identity_text="Example House, 1 Example Street, EC1A 1AA",
-        )
-
-    prop = Property.from_record(
-        normalize_record({
-            "Building": "Example House, 1 Example Street",
-            "Property Postcode": "EC1A 1AA",
-            "Brochure PDF": "https://property.test/listing-one-photo",
-        }),
-        "metspace.eml", "MetSpace", "rule:MetSpace",
-    )
-    enrich_properties([prop], fetcher=fetch, extractor=extract)
-    assert "https://property.test/listing-one-photo/brochure.pdf" in fetched
-    embeds = prop.values.get("_brochure_embedded_assets") or []
-    assert embeds
-
-
-def test_materialize_reads_spilled_local_path(tmp_path):
-    spill = tmp_path / "spill"
-    spill.mkdir()
-    photo_bytes = _photo_jpeg(4)
-    spilled = spill / "spilled.jpg"
-    spilled.write_bytes(photo_bytes)
-    photo = AssetCandidate(
-        "", "brochure.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
-        content=None, content_hash="spilledhash", extension="jpg",
-        width=640, height=400, local_path=str(spilled),
-    )
-    record = {"Building": "Spill House", "High Res Images": "", "_brochure_embedded_assets": [photo]}
-    with app_module.app.test_request_context("/process", base_url="https://service.test"):
-        jobs = app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
-    assert jobs
-    assert record.get("_high_res_candidates")
-    assert photo.content is None
-    assert photo.local_path is None
-
-
-def test_memlog_tracks_peak(monkeypatch):
-    from extraction import memlog
-
-    class Info:
-        def __init__(self, rss):
-            self.rss = rss
-
-    class FakeProc:
-        def __init__(self):
-            self._rss = 100 * 1024 * 1024
-
-        def memory_info(self):
-            return Info(self._rss)
-
-    proc = FakeProc()
-    memlog.reset_peak()
-    monkeypatch.setattr(memlog, "_process", proc)
-    monkeypatch.setattr(memlog, "_peak_rss_mb", 0.0)
-    proc._rss = 200 * 1024 * 1024
-    memlog.log("mid")
-    proc._rss = 150 * 1024 * 1024
-    memlog.log("later")
-    assert memlog.peak_mb() == pytest.approx(200.0, abs=0.1)
