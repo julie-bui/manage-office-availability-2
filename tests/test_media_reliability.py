@@ -674,9 +674,10 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
 
 
 def test_finalize_keeps_distinct_hashed_photos_up_to_soft_cap(tmp_path):
-    """Soft cap (== MIN on free tier) keeps at most N distinct photos."""
+    """Soft cap (default 8) keeps at most N distinct photos; MIN stays 5."""
     cap = app_module.SOFT_MAX_HIGH_RES_IMAGES
-    assert cap == app_module.MIN_HIGH_RES_IMAGES == 5
+    assert app_module.MIN_HIGH_RES_IMAGES == 5
+    assert cap == 8
     urls = [f"https://img.test/{i}.jpg" for i in range(cap + 3)]
     record = {
         "Building": "Many Photo House",
@@ -879,8 +880,19 @@ def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
     )
 
 
-def test_free_tier_skips_pdf_embeds_when_listing_already_has_photos(monkeypatch):
-    """Nuclear mode: keep Brochure PDF link, do not extract bitmaps if photos exist."""
+def test_free_tier_memory_mode_defaults_off(monkeypatch):
+    monkeypatch.delenv("FREE_TIER_MEMORY_MODE", raising=False)
+    assert brochure_module.free_tier_memory_mode() is False
+    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+    assert brochure_module.free_tier_memory_mode() is True
+
+
+def test_enrichment_extracts_pdf_embeds_even_with_source_photos(monkeypatch, tmp_path):
+    """Brochure bitmaps still extract when listings already have source photos.
+
+    FREE_TIER_MEMORY_MODE must not skip PDF embeds or brochure fetch — that
+    nuclear path left Workplace Plus / MetSpace at 0–1 images per cell.
+    """
     monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
     extract_calls = []
 
@@ -898,7 +910,11 @@ def test_free_tier_skips_pdf_embeds_when_listing_already_has_photos(monkeypatch)
                     width=640, height=400, association_confidence=0.9,
                 )
             )
-        return BrochureExtraction(source, identity_text="Example House, EC1A 1AA", assets=assets)
+        return BrochureExtraction(
+            source,
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+            assets=assets,
+        )
 
     prop = Property.from_record(
         normalize_record({
@@ -916,14 +932,15 @@ def test_free_tier_skips_pdf_embeds_when_listing_already_has_photos(monkeypatch)
         }),
         "metspace.eml", "MetSpace", "rule:MetSpace",
     )
-    enrich_properties([prop], fetcher=fetch, extractor=extract)
-    # Already at soft-cap (5) → brochure fetch skipped entirely.
-    assert extract_calls == []
-    assert not (prop.values.get("_brochure_embedded_assets") or [])
+    enrich_properties([prop], fetcher=fetch, extractor=extract, spill_dir=tmp_path)
+    assert extract_calls == [True]
+    embeds = prop.values.get("_brochure_embedded_assets") or []
+    assert embeds
+    assert embeds[0].content is None
+    assert embeds[0].local_path and Path(embeds[0].local_path).exists()
 
 
-def test_free_tier_extracts_embeds_only_when_zero_source_photos(monkeypatch, tmp_path):
-    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+def test_enrichment_spills_embeds_for_blank_listings(tmp_path):
     extract_flags = []
 
     def fetch(url, deadline=None):
@@ -954,21 +971,32 @@ def test_free_tier_extracts_embeds_only_when_zero_source_photos(monkeypatch, tmp
     assert extract_flags == [True]
     embeds = blank.values.get("_brochure_embedded_assets") or []
     assert embeds
-    # Spill cleared bytes immediately; materialise reads local_path.
     assert embeds[0].content is None
     assert embeds[0].local_path and Path(embeds[0].local_path).exists()
 
 
-def test_free_tier_skips_nested_pdf_when_page_has_one_photo(monkeypatch):
-    monkeypatch.setenv("FREE_TIER_MEMORY_MODE", "1")
+def test_nested_pdf_followed_when_page_has_one_photo():
+    """One HTML photo must not block nested brochure PDF (MetSpace Drive)."""
     fetched = []
 
     def fetch(url, deadline=None):
         fetched.append(url)
-        assert "brochure.pdf" not in url
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-fake", "application/pdf", url, url)
         return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
 
-    def extract(payload, content_type, final_url):
+    def extract(payload, content_type, final_url, extract_embedded_images=True):
+        if final_url.endswith(".pdf"):
+            photo = AssetCandidate(
+                "", final_url, classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                content=_photo_jpeg(5), content_hash="nestedphoto", extension="jpg",
+                width=640, height=400, association_confidence=0.9,
+            )
+            return BrochureExtraction(
+                final_url,
+                identity_text="Example House, 1 Example Street, EC1A 1AA",
+                assets=[photo] if extract_embedded_images else [],
+            )
         return BrochureExtraction(
             final_url,
             assets=[
@@ -984,10 +1012,12 @@ def test_free_tier_skips_nested_pdf_when_page_has_one_photo(monkeypatch):
             "Property Postcode": "EC1A 1AA",
             "Brochure PDF": "https://property.test/listing-one-photo",
         }),
-        "knotel.eml", "Knotel", "rule:Knotel",
+        "metspace.eml", "MetSpace", "rule:MetSpace",
     )
     enrich_properties([prop], fetcher=fetch, extractor=extract)
-    assert fetched == ["https://property.test/listing-one-photo"]
+    assert "https://property.test/listing-one-photo/brochure.pdf" in fetched
+    embeds = prop.values.get("_brochure_embedded_assets") or []
+    assert embeds
 
 
 def test_materialize_reads_spilled_local_path(tmp_path):

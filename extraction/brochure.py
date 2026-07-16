@@ -47,32 +47,31 @@ from .models import (
 # as ~22MB PDFs via app.box.com/shared/static/{id}.pdf — the previous
 # hard cap skipped those downloads and left High Res blank despite a
 # real public PDF existing behind the "CLICK HERE" cell.
-# Free-tier mode keeps the same ceiling (UNION ~22MB) but skips bitmap
-# extraction unless a listing has zero photos — see free_tier_memory_mode().
 MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
-# Always serial on free tier: even two mid-size Drive/Box PDFs in flight
-# (plus their embeds) spike past ~512MB. Parallelism is not worth the RSS.
+# Always serial: even two mid-size Drive/Box PDFs in flight (plus their
+# embeds) spike past ~512MB. Parallelism is not worth the RSS.
 _ENRICHMENT_FETCH_WORKERS = 1
 # Soft cap on embedded property photos retained per brochure PDF. Floor plans
-# stay uncapped (usually 1–2). Matches app.SOFT_MAX_HIGH_RES_IMAGES (default 5
-# = MIN target) so free-tier RSS does not hold 14× large MetSpace Drive embeds
-# until materialise.
-_SOFT_MAX_EMBEDDED_PHOTOS = max(1, int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", "5")))
+# stay uncapped (usually 1–2). Matches app.SOFT_MAX_HIGH_RES_IMAGES (default 8).
+_SOFT_MAX_EMBEDDED_PHOTOS = max(1, int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", "8")))
 
 
 def free_tier_memory_mode() -> bool:
-    """Aggressive RSS caps for ~512MB hosts (Render free tier).
+    """Optional tighter downscale for ~512MB hosts.
 
-    Default ON. Set FREE_TIER_MEMORY_MODE=0 on a larger instance to restore
-    full brochure PDF image extraction for every listing.
+    Default OFF — brochure PDF photo/floorplan extraction must run for
+    MetSpace Drive, Workplace Plus, and UNION. Nuclear skips (skip fetch /
+    skip PDF bitmaps) were reverted after they collapsed gallery quality.
+    Set FREE_TIER_MEMORY_MODE=1 only for a tighter 1200px embed edge; spill,
+    serial fetch, and soft-cap remain always on.
     """
     raw = os.environ.get("FREE_TIER_MEMORY_MODE")
     if raw is not None and str(raw).strip() != "":
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-    return True
+    return False
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -247,9 +246,10 @@ def extract_brochure(
 ) -> BrochureExtraction:
     """Best-effort extraction based on actual response content, not suffix.
 
-    extract_embedded_images: when False (free-tier nuclear mode for listings
-    that already have photos), keep text/fields/link annotations only —
-    skip PyMuPDF bitmap extraction that drove MetSpace 14×PDF RSS spikes.
+    extract_embedded_images: kept for call-site compatibility. Enrichment
+    always requests True so MetSpace/Workplace Plus/UNION galleries recover
+    embedded photos and floor plans. Callers that pass False get text/fields
+    only (tests / rare diagnostics).
     """
     resource_type = _resource_type(payload, content_type)
     if resource_type == "html":
@@ -519,14 +519,13 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                         photo_kept += 1
                     ext = base.get("ext", "png")
                     if content and classification in {AssetType.FLOORPLAN, AssetType.UNKNOWN}:
-                        # Shrink before enrichment holds embeds across listings.
-                        # Tighter edge on free tier — 14 MetSpace Drive packs
-                        # at 1600px still stacked past ~360MB before spill.
-                        max_edge = 1200 if free_tier_memory_mode() else None
-                        kwargs = {"extension": ext}
-                        if max_edge is not None:
-                            kwargs["max_edge"] = max_edge
-                        content, width, height = downscale_image_bytes(content, **kwargs)
+                        # Always downscale before spill/materialise. Optional
+                        # free-tier mode uses a tighter 1200px edge; default
+                        # is assets.MAX_EMBED_EDGE_PX (1600).
+                        max_edge = 1200 if free_tier_memory_mode() else 1600
+                        content, width, height = downscale_image_bytes(
+                            content, max_edge=max_edge, extension=ext,
+                        )
                         digest = hashlib.sha256(content).hexdigest()
                     occurrence_keys.append(original_digest)
                     extracted.append(
@@ -664,9 +663,10 @@ def enrich_properties(
     spill_dir: Optional[Path] = None,
 ) -> List[Property]:
     properties = list(properties)
-    free_tier = free_tier_memory_mode()
     own_spill = False
-    if spill_dir is None and free_tier:
+    # Always spill embeds to disk after each brochure URL so MetSpace's many
+    # Drive packs never coexist in RSS (not gated on free-tier mode).
+    if spill_dir is None:
         spill_dir = Path(tempfile.mkdtemp(prefix="brochure-spill-"))
         own_spill = True
     # Group by brochure URL first so each unique linked document is fetched
@@ -702,18 +702,6 @@ def enrich_properties(
                 _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
                 prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             continue
-        # Free tier: do not download a brochure PDF at all when every listing
-        # sharing it already meets the High Res soft cap from the source.
-        if free_tier and all(
-            _source_photo_count(prop) >= _SOFT_MAX_EMBEDDED_PHOTOS
-            for _, prop, _ in by_url[brochure_url]
-        ):
-            for _, prop, _ in by_url[brochure_url]:
-                _record_diagnostic(
-                    prop, "LINK_EMBEDS_SKIPPED_FREE_TIER", brochure_url,
-                    detail=f"Brochure fetch skipped; listing already has ≥{_SOFT_MAX_EMBEDDED_PHOTOS} source photos.",
-                )
-            continue
         pending.append(brochure_url)
 
     if not pending:
@@ -747,14 +735,6 @@ def enrich_properties(
         finally:
             for asset, content in stashed:
                 asset.content = content
-
-    def _needs_embedded_images(brochure_url: str) -> bool:
-        """Nuclear free-tier rule: only pull PDF bitmaps when a listing has
-        zero source photos. Otherwise keep Brochure PDF + Floor Plan links."""
-        members = by_url[brochure_url]
-        if not free_tier:
-            return True
-        return any(_source_photo_count(prop) == 0 for _, prop, _ in members)
 
     def _apply_result(brochure_url, extraction):
         shared_embeds = None
@@ -848,12 +828,13 @@ def enrich_properties(
         gc.collect()
 
     def _run_one(brochure_url):
-        extract_embeds = _needs_embedded_images(brochure_url)
-        bound = _bind_extractor(extractor, extract_embeds)
+        # Always extract PDF embeds — free-tier nuclear skip collapsed
+        # MetSpace/Workplace Plus galleries to 0–1 images per cell.
+        bound = _bind_extractor(extractor, True)
         try:
             return _retrieve(
                 brochure_url, fetcher, bound, deadline,
-                extract_embedded_images=extract_embeds,
+                extract_embedded_images=True,
             )
         except Exception as exc:
             return exc
@@ -929,26 +910,22 @@ def _retrieve(url, fetcher, extractor, deadline=None, extract_embedded_images: b
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
     # as a PDF link. Follow at most two unique document assets, once each —
-    # but skip nested PDFs when the page itself already supplies enough
-    # High Res candidates (Knotel property pages: ~13s for 16 galleries from
-    # HTML alone; following PDFs burned the multi-file enrichment window).
-    # Free tier: skip nested follow when the page already has ≥1 photo, and
-    # follow at most one nested PDF (MetSpace Drive viewer → usercontent).
+    # but skip nested PDFs when the page itself already supplies a gallery
+    # (≥2 photos). Knotel/GPE HTML enrichment must keep running; one
+    # thumbnail must not block MetSpace Drive viewer → usercontent PDF
+    # extract (that nuclear skip caused blank/duplicate High Res cells).
     page_photos = sum(
         1 for a in combined.assets
         if a.classification == AssetType.PROPERTY_IMAGE and (a.url or a.content or a.local_path)
     )
-    free_tier = free_tier_memory_mode()
-    skip_nested_at = 1 if free_tier else 2
-    max_nested = 1 if free_tier else 2
+    skip_nested_at = 2
+    max_nested = 2
     documents = []
     if page_photos < skip_nested_at:
         documents = [
             a.url for a in combined.assets
             if a.classification == AssetType.BROCHURE and a.url != resource.final_url
         ][:max_nested]
-    # When nuclear mode says "no embeds needed", still follow one nested PDF
-    # for Floor Plan / field links, but the bound extractor skips bitmaps.
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(
@@ -972,16 +949,6 @@ def _retrieve(url, fetcher, extractor, deadline=None, extract_embedded_images: b
             combined.assets.extend(nested_extraction.assets)
             combined.warnings.extend(nested_extraction.warnings)
             combined.diagnostics.extend(nested_extraction.diagnostics)
-            if not extract_embedded_images:
-                combined.diagnostics.append(
-                    LinkDiagnostic(
-                        "LINK_EMBEDS_SKIPPED_FREE_TIER",
-                        original_url=document_url,
-                        final_url=nested.final_url,
-                        resource_type=nested_type,
-                        detail="PDF embedded images skipped (listing already has source photos).",
-                    )
-                )
         except Exception as exc:
             combined.warnings.append(f"Linked brochure document could not be enriched: {exc}")
     combined.assets = classify_candidates(combined.assets)

@@ -22,7 +22,10 @@ services:
         sync: false
       - key: ACCESS_TOKEN
         sync: false
-      # Nuclear free-tier memory mode (default ON in code). Set to 0 only on
-      # a larger instance that can afford full brochure PDF image extraction.
+      # Optional tighter 1200px embed edge. Default OFF so MetSpace /
+      # Workplace Plus / UNION brochure PDF photos and floor plans extract.
+      # Leave at 0 unless peak RSS forces OOM after spill/serial/max-requests.
       - key: FREE_TIER_MEMORY_MODE
-        value: "1"
+        value: "0"
+      - key: SOFT_MAX_HIGH_RES_IMAGES
+        value: "8"

@@ -48,15 +48,13 @@ BATCH_MAX_AGE_SECONDS = 60 * 60  # clean up old batch output dirs after an hour
 PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
 # Target for High Res Images when the source/brochures actually contain
 # property photos. Warn when a non-exempt file finishes below MIN.
-# SOFT_MAX == MIN on Render free tier (~512MB): MetSpace alone can ship
-# 14 unique Drive brochures; holding uncapped embeds + inlined galleries
-# pushed RSS past 360MB and the next request started from that baseline
-# (SIGKILL). Distinct photos beyond the soft max are dropped earliest-first.
-# Override via SOFT_MAX_HIGH_RES_IMAGES env if a larger instance can afford more.
+# Soft max defaults to 8 (user-accepted gallery depth); MIN stays 5.
+# Spill + downscale + serial enrichment bound RSS — do not collapse soft
+# max to MIN. Override via SOFT_MAX_HIGH_RES_IMAGES if needed.
 MIN_HIGH_RES_IMAGES = 5
 SOFT_MAX_HIGH_RES_IMAGES = max(
     MIN_HIGH_RES_IMAGES,
-    int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", str(MIN_HIGH_RES_IMAGES))),
+    int(os.environ.get("SOFT_MAX_HIGH_RES_IMAGES", "8")),
 )
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
