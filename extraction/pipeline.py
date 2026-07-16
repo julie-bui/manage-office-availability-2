@@ -49,7 +49,9 @@ OPTIONAL_LOOKUP_START_SECONDS = 30
 # Must cover gallery HTML writes for every earlier file: Union Box waves
 # previously ran into (and past) batch_deadline and left Knotel finalize
 # with OPTIONAL_IMAGE_VALIDATION_SKIPPED for every Directus URL.
-ENRICHMENT_FINALIZE_RESERVE_SECONDS = 20
+# Galleries now use absolute download URLs (not inlined base64), so finalize
+# needs less reserve — free those seconds for Knotel/GPE under-target rows.
+ENRICHMENT_FINALIZE_RESERVE_SECONDS = 15
 # Confirmed real (2026-07 batch MetSpace+Knotel+WP+Union): enrichment used
 # ONE absolute deadline shared by every file. MetSpace (first) consumed the
 # budget fetching Drive brochure photos; Knotel (second) kept only its

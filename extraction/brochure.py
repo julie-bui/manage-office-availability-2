@@ -6,6 +6,7 @@ strong primary value is never silently replaced.
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+import gc
 import hashlib
 import ipaddress
 import json
@@ -41,11 +42,26 @@ MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
-_ENRICHMENT_FETCH_WORKERS = 3
-# Soft cap on embedded property photos retained per brochure PDF. Floor plans
-# stay uncapped (usually 1–2). Matches app.MAX_HIGH_RES_IMAGES so free-tier
-# RSS does not hold uncapped MetSpace Drive embeds until materialise.
-_SOFT_MAX_EMBEDDED_PHOTOS = 5
+# Serial fetches keep peak RSS predictable on 1GB hosts (UNION Box/Drive
+# PDFs in parallel were a confirmed SIGKILL / "Perhaps out of memory?" path).
+_ENRICHMENT_FETCH_WORKERS = 1
+# Soft caps on embedded bitmaps retained per brochure PDF. Matches
+# app.MAX_HIGH_RES_IMAGES so free-tier RSS does not hold uncapped MetSpace
+# Drive embeds until materialise. Floor plans capped separately (1–2 is
+# enough for the spreadsheet cell).
+_SOFT_MAX_EMBEDDED_PHOTOS = 8
+_SOFT_MAX_EMBEDDED_FLOORPLANS = 2
+_MIN_HIGH_RES_TARGET = 5
+# Skip nested PDF downloads once the HTML page already exposes a small
+# gallery. Threshold is below the High Res min (5) on purpose: Knotel
+# property pages often have 2–4 HTML photos that are enough to avoid a
+# slow PDF fetch, freeing budget for later under-filled floors.
+_NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 2
+# Leave headroom on 512MB–1GB hosts. UNION Box PDFs (~22MB) plus pdfplumber
+# + PyMuPDF decode spiked past the ceiling and SIGKILL'd the worker
+# (misreported as "Perhaps out of memory?"). Skip further fetches when RSS
+# is already this high so spreadsheet write can still finish.
+_RSS_ENRICHMENT_CEILING_MB = 420.0
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -433,10 +449,11 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     counts = Counter()
     seen_digests = set()
     photo_kept = 0
+    floorplan_kept = 0
     # Scan every page so floor plans later in UNION/Workplace Plus brochures
     # are not skipped after early photo pages. Exact content hashes prevent
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
-    # Soft-cap property-photo bitmaps (still scan for later floor plans).
+    # Soft-cap property-photo bitmaps and floor-plan bitmaps (RSS bound).
     try:
         for page_number, page in enumerate(document):
             for image in page.get_images(full=True):
@@ -458,7 +475,10 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     # PDFs) must never become PROPERTY_IMAGE later via
                     # classify_candidates' association_confidence path.
                     if is_floorplan:
+                        if floorplan_kept >= _SOFT_MAX_EMBEDDED_FLOORPLANS:
+                            continue
                         classification = AssetType.FLOORPLAN
+                        floorplan_kept += 1
                     elif width < 300 or height < 200 or is_blank_or_empty_image(content):
                         classification = AssetType.DECORATIVE
                         # Drop bytes immediately — merge never hosts decorative.
@@ -466,16 +486,24 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     else:
                         if photo_kept >= _SOFT_MAX_EMBEDDED_PHOTOS:
                             continue
-                        classification = AssetType.UNKNOWN
+                        # PROPERTY_IMAGE directly — leaving UNKNOWN let
+                        # classify_candidates promote near-white floor-plan
+                        # diagrams that barely missed FLOORPLAN_WHITE_FRACTION
+                        # into High Res (confirmed MetSpace Drive galleries).
+                        classification = AssetType.PROPERTY_IMAGE
                         photo_kept += 1
                     extracted.append(
                         AssetCandidate(
                             "", source_document, mime_type=f"image/{base.get('ext', 'png')}",
                             filename=f"asset-p{page_number + 1}-{digest[:10]}.{base.get('ext', 'png')}",
                             page_number=page_number + 1, classification=classification,
-                            confidence=0.9 if classification == AssetType.FLOORPLAN else (0.86 if classification == AssetType.DECORATIVE else 0.0),
+                            confidence=(
+                                0.9 if classification == AssetType.FLOORPLAN
+                                else 0.86 if classification == AssetType.DECORATIVE
+                                else 0.82
+                            ),
                             surrounding_text=page_text[:800], discovery_method="pdf_embedded_image",
-                            association_confidence=0.85 if classification == AssetType.UNKNOWN else 0.0,
+                            association_confidence=0.85 if classification == AssetType.PROPERTY_IMAGE else 0.0,
                             width=width, height=height, content=content, content_hash=digest,
                             extension=base.get("ext", "png"),
                         )
@@ -545,14 +573,70 @@ def _source_photo_count(prop: Property) -> int:
 
 
 def _photo_enrichment_priority(prop: Property) -> int:
-    """Lower runs first. Blank High Res (MetSpace) before single featured
-    images (Knotel) before galleries that already meet the 2+ target."""
+    """Lower runs first. Blank High Res (MetSpace) before under-target
+    galleries (Knotel bottom rows stuck at 1 featured image) before
+    listings that already meet the 5-photo target."""
     count = _source_photo_count(prop)
     if count <= 0:
         return 0
-    if count < 2:
+    if count < _MIN_HIGH_RES_TARGET:
         return 1
     return 2
+
+
+def _rss_mb() -> float:
+    try:
+        import os
+        import psutil
+
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _share_underfilled_building_photos(properties: List[Property]) -> None:
+    """Copy enriched photo candidates across floors of the same building.
+
+    Knotel/GPE/Workplace Plus often emit one row per floor. Enrichment may
+    only finish the first few unique brochure URLs before the deadline —
+    without this, the bottom half of the sheet stays on a single featured
+    email image even though a sibling floor already has a full gallery.
+    """
+    by_building = defaultdict(list)
+    for prop in properties:
+        building = str(prop.values.get("Building") or "").strip().lower()
+        if building:
+            by_building[building].append(prop)
+    for props in by_building.values():
+        if len(props) < 2:
+            continue
+        donor = max(
+            props,
+            key=lambda item: (
+                _source_photo_count(item),
+                len(item.values.get("_brochure_embedded_assets") or []),
+            ),
+        )
+        donor_count = _source_photo_count(donor)
+        donor_embeds = donor.values.get("_brochure_embedded_assets") or []
+        donor_candidates = list(donor.values.get("_high_res_candidates") or [])
+        if donor_count < 2 and not donor_embeds:
+            continue
+        for prop in props:
+            if prop is donor:
+                continue
+            if _source_photo_count(prop) >= _MIN_HIGH_RES_TARGET:
+                continue
+            if donor_embeds and not prop.values.get("_brochure_embedded_assets"):
+                prop.values["_brochure_embedded_assets"] = donor_embeds
+            if donor_candidates:
+                existing = list(prop.values.get("_high_res_candidates") or [])
+                existing_image = str(prop.values.get("High Res Images") or "").strip()
+                if existing_image and ".html" not in existing_image.lower():
+                    existing.insert(0, existing_image)
+                prop.values["_high_res_candidates"] = list(
+                    dict.fromkeys(existing + donor_candidates)
+                )[:_SOFT_MAX_EMBEDDED_PHOTOS]
 
 
 def enrich_properties(
@@ -709,6 +793,27 @@ def enrich_properties(
                     _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
                     prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             break
+        rss = _rss_mb()
+        if rss >= _RSS_ENRICHMENT_CEILING_MB:
+            for brochure_url in pending[wave_start:]:
+                for _, prop, _ in by_url[brochure_url]:
+                    _record_diagnostic(
+                        prop,
+                        "LINK_ENRICHMENT_SKIPPED",
+                        brochure_url,
+                        detail=f"Skipped to keep process RSS under {_RSS_ENRICHMENT_CEILING_MB:.0f} MiB (now {rss:.0f} MiB).",
+                    )
+                    prop.add_issue(
+                        ValidationIssue(
+                            "Brochure PDF",
+                            "Linked-source enrichment was skipped to protect worker memory.",
+                            Severity.INFO,
+                            brochure_url,
+                            "Primary extraction remains valid; process this file alone on a larger instance if photos are missing.",
+                            "linked_source_enrichment",
+                        )
+                    )
+            break
         wave = pending[wave_start : wave_start + wave_size]
         if len(wave) == 1:
             brochure_url = wave[0]
@@ -717,6 +822,7 @@ def enrich_properties(
             except Exception as exc:
                 result = exc
             _apply_result(brochure_url, result)
+            gc.collect()
             continue
         # Wait for the wave to finish (requests timeouts already respect
         # `deadline`). Abandoned wait=False workers kept downloading UNION /
@@ -734,6 +840,8 @@ def enrich_properties(
                 except Exception as exc:
                     result = exc
                 _apply_result(brochure_url, result)
+                gc.collect()
+    _share_underfilled_building_photos(properties)
     return properties
 
 
@@ -751,7 +859,14 @@ def _fetch_resource(fetcher, url, deadline):
 def _retrieve(url, fetcher, extractor, deadline=None):
     resource = _coerce_resource(_fetch_resource(fetcher, url, deadline), url)
     resource_type = _resource_type(resource.payload, resource.content_type)
-    combined = extractor(resource.payload, resource.content_type, resource.final_url)
+    payload = resource.payload
+    content_type = resource.content_type
+    final_url = resource.final_url
+    combined = extractor(payload, content_type, final_url)
+    # Drop the raw PDF/HTML body immediately — extract_brochure already
+    # holds whatever embedded bitmaps it kept. Keeping both copies of a
+    # ~22MB UNION Box PDF was a confirmed free-tier SIGKILL path.
+    del payload
     combined.diagnostics.extend(_resolution_diagnostics(resource, resource_type))
     # HTML/property pages commonly expose the actual downloadable brochure
     # as a PDF link. Follow at most two unique document assets, once each —
@@ -760,10 +875,13 @@ def _retrieve(url, fetcher, extractor, deadline=None):
     # HTML alone; following PDFs burned the multi-file enrichment window).
     page_photos = sum(
         1 for a in combined.assets
-        if a.classification == AssetType.PROPERTY_IMAGE and (a.url or a.content)
+        if a.classification in {AssetType.PROPERTY_IMAGE, AssetType.UNKNOWN} and (a.url or a.content)
     )
     documents = []
-    if page_photos < 2:
+    # Skip nested PDF downloads when the HTML page already has enough photo
+    # candidates — saves budget for later Knotel/GPE rows that would otherwise
+    # stay on a single featured image after the first buildings burn the clock.
+    if page_photos < _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS:
         documents = [
             a.url for a in combined.assets
             if a.classification == AssetType.BROCHURE and a.url != resource.final_url
@@ -840,16 +958,15 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         # already happened in classify_candidates / _extract_pdf_visuals;
         # materialise writes bytes to disk then clears content.
         photos = [a for a in embedded if a.classification == AssetType.PROPERTY_IMAGE][:_SOFT_MAX_EMBEDDED_PHOTOS]
-        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN]
+        plans = [a for a in embedded if a.classification == AssetType.FLOORPLAN][:_SOFT_MAX_EMBEDDED_FLOORPLANS]
         prop.values["_brochure_embedded_assets"] = photos + plans
         # Drop bytes from assets not kept for materialise.
         kept = set(id(a) for a in photos + plans)
         for asset in prop.assets:
             if asset.content and id(asset) not in kept:
                 asset.content = None
-    # Keep at most five property photos per listing so brochure dumps cannot
-    # flood High Res; the web layer targets 2-5 when photos exist.
-    _MAX_PROPERTY_IMAGES = 5
+    # Cap URL-side candidates to the High Res band (5–8).
+    _MAX_PROPERTY_IMAGES = _SOFT_MAX_EMBEDDED_PHOTOS
     property_images = [
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
     ][:_MAX_PROPERTY_IMAGES]

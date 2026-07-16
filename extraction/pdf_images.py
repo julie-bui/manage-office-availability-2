@@ -651,7 +651,10 @@ def is_floorplan_page(page_text):
 # decorative header/footer illustration (34.5% — low unique-color count
 # like a floor plan, but nowhere near as white). 0.5 sits with a wide
 # margin on both sides of that gap.
-FLOORPLAN_WHITE_FRACTION = 0.5
+# 0.5 missed some MetSpace Drive floor-plan pages (gray/cream boards) that
+# then leaked into High Res. 0.38 still sits well above real office photos
+# tested previously (~17% white) while catching lighter plan diagrams.
+FLOORPLAN_WHITE_FRACTION = 0.38
 # Only need a rough estimate, so large images are downsampled first —
 # this keeps the check cheap even for a multi-megapixel source image.
 _MAX_SAMPLE_PIXELS = 400 * 400

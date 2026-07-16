@@ -1,0 +1,6 @@
+# Railway Railpack uses mise to install the Python version from .python-version.
+# Upstream GitHub artifact attestations for CPython 3.12.3 are sometimes
+# unavailable; disable verification so builds are not blocked by that.
+# Equivalent service env var: MISE_PYTHON_GITHUB_ATTESTATIONS=false
+[settings]
+python.github_attestations = false

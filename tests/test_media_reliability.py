@@ -9,6 +9,7 @@ from PIL import Image
 from extraction import brochure as brochure_module, pipeline
 from extraction.assets import (
     classify_candidate,
+    evaluate_image_bytes,
     image_content_hash,
     is_blank_or_empty_image,
     merge_candidate_urls,
@@ -673,8 +674,8 @@ def test_finalize_keeps_discovered_photos_when_batch_deadline_elapsed(tmp_path):
     assert any(item.status == "IMAGE_UNHASHED_SKIPPED" for item in record["_link_diagnostics"])
 
 
-def test_finalize_caps_high_res_gallery_at_five(tmp_path):
-    urls = [f"https://img.test/{i}.jpg" for i in range(8)]
+def test_finalize_caps_high_res_gallery_at_eight(tmp_path):
+    urls = [f"https://img.test/{i}.jpg" for i in range(12)]
     record = {
         "Building": "Many Photo House",
         "_source_high_res_candidates": urls,
@@ -687,9 +688,27 @@ def test_finalize_caps_high_res_gallery_at_five(tmp_path):
         )
     assert len(jobs) == 1
     gallery = jobs[0][1].read_text(encoding="utf-8")
-    assert gallery.count("<img") == 5
-    assert record["_high_res_image_count"] == 5
+    assert gallery.count("<img") == 8
+    assert record["_high_res_image_count"] == 8
     assert any(item.status == "IMAGE_CANDIDATES_CAPPED" for item in record["_link_diagnostics"])
+
+
+def test_finalize_excludes_floor_plan_url_from_high_res(tmp_path):
+    plan = "https://cdn.test/floorplan.jpg"
+    photo = "https://cdn.test/office.jpg"
+    record = {
+        "Building": "Plan Leak House",
+        "Floor Plan": plan,
+        "_high_res_candidates": [plan, photo],
+        "_source_high_res_candidates": [plan, photo],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record["High Res Images"] == photo
+    assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])
 
 
 def _solid_jpeg(color):
@@ -712,6 +731,120 @@ def _photo_jpeg(seed=0):
 def test_blank_near_solid_image_is_rejected():
     assert is_blank_or_empty_image(_solid_jpeg((10, 12, 14)))
     assert not is_blank_or_empty_image(_photo_jpeg(3))
+
+
+def test_evaluate_image_bytes_rejects_floorplan_diagram():
+    plan = Image.new("RGB", (800, 600), (250, 250, 250))
+    pixels = plan.load()
+    for x in range(0, 800, 40):
+        for y in range(600):
+            pixels[x, y] = (40, 40, 40)
+    buf = BytesIO()
+    plan.save(buf, format="JPEG")
+    result = evaluate_image_bytes(buf.getvalue(), url="https://cdn.test/plan.jpg")
+    assert result["ok"] is False
+    assert result["status"] == "IMAGE_IS_FLOORPLAN"
+    assert evaluate_image_bytes(_photo_jpeg(4), url="https://cdn.test/office.jpg")["ok"]
+
+
+def test_finalize_excludes_floorplan_named_url(tmp_path):
+    record = {
+        "Building": "Named Plan House",
+        "Floor Plan": "",
+        "_high_res_candidates": [
+            "https://cdn.test/media/floorplan-level-2.png",
+            "https://cdn.test/media/office.jpg",
+        ],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record["High Res Images"] == "https://cdn.test/media/office.jpg"
+    assert "floorplan" in (record.get("Floor Plan") or "").lower()
+
+
+def test_share_underfilled_building_photos_copies_sibling_gallery():
+    donor_urls = [f"https://img.test/{i}.jpg" for i in range(6)]
+    donor = Property.from_record(
+        {
+            **values(Building="Shared Tower", **{"Floor/Unit": "1st"}),
+            "High Res Images": donor_urls[0],
+            "_high_res_candidates": donor_urls,
+        },
+        "src.eml",
+        "Knotel",
+        "rule:Knotel",
+    )
+    sibling = Property.from_record(
+        {
+            **values(Building="Shared Tower", **{"Floor/Unit": "5th"}),
+            "High Res Images": "https://img.test/featured-only.jpg",
+            "_high_res_candidates": ["https://img.test/featured-only.jpg"],
+        },
+        "src.eml",
+        "Knotel",
+        "rule:Knotel",
+    )
+    brochure_module._share_underfilled_building_photos([donor, sibling])
+    merged = sibling.values.get("_high_res_candidates") or []
+    assert len(merged) >= 5
+    assert donor_urls[1] in merged
+
+
+def test_soft_accept_does_not_pad_gallery_with_dead_urls(tmp_path):
+    good = "https://cdn.test/real.jpg"
+    dead = "https://cdn.test/gone.jpg"
+    record = {
+        "Building": "Pad House",
+        "_source_high_res_candidates": [good, dead],
+        "_high_res_candidates": [good, dead],
+    }
+
+    def validate(url, cache=None, deadline=None):
+        if url == good:
+            return {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": "goodhash"}
+        return {"ok": False, "url": url, "status": "LINK_EXPIRED_OR_INACCESSIBLE"}
+
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example", image_validator=validate
+        )
+    assert record["High Res Images"] == good
+    assert record["_high_res_image_count"] == 1
+
+
+def test_materialize_reclassifies_floorplan_bitmap_out_of_high_res(tmp_path):
+    # Near-white diagram should be treated as Floor Plan, not High Res.
+    plan = Image.new("RGB", (800, 600), (250, 250, 250))
+    pixels = plan.load()
+    for x in range(0, 800, 40):
+        for y in range(600):
+            pixels[x, y] = (40, 40, 40)
+    buf = BytesIO()
+    plan.save(buf, format="JPEG")
+    plan_bytes = buf.getvalue()
+    photo_bytes = _photo_jpeg(9)
+    record = {
+        "Building": "Mixed Brochure House",
+        "Floor Plan": "",
+        "_brochure_embedded_assets": [
+            AssetCandidate(
+                "", "brochure", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                content=plan_bytes, content_hash="planhash01", extension="jpg", width=800, height=600,
+            ),
+            AssetCandidate(
+                "", "brochure", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                content=photo_bytes, content_hash="photohash01", extension="jpg", width=640, height=400,
+            ),
+        ],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._materialize_brochure_assets([record], tmp_path, "batch", "Example")
+    assert ".jpg" in (record.get("Floor Plan") or "")
+    assert len(record.get("_high_res_candidates") or []) == 1
+    assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])
 
 
 def test_finalize_dedupes_identical_bytes_under_different_urls(tmp_path):

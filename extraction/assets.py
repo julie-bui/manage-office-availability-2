@@ -267,6 +267,21 @@ def evaluate_image_bytes(payload: bytes, url: str = "", content_type: str = "") 
             "content_hash": content_hash,
             "content_type": content_type,
         }
+    # Floor-plan diagrams are intentionally near-white — classify them
+    # before the blank-slide rejector so MetSpace Drive plans are not
+    # dropped as IMAGE_BLANK_OR_EMPTY (and never reach Floor Plan).
+    from . import pdf_images
+
+    if pdf_images.is_floorplan_image(payload):
+        return {
+            "ok": False,
+            "status": "IMAGE_IS_FLOORPLAN",
+            "url": url,
+            "width": width,
+            "height": height,
+            "content_hash": content_hash,
+            "content_type": content_type,
+        }
     if is_blank_or_empty_image(payload):
         return {
             "ok": False,

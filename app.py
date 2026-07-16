@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -49,8 +50,11 @@ PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
 # Target band for High Res Images when the source/brochures actually contain
 # property photos. Cap galleries at MAX so one brochure dump cannot flood a
 # listing; warn when a non-exempt file finishes below MIN or with zero images.
-MIN_HIGH_RES_IMAGES = 2
-MAX_HIGH_RES_IMAGES = 5
+MIN_HIGH_RES_IMAGES = 5
+MAX_HIGH_RES_IMAGES = 8
+# URL/filename floor-plan tokens — cheap pre-filter before pixel validation
+# (MetSpace / brochure CDN paths that literally say "floorplan").
+_FLOORPLAN_URL_RE = re.compile(r"floor[\s_-]*plan|floorplan|\blayout\b", re.I)
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
 IMAGE_EXEMPT_METHODS = {"rule:BC"}
@@ -798,6 +802,30 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         candidates = merge_candidate_urls(raw_candidates)
         diagnostics = record.setdefault("_link_diagnostics", [])
         diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED", detail=f"{len(candidates)} candidate(s)"))
+        # Never put the Floor Plan cell URL into High Res (MetSpace email
+        # floorplans / hosted plan JPEGs sometimes reappear as candidates).
+        floor_plan_url = normalize_url(str(record.get("Floor Plan") or ""))
+        if floor_plan_url:
+            before = len(candidates)
+            candidates = [url for url in candidates if normalize_url(url) != floor_plan_url]
+            if len(candidates) < before:
+                diagnostics.append(LinkDiagnostic(
+                    "IMAGE_IS_FLOORPLAN",
+                    original_url=floor_plan_url,
+                    detail="Excluded Floor Plan URL from High Res Images candidates.",
+                ))
+        named_plans = [url for url in candidates if _FLOORPLAN_URL_RE.search(url or "")]
+        if named_plans:
+            plan_names = {normalize_url(url) for url in named_plans}
+            candidates = [url for url in candidates if normalize_url(url) not in plan_names]
+            for plan_url in named_plans:
+                diagnostics.append(LinkDiagnostic(
+                    "IMAGE_IS_FLOORPLAN",
+                    original_url=plan_url,
+                    detail="Excluded floor-plan-named URL from High Res Images candidates.",
+                ))
+                if _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                    record["Floor Plan"] = plan_url
         trusted = set(merge_candidate_urls(source_candidates))
         valid = []
         seen_hashes = set()
@@ -806,7 +834,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if len(valid) >= MAX_HIGH_RES_IMAGES:
                 # Keep scanning only long enough to know we capped; further
                 # candidates are ignored so duplicate URLs cannot displace
-                # later distinct photos after the 2–5 target is already met.
+                # later distinct photos after the 5–8 target is already met.
                 break
             cached = validation_cache.get(normalize_url(candidate))
             if _is_local_download_url(candidate, batch_id):
@@ -814,7 +842,14 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 if local_path is not None:
                     payload = local_path.read_bytes()
                     result = evaluate_image_bytes(payload, url=candidate)
-                    if result.get("ok"):
+                    if result.get("ok") and pdf_images.is_floorplan_image(payload):
+                        result = {
+                            "ok": False,
+                            "url": candidate,
+                            "status": "IMAGE_IS_FLOORPLAN",
+                            "content_hash": image_content_hash(payload),
+                        }
+                    elif result.get("ok"):
                         result["status"] = "VALID_SOURCE_IMAGE"
                     elif result.get("status") == "NOT_AN_IMAGE":
                         # Fixture/edge bytes that are not decodable as a
@@ -833,7 +868,10 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             elif candidate in trusted:
                 # Source photos: validate when budget allows so Knotel-style
                 # same-bytes/different-URL duplicates can be content-hashed out.
-                # Soft fetch failures must never blank a source photo.
+                # Soft-accept a fetch failure only when this listing still has
+                # zero photos — never pad galleries with dead/blank/floorplan
+                # URLs (MetSpace blank slots; floor-plan diagrams mis-kept as
+                # "source" photos).
                 if deadline is not None and time.monotonic() >= deadline - 5:
                     result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
                 else:
@@ -841,11 +879,17 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     if deadline is not None:
                         validator_kwargs["deadline"] = deadline
                     result = image_validator(candidate, **validator_kwargs)
-                    if not result.get("ok") and result.get("status") not in {
+                    hard_reject = {
                         "IMAGE_BLANK_OR_EMPTY",
                         "IMAGE_TOO_SMALL",
+                        "IMAGE_IS_FLOORPLAN",
                         "NOT_AN_IMAGE",
-                    }:
+                    }
+                    if (
+                        not result.get("ok")
+                        and result.get("status") not in hard_reject
+                        and not valid
+                    ):
                         result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif cached is not None:
                 # Confirmed real (2026-07, GPE): a building repeated across
@@ -905,6 +949,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 "IMAGE_DUPLICATE_CONTENT": "Exact duplicate of an already-selected photo; kept only one copy.",
                 "IMAGE_DUPLICATE_URL": "Duplicate URL after normalisation; kept only one copy.",
                 "IMAGE_BLANK_OR_EMPTY": "Near-solid/blank placeholder excluded from High Res Images.",
+                "IMAGE_IS_FLOORPLAN": "Floor-plan diagram excluded from High Res Images (belongs in Floor Plan).",
                 "IMAGE_UNHASHED_SKIPPED": "Skipped unhashed soft-accept after distinct photos already selected (prevents CDN duplicate galleries).",
             }.get(status, "Candidate was excluded from High Res Images.")
             diagnostics.append(LinkDiagnostic(status, original_url=candidate, detail=detail))
@@ -1051,7 +1096,17 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                     )
                     candidate.content = None
                     continue
-                if is_blank_or_empty_image(candidate.content):
+                # Floor plans before blank reject — near-white diagrams would
+                # otherwise be dropped as blank and never fill Floor Plan.
+                if pdf_images.is_floorplan_image(candidate.content):
+                    candidate.classification = AssetType.FLOORPLAN
+                    diagnostics.append(
+                        LinkDiagnostic(
+                            "IMAGE_IS_FLOORPLAN",
+                            detail="Floor-plan diagram moved to Floor Plan; excluded from High Res Images.",
+                        )
+                    )
+                elif is_blank_or_empty_image(candidate.content):
                     diagnostics.append(
                         LinkDiagnostic("IMAGE_BLANK_OR_EMPTY", detail="Near-solid/blank placeholder excluded from High Res Images.")
                     )
@@ -1096,7 +1151,7 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
         # Plus spreadsheets) previously relied on `not existing` being
         # true; a single email featured photo with no _high_res_candidates
         # list also needs the embedded URLs merged in so finalize can
-        # build a 2-5 image gallery.
+        # build a 5-8 image gallery.
         record["_high_res_candidates"] = combined
     return jobs
 
