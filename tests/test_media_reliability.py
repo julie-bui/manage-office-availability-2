@@ -614,7 +614,7 @@ def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
                     confidence=0.85,
                 )
             )
-            for name in ("a", "b", "c")
+            for name in ("a", "b", "c", "d", "e")
         ]
         return BrochureExtraction(
             final_url,

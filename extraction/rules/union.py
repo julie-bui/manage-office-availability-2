@@ -54,9 +54,16 @@ def detect(content):
             content.get("source_file_name") or "",
         ]
     )
-    if not _UNION_HINT_RE.search(blob):
+    headers = _find_header_tables(content.get("tables") or [])
+    if not headers:
         return False
-    return bool(_find_header_tables(content.get("tables") or []))
+    # Full packs mention "union" / "sub-market avaiability" in the intro;
+    # single-tab exports named "UNION - … Clerkenwell & Farringdon.xlsx"
+    # often keep only the grid — filename/sheet still identify them.
+    if _UNION_HINT_RE.search(blob):
+        return True
+    name = f"{content.get('filename') or ''} {content.get('source_file_name') or ''}"
+    return bool(re.search(r"\bunion\b", name, re.I))
 
 
 def parse(content):

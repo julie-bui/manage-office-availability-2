@@ -5,6 +5,7 @@ file gets its own result entry so one failure doesn't sink the batch.
 Unlike an earlier version of this module, each file's records stay
 separate (one output spreadsheet per source file, not one combined master).
 """
+import gc
 import re
 import time
 from datetime import date
@@ -290,6 +291,12 @@ def process_files(
         if content.get("row_links"):
             result["row_links"] = content["row_links"]
 
+        # Rules (UNION especially) match on filename / sheet names — without
+        # this, a single-tab export of "Clerkenwell & Farringdon" that omits
+        # the word "union" in cell text falls through to the LLM and OOMs.
+        content["filename"] = filename
+        content["source_file_name"] = filename
+
         rule_name, raw_records = try_rules(content)
         llm_source_name = None
         if raw_records:
@@ -381,6 +388,10 @@ def process_files(
                 results.append(result)
                 continue
             memlog.log("after LLM call", filename)
+            # LLM JSON + source text can leave a large transient spike; free
+            # what we can before brochure enrichment (UNION Box PDFs) runs.
+            content["text"] = ""
+            gc.collect()
 
         normalized = [normalize_record(r) for r in raw_records]
         normalized = [r for r in normalized if r.get("Building") or r.get("Area")]
@@ -881,21 +892,36 @@ def _safe_print(message):
         print(message.encode("ascii", "replace").decode("ascii"))
 
 
-def _geocode_query(record):
-    """All current sources are London office listings, but the extracted
-    address text is often just a building name/street (e.g. "28 Bruton
-    Street") with no postcode or city — so append London/UK context for
-    the geocoder rather than passing an ambiguous bare address. This only
-    shapes the search query; it never fabricates the coordinates
-    themselves, and Property Address 1/Property Postcode in the output are
-    untouched.
+# Outward postcode areas that are not London — appending ", London, UK"
+# (Workplace Plus Manchester M1/M2) makes Nominatim fail entirely.
+_NON_LONDON_POSTCODE_AREA_RE = re.compile(
+    r"^\s*(LS|NE|NG|BS|CF|EH|AB|BT|GY|JE|IM|M|B|G|L|S)\d",
+    re.I,
+)
+_CITY_FROM_POSTCODE = {
+    "M": "Manchester",
+    "B": "Birmingham",
+    "G": "Glasgow",
+    "L": "Liverpool",
+    "LS": "Leeds",
+    "S": "Sheffield",
+    "NE": "Newcastle",
+    "NG": "Nottingham",
+    "BS": "Bristol",
+    "CF": "Cardiff",
+    "EH": "Edinburgh",
+    "AB": "Aberdeen",
+}
 
-    Deliberately does NOT add the informal "Area" field (e.g. "West End",
-    "Fitzrovia") — these are marketing/neighbourhood names, not formal
-    localities, and confirmed empirically to make Nominatim's free-text
-    matching fail on otherwise-correct addresses (e.g. "9-10 Market Place,
-    West End, London, UK" -> no match, but "9-10 Market Place, London, UK"
-    matches correctly)."""
+
+def _geocode_query(record):
+    """Shape a geocoder query from address + postcode.
+
+    Bare London streets get ", London, UK". Non-London UK postcodes
+    (Manchester M*, Birmingham B*, …) get their own city — never London.
+    This only shapes the search query; spreadsheet address fields are
+    untouched. Deliberately omits informal Area labels (West End, etc.).
+    """
     address = (record.get("Property Address 1") or "").strip()
     if not address:
         return ""
@@ -904,7 +930,35 @@ def _geocode_query(record):
     if postcode and postcode not in address:
         address = f"{address}, {postcode}"
 
-    if "london" not in address.lower():
-        address = f"{address}, London, UK"
+    lower = address.lower()
+    if "london" in lower or re.search(
+        r"\b(manchester|birmingham|glasgow|liverpool|leeds|sheffield|newcastle|nottingham|bristol|cardiff|edinburgh)\b",
+        lower,
+    ):
+        if not lower.endswith("uk"):
+            address = f"{address}, UK" if ", uk" not in lower else address
+        return address
 
+    area_match = _NON_LONDON_POSTCODE_AREA_RE.match(postcode or "")
+    if not area_match:
+        # Postcode may already be inside the address string.
+        embedded = re.search(
+            r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*\d[A-Z]{2}\b",
+            address,
+            re.I,
+        )
+        if embedded:
+            area_match = _NON_LONDON_POSTCODE_AREA_RE.match(embedded.group(1))
+    if area_match:
+        prefix = area_match.group(1).upper()
+        city = _CITY_FROM_POSTCODE.get(prefix)
+        if not city and len(prefix) >= 2:
+            city = _CITY_FROM_POSTCODE.get(prefix[:2])
+        if city and city.lower() not in lower:
+            address = f"{address}, {city}, UK"
+        elif not lower.endswith("uk"):
+            address = f"{address}, UK"
+        return address
+
+    address = f"{address}, London, UK"
     return address

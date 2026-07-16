@@ -25,20 +25,26 @@ def detect(content):
 
 def parse(content):
     blocks = find_property_blocks(content)
+    contacts = _default_contacts(content)
     records = []
     for block in blocks:
         links = _links_for_block(content.get("row_links") or [], block)
         for source_row, row in block["availability_rows"]:
+            desks_raw = _cell(row, block["columns"].get("Desks (max)"))
             record = {
-                "Area": block["area"],
+                "Area": block["area"] or _area_from_sheet(block.get("sheet_name") or ""),
                 "Building": block["building"],
                 "Floor/Unit": _cell(row, block["columns"].get("Floor/Unit")),
                 "Size (sq ft)": _number(_cell(row, block["columns"].get("Size (sq ft)"))),
-                "Desks (max)": _desks(_cell(row, block["columns"].get("Desks (max)"))),
+                "Desks (max)": _desks(desks_raw),
+                # Workplace Plus Manchester (etc.): desk cell holds
+                # "30 + 3 MR + Collab" — extras belong in Special Features.
+                "Special Features": _desks_features(desks_raw),
                 "Min. Term": _cell(row, block["columns"].get("Min. Term")),
                 "Marketing Price (Based on Min Term) PCM": _number(
                     _cell(row, block["columns"].get("Marketing Price (Based on Min Term) PCM"))
                 ),
+                "Contacts": contacts,
                 "_spreadsheet_block": {
                     "sheet": block["sheet_name"],
                     "address_row": block["address_row"],
@@ -55,6 +61,41 @@ def parse(content):
                     record.setdefault("Brochure PDF", url)
             records.append(record)
     return records
+
+
+def _default_contacts(content):
+    """File/sheet-level contact when the grid has no per-row agent column."""
+    blob = " ".join(
+        [
+            content.get("filename") or "",
+            content.get("source_file_name") or "",
+            " ".join(content.get("sheet_names") or []),
+            (content.get("text") or "")[:500],
+        ]
+    ).lower()
+    if "workplace plus" in blob or "workplaceplus" in blob:
+        return "Workplace Plus, hello@workplaceplus.co.uk"
+    return ""
+
+
+def _area_from_sheet(sheet_name):
+    text = str(sheet_name or "").strip()
+    if text and text.lower() not in {"sheet1", "sheet 1"}:
+        return text.title() if text.isupper() else text
+    return ""
+
+
+def _desks_features(value):
+    """Keep the descriptive desk package text (MR / Collab / BR) as features."""
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()
+    if not text or re.fullmatch(r"\d+", text):
+        return ""
+    # Pure numeric ranges are not features.
+    if re.fullmatch(r"\d+\s*[-–]\s*\d+", text):
+        return ""
+    return text
 
 
 def find_property_blocks(content):

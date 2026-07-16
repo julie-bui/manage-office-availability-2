@@ -691,16 +691,24 @@ def enrich_properties(
     # caller's original order in the returned list.
     by_url = defaultdict(list)
     for index, prop in enumerate(properties):
-        raw_url = str(prop.values.get("Brochure PDF") or "").strip()
-        brochure_url = normalize_url(raw_url)
-        if raw_url and not brochure_url:
-            status = "LINK_UNSUPPORTED" if urlparse(raw_url).scheme and urlparse(raw_url).scheme.lower() not in {"http", "https"} else "LINK_ENRICHMENT_SKIPPED"
-            _record_diagnostic(prop, status, raw_url, detail="Only valid public HTTP(S) linked resources are supported.")
-            _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", raw_url, detail="Primary extraction preserved.")
-            continue
-        if not brochure_url:
-            continue
-        by_url[brochure_url].append((index, prop, raw_url))
+        seed_urls = []
+        primary = str(prop.values.get("Brochure PDF") or "").strip()
+        if primary:
+            seed_urls.append(primary)
+        for extra in prop.values.get("_extra_brochure_urls") or []:
+            text = str(extra or "").strip()
+            if text and text not in seed_urls:
+                seed_urls.append(text)
+        for raw_url in seed_urls:
+            brochure_url = normalize_url(raw_url)
+            if raw_url and not brochure_url:
+                status = "LINK_UNSUPPORTED" if urlparse(raw_url).scheme and urlparse(raw_url).scheme.lower() not in {"http", "https"} else "LINK_ENRICHMENT_SKIPPED"
+                _record_diagnostic(prop, status, raw_url, detail="Only valid public HTTP(S) linked resources are supported.")
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", raw_url, detail="Primary extraction preserved.")
+                continue
+            if not brochure_url:
+                continue
+            by_url[brochure_url].append((index, prop, raw_url))
 
     # Unique URLs ordered by photo-need: blank High Res first (MetSpace /
     # Union / spreadsheet Drive rows), then single featured images
@@ -917,14 +925,30 @@ def _retrieve(url, fetcher, extractor, deadline=None):
         and (a.url or a.content)
         and (a.association_confidence or 0) >= 0.8
     )
-    brochure_urls = [
-        a.url for a in combined.assets
+    brochure_assets = [
+        a for a in combined.assets
         if a.classification == AssetType.BROCHURE and a.url and a.url != resource.final_url
     ]
-    hosted_docs = [url for url in brochure_urls if _is_hosted_document_download(url)]
-    optional_docs = [url for url in brochure_urls if not _is_hosted_document_download(url)]
-    documents = list(dict.fromkeys(hosted_docs))[:2]
-    if page_photos < _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS:
+    # Always follow Drive/Box/Dropbox. Follow explicit "Download brochure"
+    # PDFs (GPE) when the HTML gallery is still under the High Res target.
+    # Other nested PDFs stay optional so Knotel pages with a full HTML
+    # gallery do not burn the enrichment window.
+    must_follow = []
+    optional_docs = []
+    for asset in brochure_assets:
+        label = f"{asset.anchor_text or ''} {asset.filename or ''}".lower()
+        is_download_brochure = (
+            ("brochure" in label and ("download" in label or label.strip().endswith(".pdf")))
+            or bool(re.search(r"download\s+(?:the\s+)?(?:brochure|pdf)", label))
+        )
+        if _is_hosted_document_download(asset.url):
+            must_follow.append(asset.url)
+        elif is_download_brochure and page_photos < _MIN_HIGH_RES_TARGET:
+            must_follow.append(asset.url)
+        else:
+            optional_docs.append(asset.url)
+    documents = list(dict.fromkeys(must_follow))[:2]
+    if page_photos < _MIN_HIGH_RES_TARGET:
         for url in optional_docs:
             if url not in documents:
                 documents.append(url)

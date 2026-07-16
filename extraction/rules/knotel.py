@@ -24,19 +24,18 @@ repeating the name/address lines.
 Contacts is a fixed, whole-email value (_contact_block) — Knotel gives no
 individual broker name, only a shared team contact in the intro
 paragraph. Special Features carries a per-floor price-drop note when the
-intro also flags one (_price_drop_notes) — otherwise blank. Brochure PDF
-prefers a real, working knotel.com link ("View property"/"View Listing")
-over "View Brochure" itself (_best_brochure_link) — confirmed real
-(2026-07) that "View Brochure" always points at pitch.com, a JS-rendered
-viewer that returns an HTML page when fetched directly, never real PDF
-bytes, the same already-confirmed-unusable class as Canva/Box.com seen
-elsewhere in this project. Distinct from Link to File, which app.py
-always overwrites with the persisted source file link regardless of
-what this rule sets.
+intro also flags one (_price_drop_notes) — otherwise blank. Brochure PDF prefers a real, working knotel.com link ("View property"/
+"View Listing") over "View Brochure" itself (_best_brochure_link) —
+confirmed real (2026-07) that "View Brochure" often points at pitch.com,
+a JS-rendered viewer. When View Brochure is a high-trust HTTP(S) URL it
+is still kept on `_extra_brochure_urls` so enrichment can fetch it.
+Distinct from Link to File, which app.py always overwrites with the
+persisted source file link regardless of what this rule sets.
 """
 import re
 
 from extraction.html_images import is_low_trust_link_domain
+from extraction.assets import normalize_url
 from extraction.text_utils import titlecase_area
 
 AREA_RE = re.compile(r"^[A-Z][A-Z ]+$")
@@ -245,6 +244,8 @@ def parse(content):
 
             group = link_groups[group_idx] if group_idx < len(link_groups) else {}
             group_idx += 1
+            brochure_primary = _best_brochure_link(group)
+            brochure_extras = _extra_brochure_urls(group, brochure_primary)
 
             records.append(
                 {
@@ -257,7 +258,7 @@ def parse(content):
                     "Marketing Price (Based on Min Term) PSF": _strip_units(price_psf, "per sqft"),
                     "Special Features": _price_drop_note_for(price_drop_notes, current_building, floor),
                     "Contacts": contact,
-                    "Brochure PDF": _best_brochure_link(group),
+                    "Brochure PDF": brochure_primary,
                     "Floor Plan": group.get("floorplan", ""),
                     # Featured email photo plus later knotel.com page photos
                     # land in _high_res_candidates so app.py can build a
@@ -267,6 +268,11 @@ def parse(content):
                     "_high_res_candidates": (
                         [group["highres"]] if group.get("highres") else []
                     ),
+                    # High-trust View Brochure / View Listing URLs that were
+                    # not chosen as the primary seed — enrichment fetches
+                    # these too so under-filled cells still get PDF embeds
+                    # when the property page alone is thin.
+                    **({"_extra_brochure_urls": brochure_extras} if brochure_extras else {}),
                 }
             )
         i += 1
@@ -275,21 +281,41 @@ def parse(content):
 
 
 def _best_brochure_link(group):
-    """Prefers "View property" (this floor's own specific knotel.com
-    listing page) or "View Listing" (the whole building's knotel.com
-    page, a reasonable fallback when a floor-specific one isn't present)
-    over "View Brochure" itself — confirmed real (2026-07) that "View
-    Brochure" always points at pitch.com, a JS-rendered viewer, not a
-    real fetchable document, the same class of problem already fixed
-    for The Workplace Company's own Brochure/Website columns
-    (extraction.xlsx_links). Falls back to whichever of the three is
-    actually present, in the same preference order, if every present
-    candidate is low-trust — still better than nothing."""
-    candidates = [group.get("property"), group.get("listing"), group.get("brochure")]
-    for url in candidates:
+    """Prefer knotel.com property/listing pages over View Brochure.
+
+    View Brochure often points at pitch.com (low-trust JS viewer) — skip
+    those unless nothing else exists. When View Brochure is a real
+    HTTP(S) document host, `_extra_brochure_urls` still seeds enrichment.
+    """
+    for key in ("property", "listing", "brochure"):
+        url = group.get(key)
         if url and not is_low_trust_link_domain(url):
             return url
-    return next((url for url in candidates if url), "")
+    for key in ("property", "listing", "brochure"):
+        if group.get(key):
+            return group[key]
+    return ""
+
+
+def _extra_brochure_urls(group, primary):
+    """Additional high-trust brochure/property URLs for linked enrichment.
+
+    Prefer property page as Brochure PDF, but also keep a fetchable View
+    Brochure (non-pitch) so galleries are not stuck on one featured image
+    when the property page is thin or times out.
+    """
+    extras = []
+    seen = {normalize_url(primary)} if primary else set()
+    for key in ("property", "listing", "brochure"):
+        url = group.get(key)
+        if not url or is_low_trust_link_domain(url):
+            continue
+        normalized = normalize_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        extras.append(url)
+    return extras
 
 
 def _value_after(window, label):
