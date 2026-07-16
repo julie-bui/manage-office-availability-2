@@ -142,7 +142,7 @@ def test_brochure_source_pdf_seeds_blank_brochure_pdf(tmp_path: Path):
     )
     assert records[0]["Brochure PDF"] == "https://cdn.example/keep.pdf"
 
-    # BC multi-listing availability schedule must stay blank.
+    # BC Current Availability is the brochure PDF for every listing row.
     schedule = tmp_path / "BC Current Availability.pdf"
     schedule.write_bytes(b"%PDF-1.4")
     records = [
@@ -152,7 +152,7 @@ def test_brochure_source_pdf_seeds_blank_brochure_pdf(tmp_path: Path):
     app_module._seed_brochure_from_source_pdf(
         records, schedule, source_url, "rule:BC", schedule.name
     )
-    assert all(not r["Brochure PDF"] for r in records)
+    assert all(r["Brochure PDF"] == source_url for r in records)
 
     # Email/xlsx-shaped paths never seed (suffix check).
     eml = tmp_path / "note.eml"

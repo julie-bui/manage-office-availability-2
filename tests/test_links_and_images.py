@@ -290,11 +290,19 @@ def check_bc_links_and_images(failures, client):
     if row is None:
         failures.append(f"{filename}: expected a row for '10-12 Alie Street', found none")
         return
-    if _link(row, "Brochure PDF") or _link(row, "Floor Plan") or _link(row, "High Res Images"):
+    # Floor Plan / High Res stay blank (table has no image data). Brochure PDF
+    # is the hosted source PDF — BC uploads *are* the brochure document.
+    if _link(row, "Floor Plan") or _link(row, "High Res Images"):
         failures.append(
-            f"{filename}: expected all three blank (confirmed real — BC's own PDF table has no image data at "
-            f"all), got Brochure PDF={_link(row, 'Brochure PDF')!r} Floor Plan={_link(row, 'Floor Plan')!r} "
-            f"High Res Images={_link(row, 'High Res Images')!r}"
+            f"{filename}: expected Floor Plan/High Res Images blank (BC table has no image data), "
+            f"got Floor Plan={_link(row, 'Floor Plan')!r} High Res Images={_link(row, 'High Res Images')!r}"
+        )
+    brochure = _link(row, "Brochure PDF")
+    source_file = fr.get("source_file") or ""
+    if not brochure or (source_file and source_file not in brochure):
+        failures.append(
+            f"{filename}: expected Brochure PDF to be the hosted source PDF "
+            f"(source_file={source_file!r}), got {brochure!r}"
         )
 
 

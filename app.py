@@ -327,23 +327,24 @@ def process():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# Methods whose uploaded PDF is a multi-listing availability schedule, not a
-# per-property brochure. Seeding Brochure PDF from the source file would
-# wrongly point every row at the schedule PDF (e.g. BC Current Availability).
-_SOURCE_PDF_NOT_BROCHURE_METHODS = {"rule:BC"}
+# Uploaded PDFs that *are* the brochure document (or the provider's PDF
+# schedule that replaces a per-listing brochure link). Seed blank Brochure
+# PDF cells with the hosted source download URL — this replaces the old
+# Link to File surface for these formats.
+_SOURCE_PDF_IS_BROCHURE_METHODS = {"rule:BC", "rule:Breezblok"}
 
 
 def _should_seed_brochure_from_source_pdf(method, filename, records):
-    """True when the uploaded PDF itself is the marketing brochure.
+    """True when the uploaded PDF itself should fill blank Brochure PDF.
 
-    Emails/xlsx never reach this helper (caller checks .pdf). Availability
-    tables are excluded; LLM brochure PDFs, Breezblok sheets, filenames
-    containing 'brochure', and single-building PDFs are included.
+    Emails/xlsx never reach this helper (caller checks .pdf). BC Current
+    Availability and Breezblok sheets are brochure-source PDFs; so are LLM
+    brochure uploads, filenames containing 'brochure', and single-building
+    PDFs. Other multi-building PDF schedules without an explicit brochure
+    method stay unseeded.
     """
-    if (method or "") in _SOURCE_PDF_NOT_BROCHURE_METHODS:
-        return False
     method = method or ""
-    if method.startswith("llm") or method == "rule:Breezblok":
+    if method.startswith("llm") or method in _SOURCE_PDF_IS_BROCHURE_METHODS:
         return True
     if "brochure" in (filename or "").lower():
         return True
@@ -359,8 +360,8 @@ def _seed_brochure_from_source_pdf(records, source_path, source_url, method, ori
     """If Brochure PDF is blank and the upload is the property brochure PDF,
     point Brochure PDF at the hosted source download URL.
 
-    Replaces the old Link to File surface for brochure-source PDFs (BC
-    single-listing sheets, Breezblok, etc.) without stuffing every PDF
+    Replaces the old Link to File surface for brochure-source PDFs (BC,
+    Breezblok, LLM brochure uploads, etc.) without stuffing every PDF
     upload into Brochure PDF.
     """
     if not source_url or source_path.suffix.lower() != ".pdf":
@@ -464,10 +465,9 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
         # hits chunked extraction and must still recover hyperlinks.
         xlsx_links.enrich_records(r["records"], r["row_links"])
 
-    # Brochure-source PDFs (BC single-listing sheets, Breezblok, LLM
+    # Brochure-source PDFs (BC Current Availability, Breezblok, LLM
     # brochure uploads): when Brochure PDF is still blank, surface the
-    # hosted source PDF there. Skips availability schedules (rule:BC) and
-    # never applies to email/xlsx uploads.
+    # hosted source PDF there. Never applies to email/xlsx uploads.
     _seed_brochure_from_source_pdf(
         r["records"], source_path, source_url, r.get("method") or "", r.get("filename") or ""
     )
