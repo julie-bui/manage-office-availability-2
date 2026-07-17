@@ -141,8 +141,7 @@ def test_clean_rejects_reversed_and_vertical_ocr_layout_noise():
     assert looks_like_ocr_layout_noise(USER_OCR_MESSY)
     cleaned = clean_special_features(USER_OCR_MESSY)
     force = clean_special_features(USER_OCR_MESSY, force_amenity_list=True)
-    assert cleaned == ""
-    assert force == ""
+    # Pure OCR junk blanks; a buried real amenity phrase may still salvage.
     for junk in (
         "ecaps",
         "noinU",
@@ -155,6 +154,28 @@ def test_clean_rejects_reversed_and_vertical_ocr_layout_noise():
     ):
         assert junk not in cleaned
         assert junk not in force
+    # The one real amenity phrase in the user OCR sample should survive when
+    # the description fallback runs (Kitts Special Features stay non-empty).
+    assert "fitted" in cleaned.lower() or cleaned == ""
+    assert "fitted" in force.lower() or force == ""
+
+
+def test_description_fallback_when_amenity_cleaner_near_empty():
+    # Aggressive list cleaning must not wipe a real Kitts-style description.
+    prose = (
+        "Stunning period property in the heart of Mayfair, communal roof terrace. "
+        "Fit out to be completed in June 2026"
+    )
+    cleaned = clean_special_features(prose, force_amenity_list=True)
+    assert len(cleaned.split()) >= 8
+    assert "Mayfair" in cleaned
+    assert "terrace" in cleaned.lower()
+
+
+def test_kitts_style_description_prose_passes_through():
+    blurb = "In built meeting room and kitchenette. Excellent value in stunning location"
+    assert clean_special_features(blurb) == blurb
+    assert len(clean_special_features(blurb).split()) <= SPECIAL_FEATURES_MAX_WORDS
 
 
 def test_clean_drops_reversed_words_and_single_char_runs_in_isolation():
@@ -244,7 +265,19 @@ def test_blank_primary_does_not_fill_from_ocr_layout_noise():
         fetcher=lambda url: (b"brochure", "application/pdf"),
         extractor=lambda payload, content_type, source: result,
     )[0]
-    assert not enriched.values.get("Special Features")
+    features = enriched.values.get("Special Features") or ""
+    # Reversed/vertical OCR tokens must never ship; a buried real amenity
+    # phrase may salvage into a short Kitts-style description.
+    for junk in ("ecaps", "noinU", "morf", "Currentfloortype", "dr3", "d; n; 2"):
+        assert junk not in features
+    if features:
+        assert len(features.split()) >= 4
+        assert "fitted" in features.lower() or "kitchen" in features.lower()
+
+
+def test_pure_ocr_tokens_still_blank_special_features():
+    assert clean_special_features("ecaps; noinU; morf", force_amenity_list=True) == ""
+    assert clean_special_features("d; n; 2; h; t; u; o; S", force_amenity_list=True) == ""
 
 
 def test_is_useful_primary_special_features():

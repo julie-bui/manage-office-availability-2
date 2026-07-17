@@ -37,8 +37,16 @@ def test_short_state_of_space_unchanged():
     assert cap_state_of_space("") == ""
     assert cap_state_of_space(None) == ""
     assert clean_state_of_space("Immediate") == "Immediate"
-    assert clean_state_of_space("Cat A") == "Cat A"
+    assert clean_state_of_space("Cat A") == "CAT A"
     assert clean_state_of_space("Fully Fitted") == "Fully Fitted"
+
+
+def test_clean_state_of_space_status_only_blanks_prose_without_tag():
+    # Kitts State of Space is tag-or-blank — never keep long condition essays.
+    prose = "Bright dual-aspect floor with excellent natural light and a new kitchenette"
+    assert extract_state_of_space_status(prose) == ""
+    assert clean_state_of_space(prose) == ""
+    assert clean_state_of_space("Fully fitted floor ready for occupation") == "Fully Fitted"
 
 
 def test_extract_state_of_space_status_kitt_phrases():
@@ -75,6 +83,7 @@ def test_cap_state_of_space_ellipsis_without_sentence():
 
 
 def test_normalize_record_caps_state_of_space():
+    # Long condition prose without a status tag blanks (Kitts tag-or-blank).
     first = _words(20, "one") + "."
     second = _words(20, "two") + "."
     third = _words(30, "three") + "."
@@ -84,21 +93,15 @@ def test_normalize_record_caps_state_of_space():
             "State of Space": f"{first} {second} {third}",
         }
     )
-    state = record["State of Space"]
-    assert state == f"{first} {second}"
-    assert len(state.split()) <= STATE_OF_SPACE_MAX_WORDS
+    assert record["State of Space"] == ""
 
 
 def test_to_record_caps_state_of_space():
-    first = _words(20, "one") + "."
-    second = _words(20, "two") + "."
-    third = _words(30, "three") + "."
     record = normalize_record({"Building": "Example House"})
     prop = Property.from_record(record, "primary.xlsx", "GPE", "rule:GPE")
-    prop.values["State of Space"] = f"{first} {second} {third}"
+    prop.values["State of Space"] = "Fully fitted floor with terrace and meeting rooms"
     exported = prop.to_record()
-    assert exported["State of Space"] == f"{first} {second}"
-    assert len(exported["State of Space"].split()) <= STATE_OF_SPACE_MAX_WORDS
+    assert exported["State of Space"] == "Fully Fitted"
 
 
 def test_clean_state_of_space_messy_amenity_dump_without_status_is_blank():
@@ -162,6 +165,7 @@ def test_useful_primary_state_of_space_preferred_over_ocr_noise():
             "State of Space": "Cat A fitted",
         }
     )
+    assert primary["State of Space"] == "CAT A"
     prop = Property.from_record(primary, "primary.xlsx", "UNION", "rule:UNION")
     result = BrochureExtraction(
         BROCHURE,
@@ -176,8 +180,13 @@ def test_useful_primary_state_of_space_preferred_over_ocr_noise():
         fetcher=lambda url: (b"brochure", "application/pdf"),
         extractor=lambda payload, content_type, source: result,
     )[0]
-    assert enriched.values["State of Space"] == "Cat A fitted"
+    assert enriched.values["State of Space"] == "CAT A"
     assert not any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
+
+
+def test_useful_primary_state_of_space_normalizes_cat_a():
+    assert is_useful_primary_state_of_space("Cat A fitted")
+    assert clean_state_of_space("Cat A fitted") == "CAT A"
 
 
 def test_blank_primary_does_not_fill_state_of_space_from_ocr_noise():
