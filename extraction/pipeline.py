@@ -509,13 +509,19 @@ def process_files(
                     len(properties),
                 )
                 kwargs["deadline"] = time.monotonic()
+            memlog.log(
+                f"before brochure enrichment ({unique_brochure} unique URLs)",
+                filename,
+            )
             properties = brochure.enrich_properties(properties, **kwargs)
+            memlog.log("after brochure enrichment", filename)
             brochure_issues = [issue for prop in properties for issue in prop.issues if issue.stage.startswith(("brochure_", "linked_source_"))]
             report.record("BROCHURE_ENRICHMENT", "WARNING" if brochure_issues else "PASS", f"{len(brochure_issues)} linked-source issue(s)" if brochure_issues else "Optional linked-source enrichment complete", len(properties))
         normalized = [prop.values for prop in properties]
 
-        # Geocode only with surplus left before this file's enrichment
-        # deadline — never spend later files' brochure shares on Nominatim.
+        # Geocode only AFTER brochure enrichment (never loads Box/PDF bytes).
+        # Fair share of surplus left before this file's enrichment deadline —
+        # never spend later files' brochure shares on Nominatim.
         files_after = max(0, total_files - file_index - 1)
         if files_after > 0 and enrichment_deadline is not None:
             geocode_deadline = min(deadline, enrichment_deadline)

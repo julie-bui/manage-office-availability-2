@@ -78,8 +78,117 @@ def test_enrichment_rss_ceiling_stays_below_host_ram(ram_mb):
         assert parallel < ceiling
     else:
         # Unknown host: conservative defaults that trip before a 1GB kill.
-        assert ceiling <= 1024
+        assert ceiling <= 512
         assert parallel < ceiling
+
+
+def test_enrichment_memory_constrained_for_modest_rss_on_small_host():
+    assert brochure._enrichment_memory_constrained(100.0, hosted=True)
+    # Large host with low RSS and no hosted PDFs can stay unconstrained.
+    # (Function reads module _HOST_RAM_MB; patch it for this assertion.)
+    original = brochure._HOST_RAM_MB
+    try:
+        brochure._HOST_RAM_MB = 4096.0
+        assert not brochure._enrichment_memory_constrained(40.0, hosted=False)
+        brochure._HOST_RAM_MB = 1024.0
+        assert brochure._enrichment_memory_constrained(40.0, hosted=False)
+    finally:
+        brochure._HOST_RAM_MB = original
+
+
+def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
+    """Approaching OOM must skip remaining brochure URLs rather than SIGKILL."""
+    calls = {"n": 0}
+
+    def fake_rss():
+        calls["n"] += 1
+        # Worker sizing + first wave check stay under ceiling; after the first
+        # serial materialize, climb above the soft stop.
+        if calls["n"] <= 2:
+            return 50.0
+        return brochure._RSS_ENRICHMENT_CEILING_MB + 80
+
+    monkeypatch.setattr(brochure, "_rss_mb", fake_rss)
+    monkeypatch.setattr(brochure, "_enrichment_memory_constrained", lambda *a, **k: False)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_FETCH_WORKERS", 1)
+
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        return BrochureResource(b"%PDF-1.4 x", "application/pdf", url, url)
+
+    def extract(payload, content_type, final_url, **kwargs):
+        return BrochureExtraction(final_url, identity_text="Building EC1A 1AA")
+
+    props = []
+    for i in range(3):
+        props.append(
+            Property.from_record(
+                normalize_record(
+                    {
+                        "Building": f"Building {i}",
+                        "Property Postcode": "EC1A 1AA",
+                        "Brochure PDF": f"https://app.box.com/shared/static/union{i}.pdf",
+                    }
+                ),
+                "union.xlsx",
+                "UNION",
+                "rule:UNION",
+            )
+        )
+
+    brochure.enrich_properties(props, fetcher=fetch, extractor=extract)
+    assert len(fetched) == 1
+    skipped = [
+        d
+        for prop in props
+        for d in prop.link_diagnostics
+        if d.status == "LINK_ENRICHMENT_SKIPPED" and "RSS" in (d.detail or "")
+    ]
+    assert skipped
+    assert any("protect worker memory" in (i.message or "") for prop in props for i in prop.issues)
+
+
+def test_hosted_box_pdf_forces_light_extract_under_modest_rss(monkeypatch):
+    """UNION Box PDFs on ~1GB hosts must use light first-page extract kwargs."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    seen = []
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"%PDF-1.4 brochure", "application/pdf", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        seen.append(dict(kwargs))
+        return BrochureExtraction(
+            source_document,
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://app.box.com/shared/static/abc123.pdf",
+            }
+        ),
+        "union.xlsx",
+        "UNION",
+        "rule:UNION",
+    )
+    # Pass the real extract_brochure name so _retrieve takes the light kwargs path.
+    brochure.enrich_properties(
+        [prop],
+        fetcher=fetch,
+        extractor=brochure.extract_brochure,
+    )
+    assert seen
+    assert seen[0].get("max_pages") == brochure._LIGHT_MAX_PAGES
+    assert seen[0].get("max_photos") == brochure._LIGHT_MAX_PHOTOS
 
 
 def test_retrieve_prefers_html_gallery_and_limits_nested_pdf_photos(monkeypatch):

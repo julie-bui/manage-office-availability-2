@@ -13,6 +13,7 @@ import json
 from io import BytesIO
 import os
 import re
+import threading
 import time
 from typing import Callable, Iterable, List
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -110,19 +111,33 @@ def _default_fetch_workers(host_ram_mb: float) -> int:
 def _default_parallel_rss_mb(host_ram_mb: float) -> float:
     if host_ram_mb >= 4000:
         return 2400.0
+    if host_ram_mb >= 1800:
+        return max(250.0, host_ram_mb * 0.35)
     if host_ram_mb > 0:
-        return max(250.0, host_ram_mb * 0.4)
-    # Unknown host → assume moderate Railway, serialize early.
-    return 400.0
+        # 512MB–1.5GB Railway: serialize before the first large Box PDF.
+        return max(120.0, host_ram_mb * 0.28)
+    # Unknown host → assume ~1GB Railway, serialize early.
+    return 180.0
 
 
 def _default_rss_ceiling_mb(host_ram_mb: float) -> float:
     if host_ram_mb >= 6000:
         return 6144.0
+    if host_ram_mb >= 1800:
+        return max(400.0, host_ram_mb * 0.72)
     if host_ram_mb > 0:
-        return max(400.0, host_ram_mb * 0.78)
-    # Unknown host → stop before a typical 1GB container hard-kill.
-    return 768.0
+        # Leave headroom before the container SIGKILL line on ~1GB Railway.
+        # Confirmed real (2026-07, UNION): full Box PDF decode after
+        # rule:UNION at ~100 MiB still jumped past a high ceiling and died.
+        return max(260.0, host_ram_mb * 0.52)
+    # Unknown host → stop well before a typical 1GB hard-kill.
+    return 420.0
+
+
+# Serialize pdfplumber/fitz decodes whenever RSS is under 1.5GB (typical
+# Railway) so two ~22MB UNION Box PDFs never decode at once.
+_PDF_DECODE_LOCK = threading.Lock()
+_PDF_DECODE_SERIALIZE_BELOW_RSS_MB = 1536.0
 
 
 _HOST_RAM_MB = _detect_host_ram_mb()
@@ -329,13 +344,22 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
                     effective_timeout = max(float(timeout), _HOSTED_PDF_FETCH_TIMEOUT_SECONDS)
             else:
                 effective_timeout = request_timeout
-            response = requests.get(current, timeout=effective_timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
+            # Stream one body at a time so response.content and a second
+            # join buffer never coexist for large UNION Box PDFs.
+            response = requests.get(
+                current,
+                timeout=effective_timeout,
+                headers={"User-Agent": "OfficeAvailability/1.0"},
+                allow_redirects=False,
+                stream=True,
+            )
         except requests.Timeout as exc:
             raise LinkedResourceError("Linked resource timed out", "LINK_TIMEOUT", current) from exc
         except requests.RequestException as exc:
             raise LinkedResourceError(f"Linked resource request failed: {exc}", "LINK_ENRICHMENT_FAILED", current) from exc
         if response.status_code in {301, 302, 303, 307, 308}:
             location = response.headers.get("Location")
+            response.close()
             if not location:
                 raise LinkedResourceError("Linked-resource redirect did not provide a destination", "LINK_ENRICHMENT_FAILED", current)
             destination = urljoin(current, location)
@@ -345,20 +369,41 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
             current = destination
             continue
         if response.status_code in {401, 403}:
+            response.close()
             raise LinkedResourceError("Linked resource denied access", "LINK_ACCESS_DENIED", current)
         if response.status_code in {404, 410}:
+            response.close()
             raise LinkedResourceError("Linked resource was not found", "LINK_NOT_FOUND", current)
         if response.status_code == 429:
+            response.close()
             raise LinkedResourceError("Linked resource rate limited enrichment", "LINK_RATE_LIMITED", current)
         if response.status_code >= 400:
-            raise LinkedResourceError(f"Linked resource returned HTTP {response.status_code}", "LINK_ENRICHMENT_FAILED", current)
+            code = response.status_code
+            response.close()
+            raise LinkedResourceError(f"Linked resource returned HTTP {code}", "LINK_ENRICHMENT_FAILED", current)
         break
     else:
         raise LinkedResourceError("Linked resource exceeded the redirect limit", "LINK_ENRICHMENT_FAILED", current)
-    payload = response.content
+    content_type = response.headers.get("Content-Type", "")
+    final_url = response.url or current
+    chunks = []
+    total = 0
+    try:
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_BROCHURE_BYTES:
+                raise LinkedResourceError("Linked resource exceeds the 30MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+    finally:
+        response.close()
+        chunks.clear()
+        del chunks
     if len(payload) > MAX_BROCHURE_BYTES:
         raise LinkedResourceError("Linked resource exceeds the 30MB enrichment limit", "LINK_ENRICHMENT_SKIPPED", current)
-    return BrochureResource(payload, response.headers.get("Content-Type", ""), response.url or current, url, tuple(redirects))
+    return BrochureResource(payload, content_type, final_url, url, tuple(redirects))
 
 
 
@@ -452,36 +497,44 @@ def extract_brochure(
         return _extract_direct_image(payload, content_type, source_document)
     if resource_type != "pdf":
         raise LinkedResourceError("Linked resource type is unsupported", "LINK_UNSUPPORTED", source_document)
-    import pdfplumber
 
-    text_parts = []
-    links = []
-    page_limit = None if max_pages is None else max(1, int(max_pages))
-    with pdfplumber.open(BytesIO(payload)) as pdf:
-        pages = pdf.pages if page_limit is None else pdf.pages[:page_limit]
-        for page_number, page in enumerate(pages, start=1):
-            text_parts.append(page.extract_text() or "")
-            for annotation in page.annots or []:
-                uri = (annotation.get("data") or {}).get("URI") or annotation.get("uri")
-                if uri:
-                    links.append(AssetCandidate(uri, source_document, page_number=page_number))
-    text = "\n".join(text_parts)
-    fields = _extract_fields(text, source_document)
-    return BrochureExtraction(
-        source_document,
-        fields,
-        classify_candidates(links)
-        + _extract_pdf_visuals(
-            payload,
+    def _decode_pdf() -> BrochureExtraction:
+        import pdfplumber
+
+        text_parts = []
+        links = []
+        page_limit = None if max_pages is None else max(1, int(max_pages))
+        with pdfplumber.open(BytesIO(payload)) as pdf:
+            pages = pdf.pages if page_limit is None else pdf.pages[:page_limit]
+            for page_number, page in enumerate(pages, start=1):
+                text_parts.append(page.extract_text() or "")
+                for annotation in page.annots or []:
+                    uri = (annotation.get("data") or {}).get("URI") or annotation.get("uri")
+                    if uri:
+                        links.append(AssetCandidate(uri, source_document, page_number=page_number))
+        text = "\n".join(text_parts)
+        fields = _extract_fields(text, source_document)
+        return BrochureExtraction(
             source_document,
-            text_parts,
-            max_photos=max_photos,
-            stop_after_floorplans=stop_after_floorplans,
-            prefer_photos=prefer_photos,
-            max_pages=max_pages,
-        ),
-        identity_text=text,
-    )
+            fields,
+            classify_candidates(links)
+            + _extract_pdf_visuals(
+                payload,
+                source_document,
+                text_parts,
+                max_photos=max_photos,
+                stop_after_floorplans=stop_after_floorplans,
+                prefer_photos=prefer_photos,
+                max_pages=max_pages,
+            ),
+            identity_text=text,
+        )
+
+    # Hard cap concurrent PDF decodes to 1 under 1.5GB RSS / small hosts.
+    if _pdf_decode_must_serialize():
+        with _PDF_DECODE_LOCK:
+            return _decode_pdf()
+    return _decode_pdf()
 
 
 def _resource_type(payload: bytes, content_type: str) -> str:
@@ -1381,6 +1434,40 @@ def _rss_mb() -> float:
         return 0.0
 
 
+def _pdf_decode_must_serialize(rss: float = None) -> bool:
+    """Hard-cap concurrent PDF decodes to 1 under 1.5GB RSS / small hosts."""
+    if _HOST_RAM_MB and _HOST_RAM_MB < _PDF_DECODE_SERIALIZE_BELOW_RSS_MB:
+        return True
+    current = _rss_mb() if rss is None else rss
+    return current < _PDF_DECODE_SERIALIZE_BELOW_RSS_MB
+
+
+def _enrichment_memory_constrained(rss: float = None, hosted: bool = False) -> bool:
+    """True when Box/PDF enrichment should stay serial + light-first-page.
+
+    Modest RSS after rule:UNION (~100 MiB) is already "tight" on a 512MB–1GB
+    Railway worker — waiting for the soft ceiling lets one full 22MB decode
+    SIGKILL the process.
+    """
+    current = _rss_mb() if rss is None else rss
+    if _HOST_RAM_MB and _HOST_RAM_MB < 1536:
+        return True
+    if current >= _ENRICHMENT_PARALLEL_RSS_MB:
+        return True
+    if hosted and (not _HOST_RAM_MB or _HOST_RAM_MB < 2048) and current >= 50:
+        return True
+    return False
+
+
+def _memlog_enrichment(checkpoint: str, filename: str = "") -> None:
+    try:
+        from . import memlog
+
+        memlog.log(checkpoint, filename)
+    except Exception:
+        pass
+
+
 def _usable_floor_plan_value(values) -> str:
     plan = str(values.get("Floor Plan") or "").strip()
     if not plan or _is_viewer_floorplan_url(plan):
@@ -1503,6 +1590,37 @@ def enrich_properties(
             prop.add_issue(ValidationIssue("Brochure PDF", "Linked-source enrichment was skipped because the bounded batch enrichment budget was exhausted.", Severity.INFO, brochure_url, "Primary extraction remains valid; process this file alone for another enrichment attempt.", "linked_source_enrichment"))
             _seed_high_res_fallback(prop, brochure_url)
 
+    def _skip_remaining_for_memory(start_index, exclude=()):
+        rss_now = _rss_mb()
+        detail = (
+            f"Skipped to keep process RSS under {_RSS_ENRICHMENT_CEILING_MB:.0f} MiB "
+            f"(now {rss_now:.0f} MiB)."
+        )
+        skipped = 0
+        for brochure_url in pending[start_index:]:
+            if brochure_url in exclude:
+                continue
+            for _, prop, _ in by_url[brochure_url]:
+                _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail=detail)
+                prop.add_issue(
+                    ValidationIssue(
+                        "Brochure PDF",
+                        "Linked-source enrichment was skipped to protect worker memory.",
+                        Severity.INFO,
+                        brochure_url,
+                        "Primary extraction remains valid; process this file alone on a larger instance if photos are missing.",
+                        "linked_source_enrichment",
+                    )
+                )
+                _seed_high_res_fallback(prop, brochure_url)
+            skipped += 1
+        _memlog_enrichment(
+            f"brochure enrichment RSS skip "
+            f"(ceiling={_RSS_ENRICHMENT_CEILING_MB:.0f} MiB, now={rss_now:.0f} MiB, "
+            f"skipped_urls={skipped})"
+        )
+        return skipped
+
     pending = []
     skip_complete = len(unique_urls) >= _SKIP_COMPLETE_WHEN_UNIQUE_GE
     for brochure_url in unique_urls:
@@ -1538,15 +1656,23 @@ def enrich_properties(
         for url in pending
     )
     rss = _rss_mb()
+    memory_constrained = _enrichment_memory_constrained(rss, hosted_pending)
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
     # Always serialize when RSS is already high — not only for hosted PDFs.
     # Confirmed real (Railway GPE): parallel HTML→nested-PDF waves OOM'd
     # while hosted_pending was False, so the old guard never fired.
-    if rss >= _ENRICHMENT_PARALLEL_RSS_MB:
+    # Confirmed real (Railway UNION, 2026-07): after rule:UNION at ~100 MiB
+    # RSS, serial + light Box extracts are required on ~1GB hosts.
+    if memory_constrained or rss >= _ENRICHMENT_PARALLEL_RSS_MB:
         workers = 1
     elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
         workers = min(workers, 1)
     wave_size = max(1, workers)
+    _memlog_enrichment(
+        f"brochure enrichment start ({len(pending)} unique URLs, "
+        f"workers={workers}, hosted={int(hosted_pending)}, "
+        f"light={int(memory_constrained and hosted_pending)})"
+    )
 
     def _apply_result(brochure_url, extraction):
         shared_embeds = None
@@ -1652,41 +1778,33 @@ def enrich_properties(
             and remaining < _LIGHT_PDF_REMAINING_SECONDS * 2
         ):
             light_pdf = True
+        rss = _rss_mb()
+        # Force light first-page Box/Drive extracts under modest RSS / small
+        # hosts — full pdfplumber+fitz on a 22MB UNION PDF SIGKILL'd ~1GB
+        # Railway after rule:UNION (confirmed 2026-07).
+        if _enrichment_memory_constrained(rss, hosted_pending) and hosted_pending:
+            light_pdf = True
         if deadline is not None and remaining <= _SKIP_WAVE_REMAINING_SECONDS:
             for brochure_url in pending[wave_start:]:
                 _skip_url(brochure_url)
             break
-        rss = _rss_mb()
         if rss >= _RSS_ENRICHMENT_CEILING_MB:
-            for brochure_url in pending[wave_start:]:
-                for _, prop, _ in by_url[brochure_url]:
-                    _record_diagnostic(
-                        prop,
-                        "LINK_ENRICHMENT_SKIPPED",
-                        brochure_url,
-                        detail=f"Skipped to keep process RSS under {_RSS_ENRICHMENT_CEILING_MB:.0f} MiB (now {rss:.0f} MiB).",
-                    )
-                    prop.add_issue(
-                        ValidationIssue(
-                            "Brochure PDF",
-                            "Linked-source enrichment was skipped to protect worker memory.",
-                            Severity.INFO,
-                            brochure_url,
-                            "Primary extraction remains valid; process this file alone on a larger instance if photos are missing.",
-                            "linked_source_enrichment",
-                        )
-                    )
-                    _seed_high_res_fallback(prop, brochure_url)
+            _skip_remaining_for_memory(wave_start)
             break
         # Shrink wave when RSS is climbing so several large PDFs do not land together.
         effective_wave = wave_size
-        if rss >= _ENRICHMENT_PARALLEL_RSS_MB:
+        if _enrichment_memory_constrained(rss, hosted_pending) or rss >= _ENRICHMENT_PARALLEL_RSS_MB:
             effective_wave = 1
         elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
             effective_wave = 1
         wave = pending[wave_start : wave_start + effective_wave]
         prefer_photos = any(
             _floor_plan_already_seeded(prop) for brochure_url in wave for _, prop, _ in by_url[brochure_url]
+        )
+        # Under memory pressure, skip optional nested deepening even on HTML
+        # seeds — Box/Drive must_follow downloads still run lightly.
+        skip_nested = html_only or (
+            _enrichment_memory_constrained(rss, hosted_pending) and not hosted_pending
         )
 
         def _run_retrieve(brochure_url):
@@ -1695,11 +1813,12 @@ def enrich_properties(
                 fetcher,
                 extractor,
                 deadline,
-                skip_nested_documents=html_only,
+                skip_nested_documents=skip_nested,
                 light_pdf=light_pdf,
                 prefer_photos=prefer_photos or light_pdf,
             )
 
+        stop_for_memory = False
         if len(wave) == 1:
             brochure_url = wave[0]
             try:
@@ -1708,11 +1827,17 @@ def enrich_properties(
                 result = exc
             _apply_result(brochure_url, result)
             gc.collect()
+            # One Box PDF can push RSS near the kill line; prefer partial
+            # media over SIGKILL for the rest of the unique-URL backlog.
+            if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB:
+                _skip_remaining_for_memory(wave_start + 1)
+                break
             continue
         # Wait for the wave to finish (requests timeouts already respect
         # `deadline`). Abandoned wait=False workers kept downloading UNION /
         # Drive PDFs into the next file's enrichment window and starved
         # Knotel's lighter HTML gallery fetches (confirmed 2026-07 4-file batch).
+        applied = set()
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
             futures = {
                 pool.submit(_run_retrieve, brochure_url): brochure_url
@@ -1725,9 +1850,19 @@ def enrich_properties(
                 except Exception as exc:
                     result = exc
                 _apply_result(brochure_url, result)
+                applied.add(brochure_url)
                 gc.collect()
+                if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB:
+                    stop_for_memory = True
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    break
+        if stop_for_memory:
+            _skip_remaining_for_memory(wave_start, exclude=applied)
+            break
     # Brochure document URLs stay on Brochure PDF only — never seed High Res.
     _share_underfilled_building_photos(properties)
+    _memlog_enrichment(f"brochure enrichment end ({len(pending)} unique URLs attempted)")
     return properties
 
 
@@ -1900,7 +2035,10 @@ def _retrieve(
     if skip_nested_documents:
         documents = [u for u in documents if _is_hosted_document_download(u)][:1]
     rss_now = _rss_mb()
-    memory_tight = rss_now >= _ENRICHMENT_PARALLEL_RSS_MB
+    memory_tight = (
+        rss_now >= _ENRICHMENT_PARALLEL_RSS_MB
+        or _enrichment_memory_constrained(rss_now, hosted=any(_is_hosted_document_download(u) for u in documents))
+    )
     # When HTML already supplies High Res, prefer those photos and only
     # lightly pull nested PDFs for a floor plan. Decoding marketing photos
     # again from large landlord PDFs spikes RSS on moderate Railway
@@ -1924,10 +2062,14 @@ def _retrieve(
     else:
         nested_max_photos = None if need_nested_photos else 0
         nested_stop_plans = None if need_nested_photos else 1
+        if memory_tight and need_nested_photos:
+            # Memory-tight HTML pages: at most one nested PDF, light decode.
+            documents = documents[:1]
     if light_pdf and need_nested_photos:
         nested_max_photos = _LIGHT_MAX_PHOTOS
-    # Prefer light page scan when we only need a floor plan from nested PDF.
-    nested_light_pages = light_pdf or (html_gallery_ready and not need_nested_photos)
+    # Prefer light page scan when we only need a floor plan from nested PDF,
+    # or when RSS/host headroom is already modest.
+    nested_light_pages = light_pdf or memory_tight or (html_gallery_ready and not need_nested_photos)
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(

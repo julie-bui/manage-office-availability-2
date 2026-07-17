@@ -4,6 +4,10 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
+    # --workers 1: required for memory-heavy Box/Drive brochure enrichment.
+    # Each gunicorn worker has its own RSS; two workers on a 1GB Railway
+    # service roughly halves the headroom available per request.
+    #
     # --timeout 960: paid Railway high-RAM path (was 120/180 for Render/early
     # Railway). Must stay above BATCH_DEADLINE_SECONDS (default 900) so
     # multi-file Box/Drive brochure PDF embed extraction can finish.
@@ -12,7 +16,7 @@ services:
     # thrash loop seen at max-requests 3 (worker restarting every request).
     # IMPORTANT: if the host Dashboard "Start Command" is set, it OVERRIDES
     # this file — update Railway/Render start command to match Procfile.
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 960 --max-requests 20 --max-requests-jitter 5
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 960 --max-requests 20 --max-requests-jitter 5
     envVars:
       - key: GEMINI_API_KEY
         sync: false

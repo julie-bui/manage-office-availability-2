@@ -412,7 +412,11 @@ that a redeploy alone doesn't (a redeploy just pulls the same stale S3
 copy back down) — no restart needed. That relies on this app running as
 a single gunicorn worker (see `Procfile`/`render.yaml`); with multiple
 workers, one call here would only clear whichever worker happened to
-handle that request.
+handle that request. **Keep `--workers 1` on Railway/Render** — brochure
+PDF enrichment (UNION Box / Drive) is memory-heavy, and each worker has
+its own RSS. Prefer **≥2GB RAM** for UNION-style sheets with many unique
+Box PDFs; on ~1GB, upload that file alone so enrichment can finish (or
+partially finish) without competing with other files.
 
 ## Adding a new source
 
