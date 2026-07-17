@@ -36,7 +36,11 @@ from .models import (
     Severity,
     ValidationIssue,
 )
-from .text_utils import cap_special_features
+from .text_utils import (
+    clean_special_features,
+    is_useful_primary_special_features,
+    looks_like_long_or_messy_features,
+)
 
 # Raised from 20MB after confirming real UNION Box shared brochures arrive
 # as ~22MB PDFs via app.box.com/shared/static/{id}.pdf — the previous
@@ -956,7 +960,10 @@ def _extract_fields(text: str, source_document: str):
         elif value and field not in _ADDRESS_LOCKED_FIELDS:
             fields[field] = _evidence(value, source_document, 0.72)
     if feature_parts:
-        features = cap_special_features(_dedupe_text("; ".join(feature_parts)))
+        features = clean_special_features(
+            _dedupe_text("; ".join(feature_parts)),
+            force_amenity_list=True,
+        )
         fields["Special Features"] = _evidence(features, source_document, 0.74)
 
     if "Min. Term" not in fields:
@@ -2272,6 +2279,17 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
                 )
             )
         return
+    # Prefer short/useful primary sheet Special Features over long brochure essays.
+    if (
+        field == "Special Features"
+        and existing not in (None, "")
+        and is_useful_primary_special_features(existing)
+    ):
+        if _equivalent(existing, incoming):
+            return
+        if looks_like_long_or_messy_features(incoming):
+            return
+        # Two short competing notes — keep primary and flag for review below.
     if existing in (None, ""):
         if evidence.confidence >= BROCHURE_RELIABLE_CONFIDENCE:
             _set_value(prop, field, evidence)
@@ -2296,7 +2314,7 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
 def _set_value(prop: Property, field: str, evidence: ExtractedValue) -> None:
     value = _dedupe_text(evidence.value) if isinstance(evidence.value, str) and ";" in evidence.value else evidence.value
     if field == "Special Features" and isinstance(value, str):
-        value = cap_special_features(value)
+        value = clean_special_features(value, force_amenity_list=True)
     prop.values[field] = value
     prop.provenance[field] = FieldProvenance(
         source=evidence.source,
