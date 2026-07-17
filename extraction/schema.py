@@ -6,6 +6,7 @@ and the PCM/PSF relationship used across all three example sources.
 import re
 
 from .address import extract_postcode
+from .text_utils import cap_special_features
 
 # Fields a rule parser or the LLM fallback actually extracts from a source
 # document — must match the example output.
@@ -82,6 +83,9 @@ def normalize_record(record):
     for k, v in record.items():
         if k.startswith("_"):
             out[k] = v
+
+    # Cap long brochure amenity/description dumps; short notes stay intact.
+    out["Special Features"] = cap_special_features(out["Special Features"])
 
     out["Size (sq ft)"] = _to_number(out["Size (sq ft)"])
     out["Desks (max)"] = _to_number(out["Desks (max)"])

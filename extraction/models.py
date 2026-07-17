@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .text_utils import cap_special_features
+
 
 class Severity(str, Enum):
     INFO = "info"
@@ -182,6 +184,10 @@ class Property:
 
     def to_record(self) -> Dict[str, Any]:
         record = dict(self.values)
+        # Brochure enrichment can fill Special Features after normalize_record;
+        # cap again at export so every spreadsheet row benefits.
+        if "Special Features" in record:
+            record["Special Features"] = cap_special_features(record.get("Special Features"))
         record["_source_file"] = self.source_file_name
         record["_source_file_name"] = self.source_file_name
         record["_source_file_url"] = self.source_file_url

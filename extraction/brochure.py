@@ -35,6 +35,7 @@ from .models import (
     Severity,
     ValidationIssue,
 )
+from .text_utils import cap_special_features
 
 # Raised from 20MB after confirming real UNION Box shared brochures arrive
 # as ~22MB PDFs via app.box.com/shared/static/{id}.pdf — the previous
@@ -902,7 +903,8 @@ def _extract_fields(text: str, source_document: str):
         elif value and field not in _ADDRESS_LOCKED_FIELDS:
             fields[field] = _evidence(value, source_document, 0.72)
     if feature_parts:
-        fields["Special Features"] = _evidence(_dedupe_text("; ".join(feature_parts)), source_document, 0.74)
+        features = cap_special_features(_dedupe_text("; ".join(feature_parts)))
+        fields["Special Features"] = _evidence(features, source_document, 0.74)
 
     if "Min. Term" not in fields:
         term = _find_min_term(text)
@@ -2151,6 +2153,8 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
 
 def _set_value(prop: Property, field: str, evidence: ExtractedValue) -> None:
     value = _dedupe_text(evidence.value) if isinstance(evidence.value, str) and ";" in evidence.value else evidence.value
+    if field == "Special Features" and isinstance(value, str):
+        value = cap_special_features(value)
     prop.values[field] = value
     prop.provenance[field] = FieldProvenance(
         source=evidence.source,
