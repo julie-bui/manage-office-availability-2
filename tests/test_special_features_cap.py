@@ -29,9 +29,9 @@ def _words(n, stem="word"):
     return " ".join(f"{stem}{i}" for i in range(n))
 
 
-def test_special_features_max_is_fifty_words():
-    assert SPECIAL_FEATURES_MAX_WORDS == 50
-    assert SPECIAL_FEATURES_AMENITY_MAX_WORDS == 50
+def test_special_features_max_is_one_hundred_words():
+    assert SPECIAL_FEATURES_MAX_WORDS == 100
+    assert SPECIAL_FEATURES_AMENITY_MAX_WORDS == 100
 
 
 def test_short_special_features_unchanged():
@@ -45,10 +45,10 @@ def test_short_special_features_unchanged():
 
 
 def test_cap_stops_at_last_sentence_boundary_at_or_before_max_words():
-    # Two short sentences under 50 words, third pushes over — keep first two.
-    first = _words(18, "alpha") + "."
-    second = _words(18, "beta") + "."
-    third = _words(20, "gamma") + "."
+    # Two sentences under 100 words, third pushes over — keep first two.
+    first = _words(40, "alpha") + "."
+    second = _words(40, "beta") + "."
+    third = _words(40, "gamma") + "."
     text = f"{first} {second} {third}"
     assert len(text.split()) > SPECIAL_FEATURES_MAX_WORDS
 
@@ -61,12 +61,12 @@ def test_cap_stops_at_last_sentence_boundary_at_or_before_max_words():
 
 
 def test_cap_stops_at_last_complete_amenity_item():
-    # Semicolon amenities: keep whole items under 50 words, never mid-phrase.
+    # Semicolon amenities: keep whole items under 100 words, never mid-phrase.
     items = [
-        _words(12, "one"),
-        _words(12, "two"),
-        _words(12, "three"),
-        _words(20, "four"),
+        _words(30, "one"),
+        _words(30, "two"),
+        _words(30, "three"),
+        _words(30, "four"),
     ]
     text = "; ".join(items)
     assert len(text.split()) > SPECIAL_FEATURES_MAX_WORDS
@@ -78,14 +78,14 @@ def test_cap_stops_at_last_complete_amenity_item():
 
 
 def test_cap_prefers_richer_complete_boundary():
-    # Sentence boundary keeps more words than an earlier amenity cut would.
-    first = _words(20, "alpha") + "."
-    second = _words(20, "beta") + "."
-    third = _words(20, "gamma") + "."
+    # Sentence boundary keeps more words than truncating mid-dump would.
+    first = _words(40, "alpha") + "."
+    second = _words(40, "beta") + "."
+    third = _words(40, "gamma") + "."
     text = f"{first} {second} {third}"
     capped = cap_special_features(text)
     assert capped == f"{first} {second}"
-    assert len(capped.split()) == 40
+    assert len(capped.split()) == 80
 
 
 def test_cap_falls_back_to_word_limit_with_ellipsis_without_sentence():
@@ -98,9 +98,9 @@ def test_cap_falls_back_to_word_limit_with_ellipsis_without_sentence():
 
 
 def test_normalize_record_caps_special_features():
-    first = _words(18, "one") + "."
-    second = _words(18, "two") + "."
-    third = _words(20, "three") + "."
+    first = _words(40, "one") + "."
+    second = _words(40, "two") + "."
+    third = _words(40, "three") + "."
     record = normalize_record(
         {
             "Building": "Example House",

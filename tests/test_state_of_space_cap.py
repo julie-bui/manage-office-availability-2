@@ -27,6 +27,10 @@ def _words(n, stem="word"):
     return " ".join(f"{stem}{i}" for i in range(n))
 
 
+def test_state_of_space_max_is_under_fifty_words():
+    assert STATE_OF_SPACE_MAX_WORDS == 50
+
+
 def test_short_state_of_space_unchanged():
     assert cap_state_of_space("Immediate") == "Immediate"
     assert cap_state_of_space("Fully fitted") == "Fully fitted"
@@ -48,9 +52,9 @@ def test_extract_state_of_space_status_kitt_phrases():
 
 
 def test_cap_prose_field_shared_by_state_of_space():
-    first = _words(80, "alpha") + "."
-    second = _words(80, "beta") + "."
-    third = _words(120, "gamma") + "."
+    first = _words(20, "alpha") + "."
+    second = _words(20, "beta") + "."
+    third = _words(30, "gamma") + "."
     text = f"{first} {second} {third}"
     assert len(text.split()) > STATE_OF_SPACE_MAX_WORDS
 
@@ -71,9 +75,9 @@ def test_cap_state_of_space_ellipsis_without_sentence():
 
 
 def test_normalize_record_caps_state_of_space():
-    first = _words(100, "one") + "."
-    second = _words(100, "two") + "."
-    third = _words(100, "three") + "."
+    first = _words(20, "one") + "."
+    second = _words(20, "two") + "."
+    third = _words(30, "three") + "."
     record = normalize_record(
         {
             "Building": "Example House",
@@ -86,9 +90,9 @@ def test_normalize_record_caps_state_of_space():
 
 
 def test_to_record_caps_state_of_space():
-    first = _words(100, "one") + "."
-    second = _words(100, "two") + "."
-    third = _words(100, "three") + "."
+    first = _words(20, "one") + "."
+    second = _words(20, "two") + "."
+    third = _words(30, "three") + "."
     record = normalize_record({"Building": "Example House"})
     prop = Property.from_record(record, "primary.xlsx", "GPE", "rule:GPE")
     prop.values["State of Space"] = f"{first} {second} {third}"

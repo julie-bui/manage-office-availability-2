@@ -1,17 +1,17 @@
 import re
 
-# Special Features soft cap (Kitt-aligned): ~50 words, ending on a complete
+# Special Features soft cap (Kitt-aligned): ~100 words, ending on a complete
 # sentence or complete `;`-separated amenity phrase — never mid-word/phrase.
-SPECIAL_FEATURES_MAX_WORDS = 50
-SPECIAL_FEATURES_AMENITY_MAX_WORDS = 50
+SPECIAL_FEATURES_MAX_WORDS = 100
+SPECIAL_FEATURES_AMENITY_MAX_WORDS = 100
 # Amenity-list item count when cleaning brochure / semicolon dumps.
 SPECIAL_FEATURES_AMENITY_MAX_ITEMS = 12
 # Primary sheet notes at or under this word count are preferred over brochure essays.
 SPECIAL_FEATURES_SHORT_MAX_WORDS = 40
 
-# State of Space: mirror clean/cap treatment; soft prose backstop stays ~250
-# while messy OCR prefers compact fit-out status tags (Kitt template style).
-STATE_OF_SPACE_MAX_WORDS = 250
+# State of Space: Kitt template style — short availability/condition notes
+# (typically 2–7 words; soft cap under 50). Prefer status tags; reject OCR junk.
+STATE_OF_SPACE_MAX_WORDS = 50
 STATE_OF_SPACE_SHORT_MAX_WORDS = 40
 PROSE_FIELD_MAX_WORDS = SPECIAL_FEATURES_MAX_WORDS
 
@@ -320,7 +320,7 @@ def clean_prose_or_amenity_field(text, *, force_amenity_list=False, max_words=SP
 
     Short useful notes (price drops, desk extras, "Fitted", "Immediate") pass
     through. Semicolon amenity dumps and forced brochure fills are
-    artifact-cleaned, truncated to ~12 items / ~50 words, then boundary-capped
+    artifact-cleaned, truncated to ~12 items / ~100 words, then boundary-capped
     as a backstop. Brochure OCR layout noise (reversed words, exploded
     vertical labels, glued sheet headers) is dropped; fills that are mostly
     garbage go blank. Sentence prose without amenity separators is left for
@@ -398,8 +398,8 @@ def clean_state_of_space(text, *, force_amenity_list=False):
     Prefers compact status tags (Fully Fitted, Fitout Underway, CAT A …)
     over amenity-list essays. OCR noise and long brochure dumps without a
     status phrase are blanked rather than shipped as amenity lists. Short
-    primary notes pass through; remaining prose is soft-capped (~250 words)
-    on a complete sentence boundary.
+    primary notes pass through; remaining prose is soft-capped (under 50 words)
+    on a complete sentence or amenity boundary.
     """
     if text is None:
         return ""
@@ -415,6 +415,9 @@ def clean_state_of_space(text, *, force_amenity_list=False):
     messy = force_amenity_list or _looks_like_amenity_dump(text)
     if messy:
         # Status tag wins; otherwise do not dump amenities into this column.
+        return status
+    # Over-long condition prose: prefer a compact status tag when present.
+    if status and len(text.split()) > STATE_OF_SPACE_MAX_WORDS:
         return status
     # Short notes (Immediate, Cat A, Fully Fitted) and light condition prose.
     return cap_prose_field(text, max_words=STATE_OF_SPACE_MAX_WORDS)
