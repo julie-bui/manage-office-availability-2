@@ -348,11 +348,12 @@ def test_small_host_keeps_html_gallery_skips_nested_pdf(monkeypatch):
 
 
 def test_small_host_follows_floorplan_modal_for_plan_image(monkeypatch):
-    """GPE Umbraco floorplan modals must resolve on 1GB soft-skip (no brochure PDF).
+    """GPE regression: Umbraco floorplan modals resolve on 1GB soft-skip.
 
     Portfolio pages expose plans via data-modal-path=/umbraco/surface/floorplan?…
     which returns a tiny HTML fragment with *floorplan*.jpg / *.pdf — not a
     static floorplans.pdf href. Soft-skip must still follow that modal.
+    Shared brochure path — not a GPE rule gate.
     """
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
     monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
@@ -409,6 +410,120 @@ def test_small_host_follows_floorplan_modal_for_plan_image(monkeypatch):
     assert listing in fetched
     assert any("umbraco/surface/floorplan" in u for u in fetched)
     assert not any(u.endswith(".pdf") for u in fetched)
+    assert prop.values.get("Floor Plan") == plan_jpg
+    assert prop.values.get("Brochure PDF") == brochure_pdf
+
+
+def test_small_host_light_floorplan_discovery_any_provider(monkeypatch):
+    """Shared soft-skip path: light floor-plan HTML works for unknown providers.
+
+    LLM-fallback / no dedicated rule — only a Brochure PDF HTML seed. Uses
+    hyphenated /floor-plan/ modal path + data-href (not GPE data-modal-path).
+    """
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+
+    listing = "https://landlord.example/properties/north-wing"
+    modal = "https://landlord.example/floor-plan/modal?id=42"
+    plan_png = "https://cdn.landlord.example/assets/north-wing-floor-plan.png"
+    brochure_pdf = "https://cdn.landlord.example/assets/north-wing-brochure.pdf"
+    fetched = []
+
+    listing_html = f"""
+    <html><body><main>
+      <img src="https://cdn.landlord.example/assets/a.jpg" alt="office" />
+      <img src="https://cdn.landlord.example/assets/b.jpg" alt="office" />
+      <img src="https://cdn.landlord.example/assets/c.jpg" alt="office" />
+      <img src="https://cdn.landlord.example/assets/d.jpg" alt="office" />
+      <img src="https://cdn.landlord.example/assets/e.jpg" alt="office" />
+      <a href="{brochure_pdf}">Download brochure</a>
+      <button type="button" class="open-floorplan"
+              data-href="/floor-plan/modal?id=42">View plan</button>
+    </main></body></html>
+    """
+    modal_html = f"""
+    <section class="plan-viewer">
+      <img src="{plan_png}" alt="North Wing floor plan" />
+    </section>
+    """
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if "floor-plan/modal" in url:
+            return BrochureResource(modal_html.encode(), "text/html", modal, url)
+        if url.endswith(".pdf"):
+            raise AssertionError(f"nested PDF must not be fetched on ≤1.2GB: {url}")
+        return BrochureResource(listing_html.encode(), "text/html", listing, url)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "North Wing, 9 Example Road",
+                "Property Postcode": "E1 6AN",
+                "Brochure PDF": listing,
+            }
+        ),
+        "unknown-broker.eml",
+        "Unknown Broker",
+        "llm:fallback",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert listing in fetched
+    assert any("floor-plan/modal" in u for u in fetched)
+    assert not any(u.endswith(".pdf") for u in fetched)
+    assert prop.values.get("Floor Plan") == plan_png
+    assert prop.values.get("Brochure PDF") == brochure_pdf
+    # High Res stays on gallery images — never the brochure PDF.
+    high_res = prop.values.get("_high_res_candidates") or []
+    assert len(high_res) >= 5
+    assert all(not u.endswith(".pdf") for u in high_res)
+
+
+def test_small_host_direct_floorplan_image_on_html(monkeypatch):
+    """Soft-skip: hosted *floorplan*.jpg on the page sets Floor Plan without PDF fetch."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+
+    listing = "https://listings.example/space/42"
+    plan_jpg = "https://cdn.listings.example/media/level-3_floorplan.jpg"
+    brochure_pdf = "https://cdn.listings.example/docs/space-42-brochure.pdf"
+    fetched = []
+
+    listing_html = f"""
+    <html><body><main>
+      <img src="https://cdn.listings.example/media/a.jpg" alt="office" />
+      <img src="https://cdn.listings.example/media/b.jpg" alt="office" />
+      <img src="https://cdn.listings.example/media/c.jpg" alt="office" />
+      <img src="https://cdn.listings.example/media/d.jpg" alt="office" />
+      <img src="https://cdn.listings.example/media/e.jpg" alt="office" />
+      <img src="{plan_jpg}" alt="Level 3 floor plan" />
+      <a href="{brochure_pdf}">Download brochure</a>
+      <a href="https://cdn.listings.example/docs/level-3_floorplans.pdf">Floorplans PDF</a>
+    </main></body></html>
+    """
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if url.endswith(".pdf"):
+            raise AssertionError(f"nested PDF must not be fetched on ≤1.2GB: {url}")
+        return BrochureResource(listing_html.encode(), "text/html", listing, url)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Space 42, Example Quay",
+                "Property Postcode": "SE1 2AA",
+                "Brochure PDF": listing,
+            }
+        ),
+        "grid-availability.xlsx",
+        "Grid",
+        "llm:fallback",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert fetched == [listing]
     assert prop.values.get("Floor Plan") == plan_jpg
     assert prop.values.get("Brochure PDF") == brochure_pdf
 

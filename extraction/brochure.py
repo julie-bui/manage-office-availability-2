@@ -695,31 +695,10 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
                 candidate.classification = AssetType.DECORATIVE
                 candidate.confidence = 0.95
     candidates.extend(hosted_documents)
-    # GPE (Umbraco) and similar CMS sites expose floor plans via modal surface
-    # endpoints on data-modal-path — not static *floorplans*.pdf hrefs. Harvest
-    # those before link decompose so soft-skip can still resolve a plan image.
-    for el in soup.find_all(attrs={"data-modal-path": True}):
-        raw_path = (el.get("data-modal-path") or "").strip()
-        if not raw_path or "floorplan" not in raw_path.lower():
-            continue
-        href = urljoin(source_document, raw_path)
-        if not href:
-            continue
-        label = el.get_text(" ", strip=True) or "Floor plan"
-        candidates.append(
-            AssetCandidate(
-                href,
-                source_document,
-                original_url=raw_path,
-                final_url=href,
-                anchor_text=label,
-                filename=urlparse(href).path.rsplit("/", 1)[-1],
-                surrounding_text="Floor plan",
-                html_container=getattr(el.find_parent(["article", "section", "figure", "li", "div"]), "name", None),
-                discovery_method="html_floorplan_modal",
-                association_confidence=0.9,
-            )
-        )
+    # Shared light Floor Plan discovery (any provider / LLM-fallback HTML):
+    # CMS modals, data-* plan endpoints, and dedicated *floorplan* image links.
+    # Soft-skip follows these lightweight endpoints even when heavy PDFs skip.
+    candidates.extend(_harvest_light_floorplan_candidates(soup, source_document))
     for link in content_root.find_all("a", href=True):
         href = urljoin(source_document, link.get("href"))
         container = link.find_parent(["article", "section", "figure", "li", "div"])
@@ -743,6 +722,30 @@ def _srcset_urls(value: str) -> List[str]:
     return [part.strip().split()[0] for part in value.split(",") if part.strip()]
 
 
+_FLOORPLAN_REF_RE = re.compile(r"floor[\s_-]*plan|floorplan", re.IGNORECASE)
+
+# CMS / property-page attributes that often hold a light floor-plan endpoint
+# or a dedicated plan image (not limited to any one landlord CMS).
+_LIGHT_FLOORPLAN_ATTRS = (
+    "data-modal-path",
+    "data-modal-url",
+    "data-floorplan-url",
+    "data-floor-plan-url",
+    "data-plan-url",
+    "data-plan-src",
+    "data-href",
+    "data-url",
+    "data-src",
+    "href",
+)
+
+
+def _looks_like_floorplan_ref(*parts: str) -> bool:
+    """True when any part names a floor plan (path, class, label, attribute)."""
+    blob = " ".join(str(p or "") for p in parts).lower()
+    return bool(blob and _FLOORPLAN_REF_RE.search(blob))
+
+
 def _is_box_host(host: str) -> bool:
     host = (host or "").lower()
     if "dropbox" in host:
@@ -750,14 +753,18 @@ def _is_box_host(host: str) -> bool:
     return host == "box.com" or host.endswith(".box.com")
 
 
-def _is_floorplan_modal_url(url: str) -> bool:
-    """True for CMS floor-plan modal/HTML endpoints (not a finished plan asset).
+def _is_finished_plan_asset_path(path: str) -> bool:
+    low = (path or "").lower()
+    return low.endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".jpx"))
 
-    Confirmed real (GPE 2026-07): portfolio pages expose plans via
-    `/umbraco/surface/floorplan?…` (`data-modal-path`), which returns a tiny
-    HTML fragment with the real `*floorplan*.jpg` / `*floorplan*.pdf` links.
-    Those modal URLs must be followed even on the 1GB soft-skip path — they are
-    not heavy PDF embeds.
+
+def _is_light_floorplan_html_url(url: str) -> bool:
+    """True for lightweight floor-plan HTML/modal endpoints (not a finished asset).
+
+    Shared across all providers: Umbraco `data-modal-path` surfaces, generic
+    `/floor-plan` HTML fragments, and similar CMS endpoints that resolve to a
+    hosted `*floorplan*.jpg` / `.png` / `.pdf`. Soft-skip must still follow
+    these — they are not heavy Box/Drive PDF embeds.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -767,11 +774,104 @@ def _is_floorplan_modal_url(url: str) -> bool:
     except ValueError:
         return False
     path = (parsed.path or "").lower()
-    if not path or "floorplan" not in path:
+    query = (parsed.query or "").lower()
+    if not path and not query:
         return False
-    if path.endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".jpx")):
+    if not _looks_like_floorplan_ref(path, query):
+        return False
+    if _is_finished_plan_asset_path(path):
         return False
     return True
+
+
+# Back-compat alias used throughout soft-skip / merge paths.
+_is_floorplan_modal_url = _is_light_floorplan_html_url
+
+
+def _harvest_light_floorplan_candidates(soup, source_document: str) -> List[AssetCandidate]:
+    """Discover light floor-plan endpoints and dedicated plan image links in HTML.
+
+    Provider-neutral (runs for every Brochure PDF / property-page seed, including
+    LLM-fallback and rules that do not exist yet). Harvests before link
+    decompose so ≤1.2GB soft-skip can still resolve a hosted plan image.
+    """
+    found: List[AssetCandidate] = []
+    seen = set()
+
+    def _element_plan_signal(el) -> str:
+        parts = [
+            " ".join(el.get("class") or []),
+            el.get("id") or "",
+            el.get("data-modal-target") or "",
+            el.get_text(" ", strip=True) if hasattr(el, "get_text") else "",
+        ]
+        return " ".join(parts)
+
+    def _add(raw: str, el, method: str) -> None:
+        raw = (raw or "").strip()
+        if not raw or raw.startswith("#") or raw.lower().startswith("javascript:"):
+            return
+        href = urljoin(source_document, raw)
+        if not href:
+            return
+        key = normalize_url(href) or href
+        if key in seen:
+            return
+        path = (urlparse(href).path or "").lower()
+        is_light_html = _is_light_floorplan_html_url(href)
+        is_plan_image = path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".jpx"))
+        is_plan_pdf = path.endswith(".pdf")
+        # Only keep light HTML endpoints or finished plan assets whose URL
+        # (or the harvesting element) clearly signals a floor plan.
+        if not (is_light_html or is_plan_image or is_plan_pdf):
+            return
+        if not is_light_html and not _looks_like_floorplan_ref(raw, href, path, _element_plan_signal(el)):
+            return
+        seen.add(key)
+        label = ""
+        if hasattr(el, "get_text"):
+            label = el.get_text(" ", strip=True) or ""
+        mime = "image/*" if is_plan_image else ("application/pdf" if is_plan_pdf else None)
+        found.append(
+            AssetCandidate(
+                href,
+                source_document,
+                mime_type=mime,
+                original_url=raw,
+                final_url=href,
+                anchor_text=label or "Floor plan",
+                filename=urlparse(href).path.rsplit("/", 1)[-1],
+                surrounding_text="Floor plan",
+                html_container=getattr(
+                    el.find_parent(["article", "section", "figure", "li", "div"]),
+                    "name",
+                    None,
+                )
+                if hasattr(el, "find_parent")
+                else None,
+                discovery_method=method,
+                association_confidence=0.9,
+            )
+        )
+
+    for attr in _LIGHT_FLOORPLAN_ATTRS:
+        for el in soup.find_all(attrs={attr: True}):
+            raw = (el.get(attr) or "").strip()
+            if not raw:
+                continue
+            # Require a floor-plan signal in the URL or on the element so
+            # unrelated data-modal / data-href values are not harvested.
+            if not _looks_like_floorplan_ref(raw, _element_plan_signal(el)):
+                continue
+            absolute = urljoin(source_document, raw)
+            method = (
+                "html_floorplan_modal"
+                if _is_light_floorplan_html_url(absolute)
+                else "html_floorplan_link"
+            )
+            _add(raw, el, method)
+
+    return found
 
 
 def _is_viewer_floorplan_url(url: str) -> bool:
@@ -786,7 +886,7 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
         return False
-    if _is_floorplan_modal_url(text):
+    if _is_light_floorplan_html_url(text):
         return True
     try:
         parsed = urlparse(text)
@@ -824,8 +924,7 @@ def _is_floor_plan_pdf_fallback_url(url: str) -> bool:
     path = (parsed.path or "").lower()
     if not path.endswith(".pdf"):
         return False
-    low = text.lower()
-    if any(token in low for token in ("floorplan", "floor-plan", "floor_plan")):
+    if _looks_like_floorplan_ref(text):
         return True
     host = (parsed.hostname or "").lower()
     if _is_box_host(host):
@@ -2323,18 +2422,18 @@ def _retrieve(
                 documents.append(doc_url)
             if len(documents) >= 2:
                 break
-    # Dedicated *floorplan*.pdf links and CMS floorplan modal HTML endpoints on
-    # the property page are not finished Floor Plan cell values, but they are
-    # excellent nested sources for a plan bitmap / click-through when the
+    # Dedicated *floorplan*.pdf links and light floorplan HTML/modal endpoints
+    # on the property page are not finished Floor Plan cell values, but they
+    # are excellent nested sources for a plan bitmap / click-through when the
     # brochure pull is thin — follow them alongside Download brochure.
-    # Soft-skip still follows lightweight floorplan modals (GPE Umbraco) and
-    # keeps *floorplans*.pdf as a Floor Plan click-through fallback in _merge.
+    # Soft-skip still follows lightweight floorplan HTML endpoints (any CMS)
+    # and keeps *floorplans*.pdf as a Floor Plan click-through fallback in _merge.
     if need_nested_plans:
         for asset in combined.assets:
             if asset.classification != AssetType.FLOORPLAN or not asset.url:
                 continue
             plan_url = asset.url
-            if _is_floorplan_modal_url(plan_url):
+            if _is_light_floorplan_html_url(plan_url):
                 if plan_url not in documents:
                     documents.append(plan_url)
                 if len(documents) >= 3:
@@ -2353,14 +2452,15 @@ def _retrieve(
     # gallery URLs without nested landlord-PDF fetches. Drive/Box viewers
     # still need their download target on ≥2GB hosts — those are the only
     # photo source. On ≤1.2GB hosts, never fetch nested/hosted PDFs — but
-    # always keep tiny CMS floorplan modal HTML (resolves hosted plan jpg/pdf).
+    # always keep tiny light floorplan HTML endpoints (resolves hosted plan
+    # jpg/png/pdf) for every provider on this shared enrichment path.
     if skip_nested_documents:
         if _skip_heavy_pdf_embeds():
-            documents = [u for u in documents if _is_floorplan_modal_url(u)][:2]
+            documents = [u for u in documents if _is_light_floorplan_html_url(u)][:2]
         else:
             documents = [u for u in documents if _is_hosted_document_download(u)][:1]
     elif _skip_heavy_pdf_embeds():
-        documents = [u for u in documents if _is_floorplan_modal_url(u)][:2]
+        documents = [u for u in documents if _is_light_floorplan_html_url(u)][:2]
     rss_now = _rss_mb()
     memory_tight = (
         rss_now >= _ENRICHMENT_PARALLEL_RSS_MB
@@ -2529,8 +2629,8 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
     ][:_MAX_PROPERTY_IMAGES]
     # Prefer hosted/bitmap Floor Plan URLs. Fall back to dedicated .pdf plan
-    # links (old GPE behaviour) when nested bitmap extract soft-skipped or
-    # failed — never treat those PDFs as finished for has_floorplan_seed.
+    # links when nested bitmap extract soft-skipped or failed — never treat
+    # those PDFs as finished for has_floorplan_seed.
     image_floorplans = [
         a.url
         for a in prop.assets
