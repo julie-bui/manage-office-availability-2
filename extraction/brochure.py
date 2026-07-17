@@ -695,6 +695,31 @@ def _extract_html(payload: bytes, source_document: str) -> BrochureExtraction:
                 candidate.classification = AssetType.DECORATIVE
                 candidate.confidence = 0.95
     candidates.extend(hosted_documents)
+    # GPE (Umbraco) and similar CMS sites expose floor plans via modal surface
+    # endpoints on data-modal-path — not static *floorplans*.pdf hrefs. Harvest
+    # those before link decompose so soft-skip can still resolve a plan image.
+    for el in soup.find_all(attrs={"data-modal-path": True}):
+        raw_path = (el.get("data-modal-path") or "").strip()
+        if not raw_path or "floorplan" not in raw_path.lower():
+            continue
+        href = urljoin(source_document, raw_path)
+        if not href:
+            continue
+        label = el.get_text(" ", strip=True) or "Floor plan"
+        candidates.append(
+            AssetCandidate(
+                href,
+                source_document,
+                original_url=raw_path,
+                final_url=href,
+                anchor_text=label,
+                filename=urlparse(href).path.rsplit("/", 1)[-1],
+                surrounding_text="Floor plan",
+                html_container=getattr(el.find_parent(["article", "section", "figure", "li", "div"]), "name", None),
+                discovery_method="html_floorplan_modal",
+                association_confidence=0.9,
+            )
+        )
     for link in content_root.find_all("a", href=True):
         href = urljoin(source_document, link.get("href"))
         container = link.find_parent(["article", "section", "figure", "li", "div"])
@@ -725,16 +750,44 @@ def _is_box_host(host: str) -> bool:
     return host == "box.com" or host.endswith(".box.com")
 
 
+def _is_floorplan_modal_url(url: str) -> bool:
+    """True for CMS floor-plan modal/HTML endpoints (not a finished plan asset).
+
+    Confirmed real (GPE 2026-07): portfolio pages expose plans via
+    `/umbraco/surface/floorplan?…` (`data-modal-path`), which returns a tiny
+    HTML fragment with the real `*floorplan*.jpg` / `*floorplan*.pdf` links.
+    Those modal URLs must be followed even on the 1GB soft-skip path — they are
+    not heavy PDF embeds.
+    """
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    path = (parsed.path or "").lower()
+    if not path or "floorplan" not in path:
+        return False
+    if path.endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".jpx")):
+        return False
+    return True
+
+
 def _is_viewer_floorplan_url(url: str) -> bool:
     """True when Floor Plan still points at a document/viewer rather than a bitmap.
 
     Box/Drive/Dropbox/.pdf placeholders must not count as a *finished* Floor
     Plan for nested bitmap hunting. Dedicated .pdf links may still be kept as
     a click-through fallback when no hosted plan image was extracted.
+    CMS floor-plan modal HTML endpoints are also unfinished — follow them to
+    resolve the hosted plan image/PDF.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
         return False
+    if _is_floorplan_modal_url(text):
+        return True
     try:
         parsed = urlparse(text)
     except ValueError:
@@ -2270,16 +2323,23 @@ def _retrieve(
                 documents.append(doc_url)
             if len(documents) >= 2:
                 break
-    # Dedicated *floorplan*.pdf links on the property page are not finished
-    # Floor Plan cell values for nested bitmap hunting, but they are excellent
-    # nested sources for a plan bitmap when the brochure pull is thin — follow
-    # one alongside Download brochure. Soft-skip / failed extract still keeps
-    # them as a Floor Plan click-through fallback in _merge.
+    # Dedicated *floorplan*.pdf links and CMS floorplan modal HTML endpoints on
+    # the property page are not finished Floor Plan cell values, but they are
+    # excellent nested sources for a plan bitmap / click-through when the
+    # brochure pull is thin — follow them alongside Download brochure.
+    # Soft-skip still follows lightweight floorplan modals (GPE Umbraco) and
+    # keeps *floorplans*.pdf as a Floor Plan click-through fallback in _merge.
     if need_nested_plans:
         for asset in combined.assets:
             if asset.classification != AssetType.FLOORPLAN or not asset.url:
                 continue
             plan_url = asset.url
+            if _is_floorplan_modal_url(plan_url):
+                if plan_url not in documents:
+                    documents.append(plan_url)
+                if len(documents) >= 3:
+                    break
+                continue
             if not _is_viewer_floorplan_url(plan_url):
                 continue
             path = (urlparse(plan_url).path or "").lower()
@@ -2287,19 +2347,20 @@ def _retrieve(
                 continue
             if plan_url not in documents:
                 documents.append(plan_url)
-            if len(documents) >= 2:
+            if len(documents) >= 3:
                 break
     # Caller may request HTML-only (tight deadline): still expose page
     # gallery URLs without nested landlord-PDF fetches. Drive/Box viewers
     # still need their download target on ≥2GB hosts — those are the only
-    # photo source. On ≤1.2GB hosts, never fetch nested/hosted PDFs.
+    # photo source. On ≤1.2GB hosts, never fetch nested/hosted PDFs — but
+    # always keep tiny CMS floorplan modal HTML (resolves hosted plan jpg/pdf).
     if skip_nested_documents:
         if _skip_heavy_pdf_embeds():
-            documents = []
+            documents = [u for u in documents if _is_floorplan_modal_url(u)][:2]
         else:
             documents = [u for u in documents if _is_hosted_document_download(u)][:1]
     elif _skip_heavy_pdf_embeds():
-        documents = []
+        documents = [u for u in documents if _is_floorplan_modal_url(u)][:2]
     rss_now = _rss_mb()
     memory_tight = (
         rss_now >= _ENRICHMENT_PARALLEL_RSS_MB

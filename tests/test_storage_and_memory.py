@@ -347,6 +347,72 @@ def test_small_host_keeps_html_gallery_skips_nested_pdf(monkeypatch):
     assert prop.values.get("Floor Plan") == "https://cdn.property.test/floorplan.pdf"
 
 
+def test_small_host_follows_floorplan_modal_for_plan_image(monkeypatch):
+    """GPE Umbraco floorplan modals must resolve on 1GB soft-skip (no brochure PDF).
+
+    Portfolio pages expose plans via data-modal-path=/umbraco/surface/floorplan?…
+    which returns a tiny HTML fragment with *floorplan*.jpg / *.pdf — not a
+    static floorplans.pdf href. Soft-skip must still follow that modal.
+    """
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+
+    listing = "https://property.test/portfolio/example-house"
+    modal = "https://property.test/umbraco/surface/floorplan?propertyid=1&key=abc"
+    plan_jpg = "https://cdn.property.test/media/example-house_2d-floorplan_l6.jpg"
+    plan_pdf = "https://cdn.property.test/media/example-house_2d-floorplan_l6.pdf"
+    brochure_pdf = "https://cdn.property.test/media/example-house-brochure.pdf"
+    fetched = []
+
+    listing_html = f"""
+    <html><body><main>
+      <img src="https://cdn.property.test/media/a.jpg" alt="office" />
+      <img src="https://cdn.property.test/media/b.jpg" alt="office" />
+      <img src="https://cdn.property.test/media/c.jpg" alt="office" />
+      <img src="https://cdn.property.test/media/d.jpg" alt="office" />
+      <img src="https://cdn.property.test/media/e.jpg" alt="office" />
+      <a href="{brochure_pdf}">Download brochure</a>
+      <a href="#fpModal" data-modal-target="floorplan-modal"
+         data-modal-path="/umbraco/surface/floorplan?propertyid=1&amp;key=abc"></a>
+    </main></body></html>
+    """
+    modal_html = f"""
+    <div class="modal modal--floorplan" id="floorplan-modal">
+      <a href="{plan_pdf}" class="floorplan-download">Download</a>
+      <img class="floorplan-modal__image" src="{plan_jpg}"
+           alt="Example House 2D Floorplan L6" />
+    </div>
+    """
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if "umbraco/surface/floorplan" in url:
+            return BrochureResource(modal_html.encode(), "text/html", modal, url)
+        if url.endswith(".pdf"):
+            raise AssertionError(f"nested PDF must not be fetched on ≤1.2GB: {url}")
+        return BrochureResource(listing_html.encode(), "text/html", listing, url)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": listing,
+            }
+        ),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert listing in fetched
+    assert any("umbraco/surface/floorplan" in u for u in fetched)
+    assert not any(u.endswith(".pdf") for u in fetched)
+    assert prop.values.get("Floor Plan") == plan_jpg
+    assert prop.values.get("Brochure PDF") == brochure_pdf
+
+
 def test_floorplan_pdf_fallback_when_no_bitmap(monkeypatch):
     """When no plan bitmap is extracted, Floor Plan keeps the website floorplan.pdf."""
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
