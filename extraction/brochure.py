@@ -78,6 +78,13 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _detect_host_ram_mb() -> float:
     """Best-effort container/host RAM limit in MiB (cgroup, then psutil)."""
     for path in (
@@ -106,9 +113,44 @@ def _detect_host_ram_mb() -> float:
     return 0.0
 
 
-def _default_fetch_workers(host_ram_mb: float) -> int:
-    # Confirmed real (Railway GPE, 2026-07): 6 parallel workers + nested
-    # landlord PDFs SIGKILL'd a ~512MB–1GB worker. Scale with container RAM.
+# Railway Hobby / similar: plan memory max is often 1GB. Box PDF decode
+# peaks well above that. Full Union media needs a plan that can set ≥2GB.
+_SMALL_HOST_RAM_MB = 1200.0
+_FULL_MEDIA_HOST_RAM_MB = 2048.0
+
+
+def _resolve_high_memory(host_ram_mb: float) -> bool:
+    """Full PDF-embed path only when the container can hold it.
+
+    Auto from cgroup:
+      ≥2GB → full media
+      ≤1.2GB → safe pre-fetch skip (Railway Hobby 1GB plan)
+      unknown (0) → full media (local/dev without cgroup; Railway always
+        exposes cgroup so 1GB Hobby still takes the safe path)
+
+    Override with ENRICHMENT_HIGH_MEMORY=0|1 (forcing 1 on a 1GB plan will
+    SIGKILL on the first Union Box PDF — upgrade the Railway plan instead).
+    """
+    raw = os.environ.get("ENRICHMENT_HIGH_MEMORY")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    if host_ram_mb <= 0:
+        return True
+    return host_ram_mb >= _FULL_MEDIA_HOST_RAM_MB
+
+
+def _default_fetch_workers(host_ram_mb: float, high_memory: bool = False) -> int:
+    if high_memory:
+        if host_ram_mb >= 6000:
+            return 6
+        if host_ram_mb >= 4000 or host_ram_mb <= 0:
+            return 4
+        if host_ram_mb >= 2048:
+            return 3
+        if host_ram_mb >= 1800:
+            return 2
+        return 2
+    # Safe path (Railway 1GB plan and similar): always serial.
     if host_ram_mb >= 4000:
         return 4
     if host_ram_mb >= 1800:
@@ -116,46 +158,63 @@ def _default_fetch_workers(host_ram_mb: float) -> int:
     return 1
 
 
-def _default_parallel_rss_mb(host_ram_mb: float) -> float:
+def _default_parallel_rss_mb(host_ram_mb: float, high_memory: bool = False) -> float:
+    """RSS above which waves serialize."""
+    if high_memory:
+        if host_ram_mb >= 4000 or host_ram_mb <= 0:
+            return 2800.0
+        if host_ram_mb >= 2048:
+            return max(1200.0, host_ram_mb * 0.55)
+        if host_ram_mb >= 1800:
+            return max(900.0, host_ram_mb * 0.5)
+        return max(450.0, host_ram_mb * 0.7)
     if host_ram_mb >= 4000:
         return 2400.0
     if host_ram_mb >= 1800:
         return max(250.0, host_ram_mb * 0.35)
     if host_ram_mb > 0:
-        # 512MB–1.5GB Railway: serialize before the first large Box PDF.
         return max(120.0, host_ram_mb * 0.28)
-    # Unknown host → assume ~1GB Railway, serialize early.
     return 180.0
 
 
-def _default_rss_ceiling_mb(host_ram_mb: float) -> float:
+def _default_rss_ceiling_mb(host_ram_mb: float, high_memory: bool = False) -> float:
+    """Soft stop near the cgroup kill line (≈ limit − 100 MiB) on ≥2GB hosts.
+
+    On ≤1.2GB hosts the product path is pre-fetch skip of heavy PDFs — this
+    ceiling is only a last-resort backstop if something still runs.
+    """
+    if high_memory:
+        if host_ram_mb >= 2048:
+            return max(1800.0, host_ram_mb - 100.0)
+        if host_ram_mb > 0:
+            return max(host_ram_mb * 0.88, host_ram_mb - 100.0)
+        return 3900.0
     if host_ram_mb >= 6000:
         return 6144.0
     if host_ram_mb >= 1800:
         return max(400.0, host_ram_mb * 0.72)
     if host_ram_mb > 0:
-        # Leave headroom before the container SIGKILL line on ~1GB Railway.
-        # Confirmed real (2026-07, UNION): full Box PDF decode after
-        # rule:UNION at ~100 MiB still jumped past a high ceiling and died.
-        return max(260.0, host_ram_mb * 0.52)
-    # Unknown host → stop well before a typical 1GB hard-kill.
+        return max(host_ram_mb - 100.0, host_ram_mb * 0.85)
     return 420.0
 
 
-# Serialize pdfplumber/fitz decodes whenever RSS is under 1.5GB (typical
-# Railway) so two ~22MB UNION Box PDFs never decode at once.
+# Serialize concurrent pdfplumber/fitz decodes under pressure.
 _PDF_DECODE_LOCK = threading.Lock()
 _PDF_DECODE_SERIALIZE_BELOW_RSS_MB = 1536.0
 
-
 _HOST_RAM_MB = _detect_host_ram_mb()
+# Dual-path: ≥2GB (or ENRICHMENT_HIGH_MEMORY=1) → full Union/GPE PDF embeds.
+# ≤1.2GB Railway Hobby → soft-skip heavy embeds before fetch (survive SIGKILL).
+_ENRICHMENT_HIGH_MEMORY = _resolve_high_memory(_HOST_RAM_MB)
 # Memory-aware defaults; override with ENRICHMENT_FETCH_WORKERS /
 # ENRICHMENT_PARALLEL_RSS_MB / ENRICHMENT_RSS_CEILING_MB.
 _ENRICHMENT_FETCH_WORKERS = _env_positive_int(
-    "ENRICHMENT_FETCH_WORKERS", _default_fetch_workers(_HOST_RAM_MB)
+    "ENRICHMENT_FETCH_WORKERS",
+    _default_fetch_workers(_HOST_RAM_MB, _ENRICHMENT_HIGH_MEMORY),
 )
 _ENRICHMENT_PARALLEL_RSS_MB = _env_positive_float(
-    "ENRICHMENT_PARALLEL_RSS_MB", _default_parallel_rss_mb(_HOST_RAM_MB)
+    "ENRICHMENT_PARALLEL_RSS_MB",
+    _default_parallel_rss_mb(_HOST_RAM_MB, _ENRICHMENT_HIGH_MEMORY),
 )
 # Soft caps on embedded bitmaps retained per brochure PDF. Matches
 # app.MAX_HIGH_RES_IMAGES so RSS does not hold uncapped MetSpace Drive
@@ -175,10 +234,11 @@ _PLAN_ONLY_MAX_PAGES = 25
 # download targets — those viewer shells often have ≥2 chrome images and
 # are the ONLY photo/floorplan source for MetSpace / Workplace Plus / UNION.
 _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
-# Soft stop before container OOM — scaled to detected RAM, not a fixed 6GiB
-# that never trips on a 512MB–1GB Railway service.
+# Soft stop before container OOM. On ≥2GB hosts this is near cgroup−100MiB.
+# On ≤1.2GB hosts heavy PDFs are skipped before fetch instead.
 _RSS_ENRICHMENT_CEILING_MB = _env_positive_float(
-    "ENRICHMENT_RSS_CEILING_MB", _default_rss_ceiling_mb(_HOST_RAM_MB)
+    "ENRICHMENT_RSS_CEILING_MB",
+    _default_rss_ceiling_mb(_HOST_RAM_MB, _ENRICHMENT_HIGH_MEMORY),
 )
 # When many unique hosted PDFs remain, stop deepening already-complete
 # galleries so blank High Res rows still get a fetch attempt.
@@ -1505,28 +1565,29 @@ def _rss_mb() -> float:
 
 
 def _pdf_decode_must_serialize(rss: float = None) -> bool:
-    """Hard-cap concurrent PDF decodes to 1 under 1.5GB RSS / small hosts."""
-    if _HOST_RAM_MB and _HOST_RAM_MB < _PDF_DECODE_SERIALIZE_BELOW_RSS_MB:
-        return True
+    """Serialize concurrent PDF decodes under memory pressure."""
     current = _rss_mb() if rss is None else rss
-    return current < _PDF_DECODE_SERIALIZE_BELOW_RSS_MB
+    if _ENRICHMENT_HIGH_MEMORY:
+        return current >= _ENRICHMENT_PARALLEL_RSS_MB
+    return True
 
 
 def _enrichment_memory_constrained(rss: float = None, hosted: bool = False) -> bool:
-    """True when Box/PDF enrichment should stay serial + light-first-page.
+    """True when enrichment should stay serial / avoid deepening PDF embeds.
 
-    Modest RSS after rule:UNION (~100 MiB) is already "tight" on a 512MB–1GB
-    Railway worker — waiting for the soft ceiling lets one full 22MB decode
-    SIGKILL the process.
+    ≥2GB (high-memory): only trip near the parallel RSS threshold — post-rule
+    ~100–200 MiB is normal and must not starve Union media.
+    ≤1.2GB (safe path): always constrained; heavy PDFs are skipped before fetch.
     """
     current = _rss_mb() if rss is None else rss
-    if _HOST_RAM_MB and _HOST_RAM_MB < 1536:
-        return True
-    if current >= _ENRICHMENT_PARALLEL_RSS_MB:
-        return True
-    if hosted and (not _HOST_RAM_MB or _HOST_RAM_MB < 2048) and current >= 50:
-        return True
-    return False
+    if _ENRICHMENT_HIGH_MEMORY:
+        return current >= _ENRICHMENT_PARALLEL_RSS_MB
+    return True
+
+
+def _skip_heavy_pdf_embeds() -> bool:
+    """True when Box/Drive/nested PDF decode would likely SIGKILL (≤1.2GB)."""
+    return not _ENRICHMENT_HIGH_MEMORY
 
 
 def _memlog_enrichment(checkpoint: str, filename: str = "") -> None:
@@ -1711,6 +1772,57 @@ def enrich_properties(
         _share_underfilled_building_photos(properties)
         return properties
 
+    # Dual-path memory policy (Railway Hobby is often capped at 1GB):
+    # ≤1.2GB → soft-skip Box/Drive/Dropbox PDF embeds BEFORE fetch so the
+    # worker survives; Brochure PDF cell links stay. HTML galleries still run.
+    # ≥2GB (or ENRICHMENT_HIGH_MEMORY=1) → full nested PDF / floor-plan embeds.
+    if _skip_heavy_pdf_embeds():
+        kept = []
+        skipped_heavy = 0
+        detail = (
+            f"Skipped PDF embed download on small host "
+            f"(host_ram={_HOST_RAM_MB:.0f} MiB ≤ {_SMALL_HOST_RAM_MB:.0f} MiB). "
+            f"Brochure PDF link preserved. Upgrade Railway memory to ≥2GB "
+            f"(4GB+ recommended) for Union floor plans / High Res embeds."
+        )
+        for brochure_url in pending:
+            if _is_hosted_document_download(brochure_url):
+                for _, prop, _ in by_url[brochure_url]:
+                    _record_diagnostic(
+                        prop,
+                        "LINK_ENRICHMENT_SKIPPED",
+                        brochure_url,
+                        detail=detail,
+                    )
+                    prop.add_issue(
+                        ValidationIssue(
+                            "Brochure PDF",
+                            "Linked PDF embed extraction was skipped because this host has ≤1.2GB RAM.",
+                            Severity.INFO,
+                            brochure_url,
+                            "Upgrade the Railway plan/memory to ≥2GB (4GB+ for Union) to extract floor plans and High Res from Box/Drive PDFs.",
+                            "linked_source_enrichment",
+                        )
+                    )
+                    _seed_high_res_fallback(prop, brochure_url)
+                skipped_heavy += 1
+                continue
+            kept.append(brochure_url)
+        if skipped_heavy:
+            _memlog_enrichment(
+                f"brochure enrichment pre-fetch PDF skip "
+                f"(small_host=1, host_ram={_HOST_RAM_MB:.0f}MiB, "
+                f"skipped_urls={skipped_heavy}, kept_html={len(kept)})"
+            )
+        pending = kept
+        if not pending:
+            _share_underfilled_building_photos(properties)
+            _memlog_enrichment(
+                f"brochure enrichment end (0 URLs attempted, "
+                f"small_host pre-fetch skip, host_ram={_HOST_RAM_MB:.0f}MiB)"
+            )
+            return properties
+
     # Fetch in small waves and apply immediately. Holding every UNION Box
     # PDF (~22MB) plus extracted page images in one giant cache (the old
     # "fetch all, then merge" approach) blew past Render's free-tier RSS
@@ -1728,20 +1840,18 @@ def enrich_properties(
     rss = _rss_mb()
     memory_constrained = _enrichment_memory_constrained(rss, hosted_pending)
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
-    # Always serialize when RSS is already high — not only for hosted PDFs.
-    # Confirmed real (Railway GPE): parallel HTML→nested-PDF waves OOM'd
-    # while hosted_pending was False, so the old guard never fired.
-    # Confirmed real (Railway UNION, 2026-07): after rule:UNION at ~100 MiB
-    # RSS, serial + light Box extracts are required on ~1GB hosts.
     if memory_constrained or rss >= _ENRICHMENT_PARALLEL_RSS_MB:
         workers = 1
-    elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
-        workers = min(workers, 1)
+    elif not _ENRICHMENT_HIGH_MEMORY:
+        workers = 1
     wave_size = max(1, workers)
     _memlog_enrichment(
         f"brochure enrichment start ({len(pending)} unique URLs, "
         f"workers={workers}, hosted={int(hosted_pending)}, "
-        f"light={int(memory_constrained and hosted_pending)})"
+        f"light={int(memory_constrained and hosted_pending)}, "
+        f"high_mem={int(_ENRICHMENT_HIGH_MEMORY)}, "
+        f"host_ram={_HOST_RAM_MB:.0f}MiB, "
+        f"ceiling={_RSS_ENRICHMENT_CEILING_MB:.0f}MiB)"
     )
 
     def _apply_result(brochure_url, extraction):
@@ -1849,15 +1959,15 @@ def enrich_properties(
         ):
             light_pdf = True
         rss = _rss_mb()
-        # Force light first-page Box/Drive extracts under modest RSS / small
-        # hosts — full pdfplumber+fitz on a 22MB UNION PDF SIGKILL'd ~1GB
-        # Railway after rule:UNION (confirmed 2026-07).
-        if _enrichment_memory_constrained(rss, hosted_pending) and hosted_pending:
+        # Light Box/Drive extracts: deadline pressure, or safe-path host, or
+        # RSS already near the parallel threshold on ≥2GB hosts.
+        if hosted_pending and _enrichment_memory_constrained(rss, hosted_pending):
             light_pdf = True
         if deadline is not None and remaining <= _SKIP_WAVE_REMAINING_SECONDS:
             for brochure_url in pending[wave_start:]:
                 _skip_url(brochure_url)
             break
+        # Last-resort soft stop near cgroup limit.
         if rss >= _RSS_ENRICHMENT_CEILING_MB:
             _skip_remaining_for_memory(wave_start)
             break
@@ -1865,16 +1975,18 @@ def enrich_properties(
         effective_wave = wave_size
         if _enrichment_memory_constrained(rss, hosted_pending) or rss >= _ENRICHMENT_PARALLEL_RSS_MB:
             effective_wave = 1
-        elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
+        elif not _ENRICHMENT_HIGH_MEMORY:
             effective_wave = 1
         wave = pending[wave_start : wave_start + effective_wave]
         prefer_photos = any(
             _floor_plan_already_seeded(prop) for brochure_url in wave for _, prop, _ in by_url[brochure_url]
         )
-        # Under memory pressure, skip optional nested deepening even on HTML
-        # seeds — Box/Drive must_follow downloads still run lightly.
-        skip_nested = html_only or (
-            _enrichment_memory_constrained(rss, hosted_pending) and not hosted_pending
+        # ≤1.2GB: HTML galleries only — nested landlord PDFs OOM like Box.
+        # ≥2GB: follow nested PDFs for floor plans / photos as usual.
+        skip_nested = (
+            html_only
+            or _skip_heavy_pdf_embeds()
+            or (_enrichment_memory_constrained(rss, hosted_pending) and not hosted_pending)
         )
 
         def _run_retrieve(brochure_url):
@@ -2130,9 +2242,15 @@ def _retrieve(
                 break
     # Caller may request HTML-only (tight deadline): still expose page
     # gallery URLs without nested landlord-PDF fetches. Drive/Box viewers
-    # still need their download target — those are the only photo source.
+    # still need their download target on ≥2GB hosts — those are the only
+    # photo source. On ≤1.2GB hosts, never fetch nested/hosted PDFs.
     if skip_nested_documents:
-        documents = [u for u in documents if _is_hosted_document_download(u)][:1]
+        if _skip_heavy_pdf_embeds():
+            documents = []
+        else:
+            documents = [u for u in documents if _is_hosted_document_download(u)][:1]
+    elif _skip_heavy_pdf_embeds():
+        documents = []
     rss_now = _rss_mb()
     memory_tight = (
         rss_now >= _ENRICHMENT_PARALLEL_RSS_MB

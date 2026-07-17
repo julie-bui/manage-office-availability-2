@@ -54,46 +54,87 @@ def test_storage_env_helper_strips():
 @pytest.mark.parametrize(
     "ram_mb,expected_workers",
     [
+        (0, 4),
+        (512, 2),
+        (1024, 2),
+        (2048, 3),
+        (4096, 4),
+        (8192, 6),
+    ],
+)
+def test_enrichment_high_memory_workers_scale_with_ram(ram_mb, expected_workers):
+    assert brochure._default_fetch_workers(ram_mb, high_memory=True) == expected_workers
+
+
+@pytest.mark.parametrize(
+    "ram_mb,expected_workers",
+    [
         (0, 1),
         (512, 1),
         (1024, 1),
         (2048, 2),
         (4096, 4),
-        (8192, 4),
     ],
 )
-def test_enrichment_default_workers_scale_with_ram(ram_mb, expected_workers):
-    assert brochure._default_fetch_workers(ram_mb) == expected_workers
+def test_enrichment_safe_path_workers_remain_serial_on_1gb(ram_mb, expected_workers):
+    assert brochure._default_fetch_workers(ram_mb, high_memory=False) == expected_workers
+
+
+@pytest.mark.parametrize(
+    "ram_mb,expected",
+    [
+        (0, True),
+        (512, False),
+        (1024, False),
+        (1200, False),
+        (2047, False),
+        (2048, True),
+        (4096, True),
+    ],
+)
+def test_resolve_high_memory_auto_from_host_ram(ram_mb, expected, monkeypatch):
+    monkeypatch.delenv("ENRICHMENT_HIGH_MEMORY", raising=False)
+    assert brochure._resolve_high_memory(ram_mb) is expected
+
+
+def test_resolve_high_memory_env_override(monkeypatch):
+    monkeypatch.setenv("ENRICHMENT_HIGH_MEMORY", "1")
+    assert brochure._resolve_high_memory(1024.0) is True
+    monkeypatch.setenv("ENRICHMENT_HIGH_MEMORY", "0")
+    assert brochure._resolve_high_memory(4096.0) is False
 
 
 @pytest.mark.parametrize(
     "ram_mb",
-    [0, 512, 1024, 2048],
+    [0, 512, 1024, 2048, 4096],
 )
 def test_enrichment_rss_ceiling_stays_below_host_ram(ram_mb):
-    ceiling = brochure._default_rss_ceiling_mb(ram_mb)
-    parallel = brochure._default_parallel_rss_mb(ram_mb)
+    ceiling = brochure._default_rss_ceiling_mb(ram_mb, high_memory=True)
+    parallel = brochure._default_parallel_rss_mb(ram_mb, high_memory=True)
     if ram_mb > 0:
         assert ceiling <= ram_mb
         assert parallel < ceiling
+        if ram_mb >= 2048:
+            assert ceiling >= ram_mb - 120
+            assert parallel >= 1000
     else:
-        # Unknown host: conservative defaults that trip before a 1GB kill.
-        assert ceiling <= 512
+        assert ceiling >= 3000
         assert parallel < ceiling
+        assert parallel >= 2000
 
 
-def test_enrichment_memory_constrained_for_modest_rss_on_small_host():
-    assert brochure._enrichment_memory_constrained(100.0, hosted=True)
-    # Large host with low RSS and no hosted PDFs can stay unconstrained.
-    # (Function reads module _HOST_RAM_MB; patch it for this assertion.)
-    original = brochure._HOST_RAM_MB
-    try:
-        brochure._HOST_RAM_MB = 4096.0
-        assert not brochure._enrichment_memory_constrained(40.0, hosted=False)
-        brochure._HOST_RAM_MB = 1024.0
-        assert brochure._enrichment_memory_constrained(40.0, hosted=False)
-    finally:
-        brochure._HOST_RAM_MB = original
+def test_enrichment_memory_constrained_dual_path(monkeypatch):
+    """≥2GB: only near parallel threshold. ≤1.2GB safe path: always constrained."""
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    assert not brochure._enrichment_memory_constrained(100.0, hosted=True)
+    assert not brochure._enrichment_memory_constrained(180.0, hosted=True)
+    assert brochure._enrichment_memory_constrained(2800.0, hosted=True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    assert brochure._enrichment_memory_constrained(40.0, hosted=False)
+    assert brochure._skip_heavy_pdf_embeds() is True
 
 
 def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
@@ -102,8 +143,6 @@ def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
 
     def fake_rss():
         calls["n"] += 1
-        # Worker sizing + first wave check stay under ceiling; after the first
-        # serial materialize, climb above the soft stop.
         if calls["n"] <= 2:
             return 50.0
         return brochure._RSS_ENRICHMENT_CEILING_MB + 80
@@ -111,6 +150,8 @@ def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
     monkeypatch.setattr(brochure, "_rss_mb", fake_rss)
     monkeypatch.setattr(brochure, "_enrichment_memory_constrained", lambda *a, **k: False)
     monkeypatch.setattr(brochure, "_ENRICHMENT_FETCH_WORKERS", 1)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_skip_heavy_pdf_embeds", lambda: False)
 
     fetched = []
 
@@ -150,10 +191,48 @@ def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
     assert any("protect worker memory" in (i.message or "") for prop in props for i in prop.issues)
 
 
-def test_hosted_box_pdf_forces_light_extract_under_modest_rss(monkeypatch):
-    """UNION Box PDFs on ~1GB hosts must use light extract kwargs (deep when plan missing)."""
+def test_small_host_skips_box_pdf_before_fetch(monkeypatch):
+    """Railway 1GB plan: never download Union Box PDFs — soft-skip, keep link."""
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
-    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 180.0)
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        return BrochureResource(b"%PDF-1.4 brochure", "application/pdf", url, url)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://app.box.com/shared/static/abc123.pdf",
+            }
+        ),
+        "union.xlsx",
+        "UNION",
+        "rule:UNION",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert fetched == []
+    assert prop.values.get("Brochure PDF") == "https://app.box.com/shared/static/abc123.pdf"
+    skipped = [
+        d
+        for d in prop.link_diagnostics
+        if d.status == "LINK_ENRICHMENT_SKIPPED" and "small host" in (d.detail or "").lower()
+    ]
+    assert skipped
+    assert any("≤1.2GB" in (i.message or "") for i in prop.issues)
+
+
+def test_high_memory_host_fetches_box_pdf_full_extract(monkeypatch):
+    """≥2GB hosts run full Box PDF embed extraction (no light kwargs at ~100 MiB)."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 180.0)
     seen = []
 
     def fetch(url, deadline=None):
@@ -180,24 +259,100 @@ def test_hosted_box_pdf_forces_light_extract_under_modest_rss(monkeypatch):
         "UNION",
         "rule:UNION",
     )
-    # Pass the real extract_brochure name so _retrieve takes the light kwargs path.
     brochure.enrich_properties(
         [prop],
         fetcher=fetch,
         extractor=brochure.extract_brochure,
     )
     assert seen
-    # Blank Floor Plan → plan-hunting light extract (deeper page window + one plan).
-    assert seen[0].get("max_pages") == max(brochure._LIGHT_MAX_PAGES, brochure._PLAN_ONLY_MAX_PAGES)
-    assert seen[0].get("max_photos") == brochure._LIGHT_MAX_PHOTOS
-    assert seen[0].get("stop_after_floorplans") == 1
-    assert seen[0].get("prefer_photos") is False
+    assert seen[0].get("max_pages") is None
+    assert seen[0].get("max_photos") is None
+
+
+def test_small_host_keeps_html_gallery_skips_nested_pdf(monkeypatch):
+    """GPE-style HTML still enriches on 1GB; nested landlord PDFs soft-skip."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-1.4 plan", "application/pdf", url, url)
+        return BrochureResource(b"<html>listing</html>", "text/html", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        if payload.startswith(b"%PDF"):
+            raise AssertionError("nested PDF must not be fetched/decoded on ≤1.2GB")
+        photos = [
+            classify_candidate(
+                AssetCandidate(
+                    f"https://cdn.property.test/media/{name}.jpg",
+                    source_document,
+                    alt_text=name,
+                    association_confidence=0.85,
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                )
+            )
+            for name in ("a", "b", "c", "d", "e")
+        ]
+        return BrochureExtraction(
+            source_document,
+            assets=photos
+            + [
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/brochure.pdf",
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.BROCHURE,
+                        confidence=0.9,
+                        anchor_text="Download brochure",
+                    )
+                ),
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/floorplan.pdf",
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        alt_text="Floor plan",
+                    )
+                ),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://property.test/listing",
+            }
+        ),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert fetched == ["https://property.test/listing"]
+    assert len(prop.values.get("_high_res_candidates") or []) >= 5
 
 
 def test_hosted_box_pdf_light_extract_prefers_photos_when_real_plan_seeded(monkeypatch):
-    """Usable Floor Plan seed keeps the shallow photo-focused light window."""
-    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
-    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    """On ≥2GB with deadline/light pressure, usable Floor Plan keeps photo-focused light window."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    # Force light via memory-constrained at parallel threshold.
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 2800.0)
     seen = []
 
     def fetch(url, deadline=None):
@@ -238,8 +393,11 @@ def test_hosted_box_pdf_light_extract_prefers_photos_when_real_plan_seeded(monke
 
 def test_viewer_floor_plan_seed_does_not_skip_plan_hunt(monkeypatch):
     """Box/Drive viewer URLs must not count as a finished Floor Plan seed."""
-    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
-    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 2800.0)
     seen = []
 
     def fetch(url, deadline=None):
@@ -280,6 +438,10 @@ def test_viewer_floor_plan_seed_does_not_skip_plan_hunt(monkeypatch):
 
 def test_retrieve_prefers_html_gallery_and_limits_nested_pdf_photos(monkeypatch):
     """GPE-style pages with a real /media/ gallery must not re-decode marketing photos."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
     fetched = []
     nested_kwargs = []
 
@@ -373,7 +535,14 @@ def test_floorplan_pdf_link_on_page_still_fetches_nested_brochure_for_bitmap(mon
     assets. Counting them as has_floorplan_seed skipped the nested brochure
     bitmap extract, while merge/finalize also refuse .pdf Floor Plan cells —
     leaving Floor Plan blank.
+
+    Requires ≥2GB host (high-memory path). On Railway 1GB this nested PDF
+    path soft-skips before fetch — Floor Plan stays blank until plan upgrade.
     """
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
     fetched = []
     nested_kwargs = []
 
@@ -468,6 +637,10 @@ def test_floorplan_pdf_link_on_page_still_fetches_nested_brochure_for_bitmap(mon
 
 def test_retrieve_skips_nested_landlord_pdf_when_gallery_and_plan_and_rss_tight(monkeypatch):
     """Under RSS pressure, HTML gallery + floor plan seed must not pull nested PDFs."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
     fetched = []
 
     def fetch(url, deadline=None):
@@ -540,6 +713,11 @@ def test_retrieve_skips_nested_landlord_pdf_when_gallery_and_plan_and_rss_tight(
 
 def test_enrichment_serializes_when_rss_high_even_for_html_pages(monkeypatch):
     """HTML property pages (not Box/Drive) must still use wave size 1 under RSS pressure."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_FETCH_WORKERS", 4)
     monkeypatch.setattr(
         brochure, "_rss_mb", lambda: brochure._ENRICHMENT_PARALLEL_RSS_MB + 50
     )

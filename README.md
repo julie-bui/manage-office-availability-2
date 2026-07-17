@@ -414,9 +414,12 @@ a single gunicorn worker (see `Procfile`/`render.yaml`); with multiple
 workers, one call here would only clear whichever worker happened to
 handle that request. **Keep `--workers 1` on Railway/Render** — brochure
 PDF enrichment (UNION Box / Drive) is memory-heavy, and each worker has
-its own RSS. Prefer **≥2GB RAM** for UNION-style sheets with many unique
-Box PDFs; on ~1GB, upload that file alone so enrichment can finish (or
-partially finish) without competing with other files.
+its own RSS. Prefer **≥2GB RAM** (4GB+ recommended) for UNION-style sheets
+with many unique Box PDFs. On Railway Hobby the plan memory max is often
+**1GB** — code auto-detects that and soft-skips Box/Drive PDF embeds before
+fetch (Brochure PDF links stay; High Res / Floor Plan embeds stay blank)
+so the worker does not SIGKILL. Upgrade the Railway plan to raise Memory
+above 1GB for full Union media. Keep `--workers 1` on Railway/Render.
 
 ## Adding a new source
 
