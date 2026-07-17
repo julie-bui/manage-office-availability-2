@@ -1216,3 +1216,190 @@ def test_brochure_link_detection_accepts_hidden_labels_and_document_urls():
     assert app_module._accept_image_url_under_deadline(
         "https://anything.example/assets/opaque-id"
     )
+
+
+def _cream_floorplan_jpeg():
+    """MetSpace-style cream plan board: mostly pale with sparse CAD lines."""
+    img = Image.new("RGB", (900, 700), (245, 240, 230))
+    pixels = img.load()
+    for x in range(0, 900, 35):
+        for y in range(700):
+            pixels[x, y] = (60, 60, 55)
+    for y in range(0, 700, 40):
+        for x in range(900):
+            pixels[x, y] = (55, 55, 50)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def test_metspace_cream_floorplan_never_enters_high_res(tmp_path):
+    """Cream Drive plan boards must land in Floor Plan, never High Res."""
+    from extraction.pdf_images import is_floorplan_image
+
+    plan_bytes = _cream_floorplan_jpeg()
+    assert is_floorplan_image(plan_bytes)
+    assert evaluate_image_bytes(plan_bytes, url="https://cdn.test/plan.jpg")["status"] == "IMAGE_IS_FLOORPLAN"
+
+    photo_bytes = _photo_jpeg(3)
+    record = {
+        "Building": "9-10 Market Place",
+        "Floor Plan": "https://drive.google.com/file/d/viewer/view",
+        "_brochure_embedded_assets": [
+            AssetCandidate(
+                "", "drive.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                content=plan_bytes, content_hash="creamplan01", extension="jpg",
+                width=900, height=700,
+            ),
+            AssetCandidate(
+                "", "drive.pdf", classification=AssetType.PROPERTY_IMAGE, confidence=0.8,
+                content=photo_bytes, content_hash="creamphoto01", extension="jpg",
+                width=640, height=400,
+            ),
+        ],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._materialize_brochure_assets([record], tmp_path, "batch", "MetSpace")
+        app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "MetSpace",
+            image_validator=lambda url, cache=None, deadline=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url,
+            },
+        )
+    assert "/api/download/" in (record.get("Floor Plan") or "")
+    assert "drive.google.com" not in (record.get("Floor Plan") or "")
+    assert record.get("_high_res_image_count") == 1
+    hr = record.get("High Res Images") or ""
+    assert hr
+    assert "creamplan" not in hr
+    assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])
+
+
+def test_gpe_nested_download_brochure_fills_multi_image_gallery():
+    """Property-page chrome must not block following Download brochure PDF."""
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-1.4 gpe", "application/pdf", url, url)
+        return BrochureResource(b"<html>GPE listing</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        if payload.startswith(b"%PDF"):
+            photos = [
+                AssetCandidate(
+                    f"https://cdn.gpe.test/office-{i}.jpg",
+                    final_url,
+                    alt_text=f"Office {i}",
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                    association_confidence=0.9,
+                )
+                for i in range(1, 6)
+            ]
+            return BrochureExtraction(
+                final_url,
+                assets=photos,
+                identity_text="Elsley House, 24-30 Great Titchfield Street, W1W 8BF",
+            )
+        # Five non-image chrome URLs that previously inflated page_photos and
+        # skipped the nested PDF — must not count as a confident gallery.
+        chrome = [
+            AssetCandidate(
+                f"https://www.gpe.co.uk/static/hero-token-{i}",
+                final_url,
+                alt_text="Hero",
+                association_confidence=0.85,
+                classification=AssetType.PROPERTY_IMAGE,
+                confidence=0.85,
+            )
+            for i in range(5)
+        ]
+        return BrochureExtraction(
+            final_url,
+            assets=chrome + [
+                AssetCandidate(
+                    "https://www.gpe.co.uk/downloads/elsley-brochure.pdf",
+                    final_url,
+                    mime_type="application/pdf",
+                    classification=AssetType.BROCHURE,
+                    confidence=0.9,
+                    anchor_text="Download brochure",
+                )
+            ],
+            identity_text="Elsley House, 24-30 Great Titchfield Street, W1W 8BF",
+        )
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "Elsley House",
+            "Property Postcode": "W1W 8BF",
+            "High Res Images": "https://cdn.gpe.test/email-hero.jpg",
+            "_high_res_candidates": ["https://cdn.gpe.test/email-hero.jpg"],
+            "Brochure PDF": "https://www.gpe.co.uk/properties/elsley-house",
+        }),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    assert any(url.endswith(".pdf") for url in fetched)
+    candidates = prop.values.get("_high_res_candidates") or []
+    assert len(candidates) >= 5
+    assert any("office-1.jpg" in url for url in candidates)
+
+
+def test_share_finalized_media_copies_gallery_and_floorplan_to_sibling():
+    donor = {
+        "Building": "Shared Tower, 1 Example Street",
+        "Floor/Unit": "1st",
+        "High Res Images": "https://service.test/api/download/batch/Shared_photos1.html",
+        "_high_res_image_count": 6,
+        "Floor Plan": "https://service.test/api/download/batch/plan.jpg",
+        "_link_diagnostics": [],
+    }
+    sibling = {
+        "Building": "Shared Tower, 1 Example Street",
+        "Floor/Unit": "5th",
+        "High Res Images": "",
+        "_high_res_image_count": 0,
+        "Floor Plan": "https://app.box.com/s/vieweronly",
+        "_link_diagnostics": [],
+    }
+    app_module._share_finalized_media_across_buildings([donor, sibling])
+    assert sibling["High Res Images"] == donor["High Res Images"]
+    assert sibling["_high_res_image_count"] == 6
+    assert sibling["Floor Plan"] == donor["Floor Plan"]
+    assert any(
+        item.status == "IMAGES_SHARED_FROM_SIBLING_FLOOR"
+        for item in sibling["_link_diagnostics"]
+    )
+
+
+def test_finalize_soft_accept_under_deadline_rejects_floorplan_named_url(tmp_path):
+    record = {
+        "Building": "Plan Leak House",
+        "_source_high_res_candidates": [
+            "https://cdn.test/assets/real-office.jpg",
+            "https://cdn.test/media/third-floorplan-diagram.jpg",
+        ],
+        "_high_res_candidates": [
+            "https://cdn.test/assets/real-office.jpg",
+            "https://cdn.test/media/third-floorplan-diagram.jpg",
+        ],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda url, cache=None, deadline=None: {
+                "ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url,
+            },
+            deadline=time.monotonic() - 1,
+        )
+    assert "floorplan" not in (record.get("High Res Images") or "").lower()
+    assert record.get("_high_res_image_count") == 1
+    assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])

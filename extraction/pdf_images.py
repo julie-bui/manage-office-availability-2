@@ -652,18 +652,21 @@ def is_floorplan_page(page_text):
 # like a floor plan, but nowhere near as white). 0.5 sits with a wide
 # margin on both sides of that gap.
 #
-# 0.38 (tried 2026-07) false-positived bright MetSpace/WP interiors and
-# wiped High Res galleries. Stay at 0.5; cream/gray plan boards that sit
-# under 0.5 are caught by is_floorplan_page(page_text) during PDF extract
-# and by Floor Plan URL exclusion in finalize — not by lowering this.
+# 0.38 alone (tried 2026-07) false-positived bright MetSpace/WP interiors.
+# Hard band stays at 0.5; cream/gray MetSpace Drive plan boards that sit
+# ~0.32–0.48 white with moderate line-drawing diversity are caught by the
+# soft / mid bands below (unique-colour caps keep real photos out).
 FLOORPLAN_WHITE_FRACTION = 0.5
-# Cream/gray MetSpace plan boards often sit ~0.35–0.45 white with very few
-# colours. Require low diversity so bright office photos still pass.
-_FLOORPLAN_SOFT_WHITE_FRACTION = 0.35
+# Cream/gray MetSpace plan boards often sit ~0.32–0.45 white. Soft band
+# allows slightly more unique colours than before (anti-aliased CAD lines
+# push past 150) while still excluding photo galleries (uniq ≫ 1000).
+_FLOORPLAN_SOFT_WHITE_FRACTION = 0.32
+_FLOORPLAN_MID_WHITE_FRACTION = 0.42
 # Near-white AND low colour diversity (line drawings). Bright photos can
 # exceed ~40% white from walls/windows but still have rich colour counts.
 _FLOORPLAN_MAX_UNIQUE_COLORS = 900
-_FLOORPLAN_SOFT_MAX_UNIQUE_COLORS = 150
+_FLOORPLAN_SOFT_MAX_UNIQUE_COLORS = 420
+_FLOORPLAN_MID_MAX_UNIQUE_COLORS = 700
 # Only need a rough estimate, so large images are downsampled first —
 # this keeps the check cheap even for a multi-megapixel source image.
 _MAX_SAMPLE_PIXELS = 400 * 400
@@ -693,7 +696,12 @@ def _white_fraction_and_unique(image_bytes):
     for r, g, b in im.getdata():
         total += 1
         unique.add((r >> 3, g >> 3, b >> 3))  # 5-bit buckets — cheap diversity
+        # Near-white OR cream/gray plan boards (MetSpace Drive PDFs use warm
+        # cream backgrounds whose blue channel sits ~220–235 — under the old
+        # all-channels>235 gate, so plans leaked into High Res as "photos").
         if r > 235 and g > 235 and b > 235:
+            white += 1
+        elif min(r, g, b) > 210 and max(r, g, b) > 225 and (max(r, g, b) - min(r, g, b)) < 40:
             white += 1
     return ((white / total) if total else 0.0), len(unique)
 
@@ -717,11 +725,13 @@ def is_floorplan_image(image_bytes):
     both together.
 
     Requires high white fraction AND low colour diversity so bright office
-    photos (white walls, windows) are not stripped from High Res. Soft band
-    catches cream MetSpace plan boards that sit under 0.5 white.
+    photos (white walls, windows) are not stripped from High Res. Soft/mid
+    bands catch cream MetSpace Drive plan boards that sit under 0.5 white.
     """
     white, unique = _white_fraction_and_unique(image_bytes)
     if white > FLOORPLAN_WHITE_FRACTION and unique <= _FLOORPLAN_MAX_UNIQUE_COLORS:
+        return True
+    if white > _FLOORPLAN_MID_WHITE_FRACTION and unique <= _FLOORPLAN_MID_MAX_UNIQUE_COLORS:
         return True
     return white > _FLOORPLAN_SOFT_WHITE_FRACTION and unique <= _FLOORPLAN_SOFT_MAX_UNIQUE_COLORS
 

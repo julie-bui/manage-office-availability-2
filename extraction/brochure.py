@@ -619,6 +619,13 @@ def _rss_mb() -> float:
         return 0.0
 
 
+def _usable_floor_plan_value(values) -> str:
+    plan = str(values.get("Floor Plan") or "").strip()
+    if not plan or _is_viewer_floorplan_url(plan):
+        return ""
+    return plan
+
+
 def _share_underfilled_building_photos(properties: List[Property]) -> None:
     """Copy enriched photo candidates across floors of the same building.
 
@@ -642,27 +649,31 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
             key=lambda item: (
                 _source_photo_count(item),
                 len(item.values.get("_brochure_embedded_assets") or []),
-                0 if _is_viewer_floorplan_url(str(item.values.get("Floor Plan") or "")) else 1,
+                1 if _usable_floor_plan_value(item.values) else 0,
             ),
         )
         donor_count = _source_photo_count(donor)
         donor_embeds = donor.values.get("_brochure_embedded_assets") or []
         donor_candidates = list(donor.values.get("_high_res_candidates") or [])
-        donor_plan = str(donor.values.get("Floor Plan") or "").strip()
-        if _is_viewer_floorplan_url(donor_plan):
-            donor_plan = ""
-        if donor_count < 1 and not donor_embeds:
+        donor_image = str(donor.values.get("High Res Images") or "").strip()
+        if donor_image and ".html" not in donor_image.lower():
+            donor_candidates = list(dict.fromkeys([donor_image] + donor_candidates))
+        donor_plan = _usable_floor_plan_value(donor.values)
+        if donor_count < 1 and not donor_embeds and not donor_plan:
             continue
-        # Only share when the donor actually has more media than a lone
-        # email featured image (or has brochure embeds).
-        if donor_count < 2 and not donor_embeds and len(donor_candidates) < 2 and not donor_plan:
+        # Share whenever a sibling is under-filled or missing a real plan —
+        # even a single enriched photo / embed beats a blank cell.
+        if (
+            donor_count < 1
+            and not donor_embeds
+            and len(donor_candidates) < 1
+            and not donor_plan
+        ):
             continue
         for prop in props:
             if prop is donor:
                 continue
-            if _source_photo_count(prop) >= _MIN_HIGH_RES_TARGET:
-                pass
-            else:
+            if _source_photo_count(prop) < _MIN_HIGH_RES_TARGET:
                 if donor_embeds and not prop.values.get("_brochure_embedded_assets"):
                     prop.values["_brochure_embedded_assets"] = donor_embeds
                 if donor_candidates:
@@ -673,7 +684,8 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
                     prop.values["_high_res_candidates"] = list(
                         dict.fromkeys(existing + donor_candidates)
                     )[:_SOFT_MAX_EMBEDDED_PHOTOS]
-            if donor_plan and _is_viewer_floorplan_url(str(prop.values.get("Floor Plan") or "")):
+            sibling_plan = str(prop.values.get("Floor Plan") or "").strip()
+            if donor_plan and (not sibling_plan or _is_viewer_floorplan_url(sibling_plan)):
                 prop.values["Floor Plan"] = donor_plan
 
 
@@ -919,12 +931,37 @@ def _retrieve(url, fetcher, extractor, deadline=None):
     # (MetSpace/Workplace Plus: viewer chrome has ≥2 imgs but zero real
     # photos). Optionally skip other nested PDFs when a Knotel-style
     # property page already exposes a confident HTML photo gallery.
-    page_photos = sum(
-        1 for a in combined.assets
-        if a.classification == AssetType.PROPERTY_IMAGE
-        and (a.url or a.content)
-        and (a.association_confidence or 0) >= 0.8
-    )
+    def _confident_page_photo_count(assets):
+        """Count real listing photos only — not Drive/Box chrome or icons.
+
+        Confirmed real (2026-07, GPE): decorative/preview images on the
+        property HTML page were counted as a "full gallery", which skipped
+        the nested "Download brochure" PDF that actually held the photos.
+        Require image-like URLs or embedded bitmaps plus association.
+        """
+        count = 0
+        for asset in assets:
+            if asset.classification != AssetType.PROPERTY_IMAGE:
+                continue
+            if (asset.association_confidence or 0) < 0.8:
+                continue
+            if asset.content:
+                count += 1
+                continue
+            url = (asset.url or "").lower()
+            if not url:
+                continue
+            if any(
+                token in url
+                for token in (
+                    ".jpg", ".jpeg", ".png", ".webp", "/assets/", "/media/",
+                    "/digitalassets", "/image", "/photo", "/gallery/",
+                )
+            ):
+                count += 1
+        return count
+
+    page_photos = _confident_page_photo_count(combined.assets)
     brochure_assets = [
         a for a in combined.assets
         if a.classification == AssetType.BROCHURE and a.url and a.url != resource.final_url
@@ -944,6 +981,8 @@ def _retrieve(url, fetcher, extractor, deadline=None):
         if _is_hosted_document_download(asset.url):
             must_follow.append(asset.url)
         elif is_download_brochure and page_photos < _MIN_HIGH_RES_TARGET:
+            # Explicit CTA — follow even when a couple of HTML heroes exist
+            # so GPE/landlord PDFs can fill the 5–8 High Res band.
             must_follow.append(asset.url)
         else:
             optional_docs.append(asset.url)

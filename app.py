@@ -480,9 +480,11 @@ def _finish_ok_result(r, batch_dir, batch_id, name, deadline):
     # this — a building can genuinely have two distinct real
     # photos, one from a promotional blurb and one from its own
     # listing card). Turns 2+ into a small gallery page, 1 into a
-    # direct link, same as the PDF path above.
+    # direct link, same as the PDF path above. Sibling floors then
+    # share finalized High Res / Floor Plan when one floor succeeded.
     upload_jobs.extend(_materialize_brochure_assets(r["records"], batch_dir, batch_id, name))
     upload_jobs.extend(_finalize_high_res_images(r["records"], batch_dir, batch_id, name, deadline=deadline))
+    _share_finalized_media_across_buildings(r["records"])
     image_warning = _image_coverage_warning(r["records"], r.get("method") or "")
     if image_warning:
         existing = (r.get("warning") or "").strip()
@@ -935,7 +937,12 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 # URLs (MetSpace blank slots; floor-plan diagrams mis-kept as
                 # "source" photos).
                 if deadline is not None and time.monotonic() >= deadline - 5:
-                    result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
+                    # Under deadline still reject obvious floor-plan URLs —
+                    # soft-accept must never reintroduce plans into High Res.
+                    if _FLOORPLAN_URL_RE.search(candidate or ""):
+                        result = {"ok": False, "url": candidate, "status": "IMAGE_IS_FLOORPLAN"}
+                    else:
+                        result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
                 else:
                     validator_kwargs = {"cache": validation_cache}
                     if deadline is not None:
@@ -965,7 +972,9 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 # every row of a building after its first.
                 result = cached
             elif deadline is not None and time.monotonic() >= deadline - 5:
-                if _accept_image_url_under_deadline(candidate):
+                if _FLOORPLAN_URL_RE.search(candidate or ""):
+                    result = {"ok": False, "url": candidate, "status": "IMAGE_IS_FLOORPLAN"}
+                elif _accept_image_url_under_deadline(candidate):
                     result = {
                         "ok": True,
                         "url": candidate,
@@ -1291,7 +1300,7 @@ def _share_materialized_media_across_buildings(records):
         if donor_image and ".html" not in donor_image.lower():
             donor_candidates.insert(0, donor_image)
         donor_plan = _usable_floor_plan(donor)
-        if _candidate_count(donor) < 2 and not donor_plan:
+        if _candidate_count(donor) < 1 and not donor_plan:
             continue
         for record in group:
             if record is donor:
@@ -1304,8 +1313,66 @@ def _share_materialized_media_across_buildings(records):
                 record["_high_res_candidates"] = list(
                     dict.fromkeys(existing + donor_candidates)
                 )[:MAX_HIGH_RES_IMAGES]
-            if donor_plan and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+            sibling_plan = str(record.get("Floor Plan") or "").strip()
+            if donor_plan and (not sibling_plan or _is_replaceable_viewer_url(sibling_plan)):
                 record["Floor Plan"] = donor_plan
+
+
+def _share_finalized_media_across_buildings(records):
+    """After finalize, copy High Res galleries + Floor Plans to sibling floors.
+
+    Materialise sharing only moves candidates. Finalize may still leave a
+    later floor blank (deadline / validation order) even when an earlier
+    floor of the same building already has a multi-image gallery. Provider-
+    neutral fan-out closes that gap for Knotel/GPE/Union/MetSpace/WP+.
+    """
+    by_building = defaultdict(list)
+    for record in records:
+        building = str(record.get("Building") or "").strip().lower()
+        if building:
+            by_building[building].append(record)
+
+    def _hr_score(record):
+        hr = str(record.get("High Res Images") or "").strip()
+        count = int(record.get("_high_res_image_count") or (1 if hr else 0))
+        plan = str(record.get("Floor Plan") or "").strip()
+        usable_plan = 1 if plan and not _is_replaceable_viewer_url(plan) else 0
+        return (count, usable_plan, 1 if hr else 0)
+
+    for group in by_building.values():
+        if len(group) < 2:
+            continue
+        donor = max(group, key=_hr_score)
+        donor_hr = str(donor.get("High Res Images") or "").strip()
+        donor_count = int(donor.get("_high_res_image_count") or (1 if donor_hr else 0))
+        donor_plan = str(donor.get("Floor Plan") or "").strip()
+        if donor_plan and _is_replaceable_viewer_url(donor_plan):
+            donor_plan = ""
+        if not donor_hr and not donor_plan:
+            continue
+        for record in group:
+            if record is donor:
+                continue
+            sibling_hr = str(record.get("High Res Images") or "").strip()
+            sibling_count = int(record.get("_high_res_image_count") or (1 if sibling_hr else 0))
+            if donor_hr and (not sibling_hr or sibling_count < donor_count):
+                record["High Res Images"] = donor_hr
+                record["_high_res_image_count"] = donor_count
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic(
+                        "IMAGES_SHARED_FROM_SIBLING_FLOOR",
+                        detail="Copied finalized High Res Images from another floor of the same building.",
+                    )
+                )
+            sibling_plan = str(record.get("Floor Plan") or "").strip()
+            if donor_plan and (not sibling_plan or _is_replaceable_viewer_url(sibling_plan)):
+                record["Floor Plan"] = donor_plan
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic(
+                        "FLOORPLAN_SHARED_FROM_SIBLING_FLOOR",
+                        detail="Copied Floor Plan from another floor of the same building.",
+                    )
+                )
 
 
 def _upload_all(jobs):
