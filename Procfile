@@ -1,1 +1,1 @@
-web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 180 --max-requests 20 --max-requests-jitter 5
+web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 960 --max-requests 20 --max-requests-jitter 5

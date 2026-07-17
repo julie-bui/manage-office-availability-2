@@ -6,6 +6,7 @@ Unlike an earlier version of this module, each file's records stay
 separate (one output spreadsheet per source file, not one combined master).
 """
 import gc
+import os
 import re
 import time
 from datetime import date
@@ -24,34 +25,38 @@ from .spreadsheet_chunks import extract_in_chunks, is_large_spreadsheet, is_spre
 from .validation import validate_properties
 
 # Confirmed via a real Render SIGKILL (2026-07, "UNION - Availability -
-# June 26 - City 2.xlsx"): gunicorn's own --timeout 120 (render.yaml) is a
-# hard ceiling on the WHOLE request, not just geocoding — file reading,
-# LLM calls, and image attachment for every file in the batch all count
-# against it too. A file with many bare-name/ambiguous buildings can rack
-# up enough cumulative extraction.address_lookup._throttle_rpm waiting
-# and per-building retries to blow straight past that ceiling with no
-# warning — the crash was caught mid-sleep inside _throttle_rpm itself.
+# June 26 - City 2.xlsx"): gunicorn's own --timeout is a hard ceiling on
+# the WHOLE request, not just geocoding — file reading, LLM calls, and
+# image attachment for every file in the batch all count against it too.
 # _geocode_records checks this deadline before EVERY per-building lookup
-# (Nominatim or Gemini) and, once passed, stops attempting further
-# lookups entirely for the rest of the batch — trading address
-# completeness (those rows fall back to "Needs manual lookup", the same
-# honest flag used for any other geocoding gap) for a guaranteed response
-# within the timeout, rather than a silent SIGKILL that returns nothing
-# at all. Raised with Railway gunicorn --timeout 180: 160s leaves ~20s
-# margin for finalize/write after enrichment (real Box/Drive PDF embeds
-# need the extra wall-clock vs Render free-tier's old 100/120 split).
-BATCH_DEADLINE_SECONDS = 160
+# and, once passed, stops further lookups for the rest of the batch —
+# trading address completeness for a guaranteed response rather than a
+# silent SIGKILL. Default 900s assumes paid Railway RAM/CPU and matches
+# gunicorn --timeout 960 (Procfile/railway.toml/render.yaml). Override
+# with BATCH_DEADLINE_SECONDS when a smaller/larger wall is needed.
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+BATCH_DEADLINE_SECONDS = _env_positive_float("BATCH_DEADLINE_SECONDS", 900.0)
 # Do not start another optional address/geocode operation unless there is
 # enough shared time for the longest bounded lookup (Gemini: 25s) plus a
 # small scheduling margin. Core extraction and spreadsheet writing win.
 OPTIONAL_LOOKUP_START_SECONDS = 30
 # Reserve wall-clock for finalize/write after the last file's enrichment.
-# Must cover gallery HTML writes for every earlier file: Union Box waves
-# previously ran into (and past) batch_deadline and left Knotel finalize
-# with OPTIONAL_IMAGE_VALIDATION_SKIPPED for every Directus URL.
-# Galleries now use absolute download URLs (not inlined base64), so finalize
-# needs less reserve — free those seconds for Knotel/GPE under-target rows.
-ENRICHMENT_FINALIZE_RESERVE_SECONDS = 18
+# Must cover gallery HTML writes for every earlier file. With longer paid
+# Railway deadlines, keep a larger absolute reserve so multi-file batches
+# still finish galleries after heavy Union Box waves.
+ENRICHMENT_FINALIZE_RESERVE_SECONDS = _env_positive_float(
+    "ENRICHMENT_FINALIZE_RESERVE_SECONDS", 45.0
+)
 # Confirmed real (2026-07 batch MetSpace+Knotel+WP+Union): enrichment used
 # ONE absolute deadline shared by every file. MetSpace (first) consumed the
 # budget fetching Drive brochure photos; Knotel (second) kept only its

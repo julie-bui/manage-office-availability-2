@@ -174,11 +174,11 @@ def test_dropbox_hosted_document_gets_direct_download_candidate():
     assert "dl=1" in candidates[0].url
 
 
-def test_budget_skip_seeds_high_res_for_drive_not_property_pages():
-    """Under enrichment deadline, resolvable document PDFs seed High Res.
+def test_budget_skip_leaves_high_res_blank_not_document_seed():
+    """Under enrichment deadline, document PDFs stay on Brochure PDF only.
 
-    Drive/Box/.pdf keep a usable High Res click-through. Plain HTML property
-    pages stay on Brochure PDF only — blank High Res beats a non-image seed.
+    Drive/Box/.pdf must not be copied into High Res as a click-through
+    fallback — blank High Res beats a brochure document URL in that column.
     """
     from extraction.brochure import enrich_properties
     from extraction.models import Property
@@ -215,7 +215,8 @@ def test_budget_skip_seeds_high_res_for_drive_not_property_pages():
         extractor=lambda *a, **k: None,
         deadline=time.monotonic() - 1,
     )
-    assert "drive.usercontent.google.com" in (props[0].values.get("High Res Images") or "")
+    assert "drive.google.com" in (props[0].values.get("Brochure PDF") or "")
+    assert not props[0].values.get("High Res Images")
     assert props[1].values.get("Brochure PDF") == page
     assert not props[1].values.get("High Res Images")
 
@@ -245,8 +246,8 @@ def test_finalize_keeps_featured_photo_and_property_page_fallback(tmp_path):
     assert int(record.get("_high_res_image_count") or 0) >= 1
 
 
-def test_finalize_falls_back_to_property_page_when_photos_rejected(tmp_path):
-    """When featured photo fails validation, Brochure PDF page stays in High Res."""
+def test_finalize_blanks_high_res_when_only_document_urls_remain(tmp_path):
+    """When featured photo fails validation, do not fall back to Brochure PDF page."""
     featured = "https://cdn.example.test/photo.jpg"
     page = "https://property.example.test/buildings/example-tower"
     record = {
@@ -263,8 +264,8 @@ def test_finalize_falls_back_to_property_page_when_photos_rejected(tmp_path):
             "Example",
             image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
         )
-    assert record["High Res Images"] == page
-    assert any(item.status == "HIGH_RES_BROCHURE_SEEDED" for item in record["_link_diagnostics"])
+    assert not record.get("High Res Images")
+    assert record.get("Brochure PDF") == page
 
 
 def test_brochure_media_seed_helpers_are_provider_neutral():

@@ -482,10 +482,9 @@ def test_linked_enrichment_deadline_uses_batch_headroom(monkeypatch):
     )[0]
     assert result["status"] == "ok"
     assert captured["deadline"] == pytest.approx(batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS, abs=0.5)
-    # Old behaviour: min(deadline-20, now+15) ≈ batch_deadline-65 for an 80s
-    # batch. Solo files still receive nearly the full remaining enrichment
-    # headroom (deadline - finalize reserve).
-    assert captured["deadline"] > batch_deadline - 20
+    # Solo files still receive nearly the full remaining enrichment headroom
+    # (deadline - finalize reserve), not an arbitrary 15s hard cap.
+    assert captured["deadline"] > batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS - 1
 
 
 def test_batch_file_index_preserves_fair_share_when_finishing_one_at_a_time(monkeypatch):
@@ -511,11 +510,13 @@ def test_batch_file_index_preserves_fair_share_when_finishing_one_at_a_time(monk
     )
     assert len(captured) == 1
     pool_end = batch_deadline - pipeline.ENRICHMENT_FINALIZE_RESERVE_SECONDS
-    # File index 1 of 4 → rem/3 at call start, leaving ~2/3 for later files —
-    # not rem/1 (what a naive one-path call would get).
-    expected = captured[0]["started"] + (pool_end - captured[0]["started"]) / 3
-    assert captured[0]["deadline"] == pytest.approx(expected, abs=1.0)
-    assert (pool_end - captured[0]["deadline"]) > 20
+    # File index 1 of 4 → base share rem/3 at call start. Sheets with many
+    # unique brochure URLs may receive a larger weighted slice, but must still
+    # leave a meaningful remainder for later files.
+    base_deadline = captured[0]["started"] + (pool_end - captured[0]["started"]) / 3
+    assert captured[0]["deadline"] + 0.01 >= base_deadline
+    assert captured[0]["deadline"] <= pool_end + 0.5
+    assert (pool_end - captured[0]["deadline"]) > 5
 
 
 def test_batch_enrichment_splits_deadline_across_files(monkeypatch):
@@ -1493,14 +1494,12 @@ def test_finalize_soft_accept_under_deadline_rejects_floorplan_named_url(tmp_pat
     assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])
 
 
-def test_enrichment_seeds_high_res_when_budget_skips_unique_box_urls():
-    """Floor Plan seed alone must not leave High Res blank under deadline.
+def test_enrichment_does_not_seed_high_res_with_box_document_when_budget_skips():
+    """Floor Plan / Brochure seeds must not copy document URLs into High Res.
 
     Provider-neutral: uses synthetic Box share URLs (any spreadsheet with
     hosted document links), not a UNION-specific rule path.
     """
-    from extraction.brochure import _usable_high_res_seed_url
-
     props = []
     for i in range(15):
         box = f"https://app.box.com/s/share{i:04d}abcd"
@@ -1521,18 +1520,17 @@ def test_enrichment_seeds_high_res_when_budget_skips_unique_box_urls():
 
     enrich_properties(props, fetcher=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")), extractor=lambda *a, **k: None, deadline=time.monotonic() - 1)
     for prop in props:
-        hr = prop.values.get("High Res Images") or ""
-        assert hr, "High Res must be seeded when enrichment is skipped"
-        assert "/shared/static/" in hr and hr.endswith(".pdf")
-        assert hr == _usable_high_res_seed_url(prop.values["Brochure PDF"])
-        # Floor Plan seed is independent — still present.
+        assert not (prop.values.get("High Res Images") or ""), "High Res must stay blank when enrichment is skipped"
+        assert "box.com" in (prop.values.get("Brochure PDF") or "")
+        # Parse-time Floor Plan seed may still be present until finalize clears it.
         assert prop.values.get("Floor Plan")
 
 
-def test_finalize_preserves_brochure_high_res_seed(tmp_path):
+def test_finalize_clears_brochure_high_res_and_floor_plan_document_urls(tmp_path):
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     record = {
         "Building": "Example House",
+        "Brochure PDF": "https://app.box.com/s/examplebrochure",
         "Floor Plan": "https://app.box.com/s/examplebrochure",
         "High Res Images": seed,
         "_high_res_candidates": [seed],
@@ -1545,8 +1543,12 @@ def test_finalize_preserves_brochure_high_res_seed(tmp_path):
             "Example",
             image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
         )
-    assert record["High Res Images"] == seed
-    assert any(item.status == "HIGH_RES_BROCHURE_SEEDED" for item in record["_link_diagnostics"])
+    assert not record.get("High Res Images")
+    assert not record.get("Floor Plan")
+    assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
+    statuses = {item.status for item in record["_link_diagnostics"]}
+    assert "HIGH_RES_DOCUMENT_PLACEHOLDER_CLEARED" in statuses or "NO_IMAGES_DISCOVERED" in statuses
+    assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" in statuses
 
 
 def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
@@ -1554,6 +1556,8 @@ def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
     photo = "https://cdn.test/office.jpg"
     record = {
         "Building": "Example House",
+        "Brochure PDF": "https://app.box.com/s/examplebrochure",
+        "Floor Plan": "https://app.box.com/s/examplebrochure",
         "High Res Images": seed,
         "_high_res_candidates": [seed, photo],
         "_source_high_res_candidates": [photo],
@@ -1568,6 +1572,32 @@ def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
         )
     assert record["High Res Images"] == photo
     assert "box.com" not in (record.get("High Res Images") or "")
+    # Floor Plan document placeholder cleared when no real plan image exists.
+    assert not record.get("Floor Plan")
+    assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
+
+
+def test_finalize_keeps_real_floor_plan_image_and_gallery(tmp_path):
+    photo = "https://cdn.test/office.jpg"
+    plan = "https://service.test/api/download/batch/plan.png"
+    record = {
+        "Building": "Example House",
+        "Brochure PDF": "https://app.box.com/s/examplebrochure",
+        "Floor Plan": plan,
+        "High Res Images": "",
+        "_high_res_candidates": [photo],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record["High Res Images"] == photo
+    assert record["Floor Plan"] == plan
+    assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
 
 
 def test_usable_high_res_seed_rewrites_box_and_drive():

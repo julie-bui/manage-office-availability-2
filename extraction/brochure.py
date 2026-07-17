@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import json
 from io import BytesIO
+import os
 import re
 import time
 from typing import Callable, Iterable, List
@@ -43,21 +44,42 @@ MAX_BROCHURE_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 6
 PRIMARY_STRONG_CONFIDENCE = 0.8
 BROCHURE_RELIABLE_CONFIDENCE = 0.7
-# Prefer a single in-flight large PDF on tight RSS; allow two concurrent
-# Box/Drive static fetches when headroom exists so high unique-URL sheets
-# (UNION City) cover more buildings before the batch deadline.
-_ENRICHMENT_FETCH_WORKERS = 2
-# Softened for Railway (≥1GB services): previously 220 for Render ~512MB.
-# Two concurrent ~22MB Box PDFs are fine until RSS is genuinely high.
-_ENRICHMENT_PARALLEL_RSS_MB = 400.0
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Paid Railway defaults: several concurrent large Box/Drive PDFs when RSS
+# allows. Override with ENRICHMENT_FETCH_WORKERS / ENRICHMENT_PARALLEL_RSS_MB.
+_ENRICHMENT_FETCH_WORKERS = _env_positive_int("ENRICHMENT_FETCH_WORKERS", 6)
+_ENRICHMENT_PARALLEL_RSS_MB = _env_positive_float("ENRICHMENT_PARALLEL_RSS_MB", 2400.0)
 # Soft caps on embedded bitmaps retained per brochure PDF. Matches
 # app.MAX_HIGH_RES_IMAGES so RSS does not hold uncapped MetSpace Drive
 # embeds until materialise. Floor plans capped separately.
 _SOFT_MAX_EMBEDDED_PHOTOS = 8
 _SOFT_MAX_EMBEDDED_FLOORPLANS = 4
 _MIN_HIGH_RES_TARGET = 5
-# Light extract under deadline pressure: a few first-page photos beat blank
-# High Res. Full galleries still run when budget/RSS allow.
+# Light extract under extreme deadline pressure only: a few first-page
+# photos beat blank High Res. Full galleries run whenever budget/RSS allow.
 _LIGHT_MAX_PHOTOS = 3
 _LIGHT_MAX_PAGES = 5
 # Skip *optional* nested PDFs on property HTML pages that already expose a
@@ -65,13 +87,21 @@ _LIGHT_MAX_PAGES = 5
 # download targets — those viewer shells often have ≥2 chrome images and
 # are the ONLY photo/floorplan source for MetSpace / Workplace Plus.
 _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
-# Soft stop before container OOM. Tuned for Railway services with ~1GB+
-# (Render free-tier was 360 on ~512MB). Still well below a hard kill so
-# brochure URL seeds remain a last resort, not the default.
-_RSS_ENRICHMENT_CEILING_MB = 750.0
+# Soft stop before container OOM. Paid Railway high-RAM default (~6GiB);
+# still well below a hard kill. Override with ENRICHMENT_RSS_CEILING_MB.
+_RSS_ENRICHMENT_CEILING_MB = _env_positive_float("ENRICHMENT_RSS_CEILING_MB", 6144.0)
 # When many unique hosted PDFs remain, stop deepening already-complete
 # galleries so blank High Res rows still get a fetch attempt.
 _SKIP_COMPLETE_WHEN_UNIQUE_GE = 24
+# Only force light first-page extracts when a huge unique-URL backlog remains
+# *and* little wall-clock is left — prefer full embeds on paid Railway.
+_FORCE_LIGHT_UNIQUE_REMAINING = 80
+_HTML_ONLY_REMAINING_SECONDS = 12.0
+_LIGHT_PDF_REMAINING_SECONDS = 35.0
+_SKIP_WAVE_REMAINING_SECONDS = 5.0
+# Box/Drive static PDFs are often 15-25MB; allow a long transfer when the
+# enrichment deadline still has headroom.
+_HOSTED_PDF_FETCH_TIMEOUT_SECONDS = 60.0
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -227,9 +257,12 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
                     # Cap under the remaining enrichment window so a late
                     # UNION wave cannot overrun batch_deadline and erase
                     # earlier files' galleries at finalize time.
-                    effective_timeout = min(18.0, max(0.5, deadline - time.monotonic()))
+                    effective_timeout = min(
+                        _HOSTED_PDF_FETCH_TIMEOUT_SECONDS,
+                        max(0.5, deadline - time.monotonic()),
+                    )
                 else:
-                    effective_timeout = max(float(timeout), 20.0)
+                    effective_timeout = max(float(timeout), _HOSTED_PDF_FETCH_TIMEOUT_SECONDS)
             else:
                 effective_timeout = request_timeout
             response = requests.get(current, timeout=effective_timeout, headers={"User-Agent": "OfficeAvailability/1.0"}, allow_redirects=False)
@@ -494,7 +527,11 @@ def _is_box_host(host: str) -> bool:
 
 
 def _is_viewer_floorplan_url(url: str) -> bool:
-    """True when Floor Plan still points at a JS viewer rather than a bitmap."""
+    """True when Floor Plan still points at a document/viewer rather than a bitmap.
+
+    Box/Drive/Dropbox/.pdf placeholders are temporary enrichment seeds only;
+    they must not count as a finished Floor Plan cell value.
+    """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
         return False
@@ -504,9 +541,14 @@ def _is_viewer_floorplan_url(url: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     path = (parsed.path or "").lower()
-    if _is_box_host(host) and "/shared/static/" not in path:
+    query = (parsed.query or "").lower()
+    if _is_box_host(host):
         return True
-    if host in {"drive.google.com", "docs.google.com"}:
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return True
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if path.endswith(".pdf") or "export=download" in query:
         return True
     if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
         return True
@@ -1249,60 +1291,14 @@ def _promote_brochure_pdf_cell(prop: Property, extraction: BrochureExtraction) -
 
 
 def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
-    """Last-resort High Res seed from a real document PDF URL only.
+    """No-op: brochure/document URLs must not become High Res cell values.
 
-    When enrichment cannot finish Box/Drive/.pdf embeds, leave a direct
-    document link in High Res so the cell stays usable. Real photo embeds
-    replace this seed when a later fetch succeeds. Never seed after an
-    identity conflict — that brochure does not belong to this listing.
-
-    HTML property/listing pages are NOT seeded into High Res (Railway-era
-    preference: blank or real photos beat a non-image click-through).
-    Brochure PDF still keeps the page URL / promoted PDF separately.
-
-    Always stash a document seed on `_high_res_candidates` even when a
-    featured photo already exists, so finalize can fall back if soft-accept
-    rejects that photo under deadline.
+    High Res / Floor Plan final cells are real extracted images or hosted
+    gallery HTML only. Brochure PDF keeps the document URL. Enrichment still
+    fetches aggressively; when budget/RSS skips a unique PDF the High Res
+    cell stays blank rather than showing a Box/Drive/.pdf click-through.
     """
-    conflict = {
-        "LINK_IDENTITY_HARD_CONFLICT",
-        "LINK_IDENTITY_AMBIGUOUS",
-    }
-    for diagnostic in prop.link_diagnostics:
-        if diagnostic.status in conflict:
-            original = normalize_url(diagnostic.original_url or "") or str(diagnostic.original_url or "")
-            if original == brochure_url or original == normalize_url(brochure_url):
-                return
-    seed = _usable_high_res_seed_url(brochure_url)
-    # Prefer promoted Brochure PDF document when the enrichment seed was
-    # still the HTML property page.
-    brochure_cell = str(prop.values.get("Brochure PDF") or "").strip()
-    brochure_doc = _as_brochure_document_url(brochure_cell)
-    if brochure_doc:
-        seed = brochure_doc
-    if not seed or not _is_direct_document_pdf(seed):
-        return
-    candidates = list(prop.values.get("_high_res_candidates") or [])
-    if seed not in candidates:
-        # Photos stay first; seed is a finalize fallback, not a gallery pad.
-        prop.values["_high_res_candidates"] = [
-            c for c in candidates if c and c != seed
-        ] + [seed]
-    if _source_photo_count(prop) > 0:
-        return
-    if prop.values.get("_brochure_embedded_assets"):
-        return
-    existing = str(prop.values.get("High Res Images") or "").strip()
-    if existing and not _is_brochure_media_seed_url(existing):
-        return
-    prop.values["High Res Images"] = seed
-    _record_diagnostic(
-        prop,
-        "HIGH_RES_BROCHURE_SEEDED",
-        brochure_url,
-        seed,
-        detail="Seeded High Res with brochure document URL after enrichment budget/RSS skip.",
-    )
+    return
 
 
 def _floor_plan_already_seeded(prop: Property) -> bool:
@@ -1465,9 +1461,9 @@ def enrich_properties(
     # Fetch in small waves and apply immediately. Holding every UNION Box
     # PDF (~22MB) plus extracted page images in one giant cache (the old
     # "fetch all, then merge" approach) blew past Render's free-tier RSS
-    # ceiling before spreadsheet write. Prefer a single in-flight large
-    # PDF when RSS is tight; allow two concurrent static fetches when
-    # headroom exists so high unique-URL sheets cover more buildings.
+    # ceiling before spreadsheet write. Paid Railway: several concurrent
+    # static fetches when RSS is below ENRICHMENT_PARALLEL_RSS_MB; serialize
+    # only when memory is genuinely high.
     hosted_pending = any(
         "/shared/static/" in (urlparse(url).path or "")
         or _box_shared_name(url)
@@ -1576,15 +1572,19 @@ def enrich_properties(
         # for remaining property pages instead of hard-skipping — nested
         # landlord PDFs are what burn the budget.
         remaining = None if deadline is None else deadline - time.monotonic()
-        # Softened for Railway: keep fetching real nested/hosted PDFs longer
-        # before falling back to HTML-only or light first-page extracts.
-        html_only = remaining is not None and remaining < 8.0
-        light_pdf = remaining is not None and remaining < 15.0
-        # Many unique hosted PDFs: prefer light first-page photos for the
-        # whole wave so later buildings still get High Res, not only Floor Plan.
-        if len(pending) - wave_start >= 16 and hosted_pending:
+        # Paid Railway: prefer full embed extraction. Only cut over to
+        # HTML-only / light first-page extracts when the file's fair share
+        # is nearly gone — not as soon as a modest unique-URL backlog exists.
+        html_only = remaining is not None and remaining < _HTML_ONLY_REMAINING_SECONDS
+        light_pdf = remaining is not None and remaining < _LIGHT_PDF_REMAINING_SECONDS
+        if (
+            len(pending) - wave_start >= _FORCE_LIGHT_UNIQUE_REMAINING
+            and hosted_pending
+            and remaining is not None
+            and remaining < _LIGHT_PDF_REMAINING_SECONDS * 2
+        ):
             light_pdf = True
-        if deadline is not None and remaining <= 3.0:
+        if deadline is not None and remaining <= _SKIP_WAVE_REMAINING_SECONDS:
             for brochure_url in pending[wave_start:]:
                 _skip_url(brochure_url)
             break
@@ -1610,7 +1610,7 @@ def enrich_properties(
                     )
                     _seed_high_res_fallback(prop, brochure_url)
             break
-        # Shrink wave when RSS is climbing so two 22MB Box PDFs do not land together.
+        # Shrink wave when RSS is climbing so several large Box PDFs do not land together.
         effective_wave = wave_size
         if hosted_pending and rss >= _ENRICHMENT_PARALLEL_RSS_MB:
             effective_wave = 1
@@ -1656,11 +1656,7 @@ def enrich_properties(
                     result = exc
                 _apply_result(brochure_url, result)
                 gc.collect()
-    # Final pass: every brochure-linked row keeps a usable High Res link
-    # even when later unique PDFs never entered a fetch wave.
-    for brochure_url, members in by_url.items():
-        for _, prop, _ in members:
-            _seed_high_res_fallback(prop, brochure_url)
+    # Brochure document URLs stay on Brochure PDF only — never seed High Res.
     _share_underfilled_building_photos(properties)
     return properties
 

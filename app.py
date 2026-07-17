@@ -799,9 +799,10 @@ def _local_download_path(url, batch_dir, batch_id):
 def _is_replaceable_viewer_url(url):
     """True for JS/document viewers that should yield to a hosted floor-plan image.
 
-    UNION pre-fills Floor Plan with app.box.com/s/… and Workplace Plus /
-    MetSpace use Drive viewers — those block materialising a real plan
-    bitmap unless overwritten here.
+    UNION pre-fills Floor Plan with app.box.com/s/… (and sometimes
+    /shared/static/….pdf) and Workplace Plus / MetSpace use Drive viewers —
+    those block materialising a real plan bitmap unless overwritten here.
+    Brochure PDF keeps the document URL; Floor Plan must end as a real image.
     """
     text = str(url or "").strip()
     if not text:
@@ -814,9 +815,14 @@ def _is_replaceable_viewer_url(url):
         return False
     host = (parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
-    if "box.com" in host and "/shared/static/" not in path:
+    query = (parsed.query or "").lower()
+    if "box.com" in host:
         return True
-    if host in {"drive.google.com", "docs.google.com"}:
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return True
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if path.endswith(".pdf") or "export=download" in query:
         return True
     if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
         return True
@@ -824,15 +830,15 @@ def _is_replaceable_viewer_url(url):
 
 
 def _is_brochure_media_seed_url(url):
-    """True for brochure/document URLs used as High Res click-through seeds.
+    """True for brochure/document URLs that must not remain as High Res/Floor Plan.
 
-    Matches extraction.brochure seeding: Box/Drive/Dropbox/.pdf and any
-    non-image http(s) brochure/property page keep High Res non-blank when
-    photo extraction cannot finish every unique URL. Image-like CMS/CDN
-    URLs are never treated as seeds.
+    Matches Box/Drive/Dropbox/.pdf and non-image http(s) brochure/property
+    pages. Image-like CMS/CDN URLs and hosted gallery HTML are never seeds.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
+        return False
+    if ".html" in text.lower() and "/api/download/" in text:
         return False
     try:
         parsed = urlparse(text)
@@ -840,6 +846,8 @@ def _is_brochure_media_seed_url(url):
         return False
     host = (parsed.hostname or parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
+    if path.endswith(".html"):
+        return False
     if "box.com" in host:
         return True
     if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
@@ -854,6 +862,39 @@ def _is_brochure_media_seed_url(url):
     return False
 
 
+def _clear_document_media_placeholders(records):
+    """Strip brochure/document URLs from Floor Plan and High Res final cells.
+
+    Brochure PDF is the only column that may keep Box/Drive/.pdf links.
+    High Res must be a hosted image or gallery HTML; Floor Plan a real plan
+    image (or blank).
+    """
+    for record in records:
+        high_res = str(record.get("High Res Images") or "").strip()
+        if high_res and _is_brochure_media_seed_url(high_res):
+            record["High Res Images"] = ""
+            record["_high_res_image_count"] = 0
+            record.setdefault("_link_diagnostics", []).append(
+                LinkDiagnostic(
+                    "HIGH_RES_DOCUMENT_PLACEHOLDER_CLEARED",
+                    original_url=high_res,
+                    detail="Removed brochure/document URL from High Res Images; Brochure PDF retains the document link.",
+                )
+            )
+        floor_plan = str(record.get("Floor Plan") or "").strip()
+        if floor_plan and (
+            _is_brochure_media_seed_url(floor_plan) or _is_replaceable_viewer_url(floor_plan)
+        ):
+            # _is_replaceable_viewer_url is True for blank; only clear non-empty.
+            record["Floor Plan"] = ""
+            record.setdefault("_link_diagnostics", []).append(
+                LinkDiagnostic(
+                    "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED",
+                    original_url=floor_plan,
+                    detail="Removed brochure/document viewer URL from Floor Plan; Brochure PDF retains the document link.",
+                )
+            )
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -865,12 +906,14 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     so deadline pressure cannot reintroduce those duplicates. Local batch
     assets are validated from disk; gallery HTML uses absolute download URLs
     (not base64 data URIs) so free-tier RSS stays bounded.
+
+    Brochure/document URLs are never kept as High Res — only real images or
+    hosted gallery HTML. Brochure PDF retains the document link.
     """
     jobs = []
     gallery_url_by_candidates = {}
     gallery_count = 0
     validation_cache = {}
-    from extraction.brochure import _usable_high_res_seed_url
 
     def _finalize_photo_need(record):
         cands = list(record.get("_high_res_candidates") or [])
@@ -896,61 +939,39 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         if source_candidates:
             raw_candidates = source_candidates + list(raw_candidates or [])
         existing_image = str(record.get("High Res Images") or "")
-        brochure_seed = existing_image if _is_brochure_media_seed_url(existing_image) else ""
-        if not brochure_seed:
-            brochure_pdf = str(record.get("Brochure PDF") or "").strip()
-            if brochure_pdf and _is_brochure_media_seed_url(brochure_pdf):
-                brochure_seed = _usable_high_res_seed_url(brochure_pdf) or brochure_pdf
         if not raw_candidates and existing_image and ".html" not in existing_image.lower():
             if _is_brochure_media_seed_url(existing_image):
-                record["High Res Images"] = existing_image
+                record["High Res Images"] = ""
                 record["_high_res_image_count"] = 0
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic(
-                        "HIGH_RES_BROCHURE_SEEDED",
-                        final_url=existing_image,
-                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
+                        "HIGH_RES_DOCUMENT_PLACEHOLDER_CLEARED",
+                        original_url=existing_image,
+                        detail="Cleared brochure document URL from High Res (no photo candidates).",
                     )
                 )
                 continue
             raw_candidates = [existing_image]
         if not raw_candidates:
-            if brochure_seed:
-                record["High Res Images"] = brochure_seed
+            if existing_image and _is_brochure_media_seed_url(existing_image):
+                record["High Res Images"] = ""
                 record["_high_res_image_count"] = 0
-                record.setdefault("_link_diagnostics", []).append(
-                    LinkDiagnostic(
-                        "HIGH_RES_BROCHURE_SEEDED",
-                        final_url=brochure_seed,
-                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
-                    )
-                )
             elif not existing_image:
                 record["_high_res_image_count"] = 0
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
                 )
             continue
-        seed_from_candidates = [url for url in raw_candidates if _is_brochure_media_seed_url(url)]
-        if seed_from_candidates and not brochure_seed:
-            brochure_seed = seed_from_candidates[0]
         photo_raw = [url for url in raw_candidates if not _is_brochure_media_seed_url(url)]
         if not photo_raw:
-            if brochure_seed:
-                record["High Res Images"] = brochure_seed
-                record["_high_res_image_count"] = 0
-                record.setdefault("_link_diagnostics", []).append(
-                    LinkDiagnostic(
-                        "HIGH_RES_BROCHURE_SEEDED",
-                        final_url=brochure_seed,
-                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
-                    )
+            record["High Res Images"] = ""
+            record["_high_res_image_count"] = 0
+            record.setdefault("_link_diagnostics", []).append(
+                LinkDiagnostic(
+                    "NO_IMAGES_DISCOVERED",
+                    detail="Only brochure/document URLs were present; High Res left blank (Brochure PDF keeps the document).",
                 )
-            elif not existing_image:
-                record["_high_res_image_count"] = 0
-                record.setdefault("_link_diagnostics", []).append(
-                    LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
-                )
+            )
             continue
         candidates = merge_candidate_urls(photo_raw)
         diagnostics = record.setdefault("_link_diagnostics", [])
@@ -1124,20 +1145,9 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if status == "IMAGE_IS_FLOORPLAN" and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
                 record["Floor Plan"] = candidate
         if not valid:
-            # Prefer a brochure document seed over wiping High Res blank —
-            # UNION/Box rows skipped by enrichment budget still need a link.
-            if brochure_seed:
-                record["High Res Images"] = brochure_seed
-                record["_high_res_image_count"] = 0
-                diagnostics.append(LinkDiagnostic(
-                    "HIGH_RES_BROCHURE_SEEDED",
-                    final_url=brochure_seed,
-                    detail="Photo candidates rejected; kept brochure document URL as High Res fallback.",
-                ))
-            else:
-                record["High Res Images"] = ""
-                record["_high_res_image_count"] = 0
-                diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
+            record["High Res Images"] = ""
+            record["_high_res_image_count"] = 0
+            diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
 
         if len(candidates) > len(valid) and len(valid) >= MAX_HIGH_RES_IMAGES:
@@ -1194,6 +1204,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 detail=f"{len(valid)} image(s); target is {MIN_HIGH_RES_IMAGES}-{MAX_HIGH_RES_IMAGES} when source/brochures provide photos.",
             ))
 
+    _clear_document_media_placeholders(records)
     return jobs
 
 
