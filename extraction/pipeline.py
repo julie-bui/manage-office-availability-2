@@ -305,6 +305,7 @@ def process_files(
         llm_source_name = None
         if raw_records:
             result["method"] = f"rule:{rule_name}"
+            memlog.log(f"after rule:{rule_name}", filename)
             report.record("EXTRACTION", "PASS", f"rule:{rule_name}", len(raw_records))
             if rule_name == "Spreadsheet Blocks":
                 blocks = len({((r.get("_spreadsheet_block") or {}).get("sheet"), (r.get("_spreadsheet_block") or {}).get("address_row")) for r in raw_records})
@@ -321,6 +322,26 @@ def process_files(
                 report.record("PROPERTY_BLOCKS_FOUND", "PASS", item_count=blocks)
                 report.record("DETERMINISTIC_BLOCKS_PARSED", "PASS", item_count=blocks)
                 report.record("LLM_BLOCKS_REQUIRED", "PASS", item_count=0)
+            # Drop the full sheet text copy before brochure enrichment so
+            # rule:UNION Box PDFs are not competing with a second copy of the
+            # grid in RSS (same free-as-we-go pattern as the LLM branch).
+            content["text"] = ""
+            gc.collect()
+        elif rule_name == "UNION":
+            # detect() matched but parse() produced nothing — never send this
+            # to Gemini (huge context + Box enrichment was a confirmed OOM).
+            memlog.log("UNION rule matched with zero rows; skipping LLM", filename)
+            result["status"] = "error"
+            result["error"] = (
+                "UNION availability layout was recognized but no listing rows "
+                "could be parsed; refusing LLM fallback to avoid out-of-memory failures. "
+                "Please report this file layout."
+            )
+            result["method"] = "rule:UNION"
+            report.record("EXTRACTION", "FAIL", result["error"])
+            result["processing_report"] = report.as_dict()
+            results.append(result)
+            continue
         else:
             memlog.log("before LLM call", filename)
             try:

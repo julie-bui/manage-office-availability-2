@@ -46,21 +46,88 @@ def test_spreadsheet_blocks_manchester_contacts_and_desk_features():
 
 
 def test_union_detects_filename_even_without_intro_blurb():
+    """Area-tab headers use the sub-market name, not 'City', as the building column.
+
+    Confirmed real (2026-07, Clerkenwell & Farringdon single-tab export): detect
+    matched on the UNION filename but parse returned [] because Building was
+    unmapped, so the pipeline fell through to Gemini (memlog 'before LLM call')
+    and OOM'd during enrichment.
+    """
     content = {
         "filename": "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
-        "text": "City Floor Size sq.ft",
+        "text": "Floor Size sq.ft Brochure",
         "sheet_names": ["Clerkenwell & Farringdon"],
         "tables": [
             [
-                ["", "City", "Floor", "Current Spec", "Size sq.ft", "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
-                ["", "Example House", "3rd", "Fitted", "1466", "2 Years", "20157", "165", "CLICK HERE"],
+                [
+                    "Unnamed: 0",
+                    "Clerkenwell & Farringdon ",
+                    "Floor",
+                    "Current spec",
+                    "Size sq.ft",
+                    "Minimum Term",
+                    "Monthly Rate",
+                    "Price p/sq.ft",
+                    "Brochure",
+                ],
+                ["", "55 Goswell Road", "3rd (South)", "Fitted", "624", "2 Years", "8840", "170", "CLICK HERE"],
+                ["", "109-111 Farringdon Road", "3rd (Front)", "Fitted", "1030", "3 Years", "14162.5", "165", "CLICK HERE"],
             ]
         ],
     }
     assert union.detect(content)
     records = union.parse(content)
-    assert records
-    assert records[0]["Building"] == "Example House"
+    assert len(records) == 2
+    assert records[0]["Building"] == "55 Goswell Road"
+    assert records[0]["Area"] == "Clerkenwell & Farringdon"
+    assert records[1]["Building"] == "109-111 Farringdon Road"
+    from extraction.rules import try_rules
+
+    rule, via_try = try_rules(content)
+    assert rule == "UNION"
+    assert len(via_try) == 2
+
+
+def test_union_parses_clerkernwell_sheet_from_full_pack():
+    """Prefer the real multi-sheet pack when present; otherwise synthetic layout."""
+    from pathlib import Path
+
+    from extraction.file_readers import read_file
+    from extraction.rules import try_rules
+
+    pack = Path(__file__).resolve().parent.parent / "UNION - Availability - June 26.xlsx"
+    if pack.is_file():
+        content = read_file(pack)
+        content["filename"] = pack.name
+        content["source_file_name"] = pack.name
+        # Solo-export shape: only the Clerkenwell tab + area filename.
+        idx = (content.get("sheet_names") or []).index("Clerkenwell & Farringdon")
+        solo = {
+            "filename": "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+            "source_file_name": "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+            "sheet_names": ["Clerkenwell & Farringdon"],
+            "tables": [content["tables"][idx]],
+            "text": "",
+            "row_links": [
+                r
+                for r in (content.get("row_links") or [])
+                if "Clerkenwell" in (r.get("sheet_name") or "")
+            ],
+        }
+        rule, records = try_rules(solo)
+        assert rule == "UNION"
+        assert len(records) >= 15
+        assert any("Goswell" in (r.get("Building") or "") for r in records)
+        assert any("Farringdon" in (r.get("Building") or "") for r in records)
+        # Full pack must also keep non-City area tabs (previously City-only).
+        rule_full, full = try_rules(content)
+        assert rule_full == "UNION"
+        areas = {r.get("Area") for r in full}
+        assert "Clerkenwell & Farringdon" in areas
+        assert "City" in areas
+        assert len(full) > 90
+    else:
+        test_union_detects_filename_even_without_intro_blurb()
 
 
 def test_knotel_keeps_high_trust_view_brochure_as_extra_seed():

@@ -8,13 +8,14 @@ pandas' value-only read and previously only recoverable after an LLM parse
 ("doesn't process") and High Res / Brochure stay blank even though the
 hyperlinks were always present.
 
-Layout (per sheet — City, Shoreditch, …):
-    intro / instruction rows
+Layout (per sheet — City, Shoreditch, Clerkenwell & Farringdon, …):
+    intro / instruction rows (City tab) OR header on row 0 (area tabs)
     | City | Floor | Current Spec | Size sq.ft | Minimum Term | Monthly Rate | Price p/sq.ft | Brochure |
     | <building name> | 3rd | Fitted | 1466 | 2 Years | 20157.5 | 165 | CLICK HERE |
 
-Column "City" holds the building name (UNION's own header wording); the sheet
-name / Area column value is the sub-market, not a UK city name.
+Column "City" holds the building name on the City tab. Area tabs label that
+same column with the sub-market name (e.g. "Clerkenwell & Farringdon") —
+``_infer_building_column`` maps it so single-tab exports still use rule:UNION.
 
 Confirmed real (2026-07): some UNION rows label the Box landlord PDF
 "FLOOR PLAN" even when no separate brochure link exists — treating that as
@@ -29,7 +30,8 @@ from extraction.xlsx_links import associate_row_links, _normalize_for_matching
 _HEADER_ALIASES = {
     "Building": (("city",), ("building",), ("address",), ("property",)),
     "Floor/Unit": (("floor",), ("unit",)),
-    "Special Features": (("current", "spec"), ("spec",), ("fit", "out")),
+    # Some area tabs use "Category" instead of "Current Spec".
+    "Special Features": (("current", "spec"), ("spec",), ("fit", "out"), ("category",)),
     "Size (sq ft)": (("size",), ("sq", "ft"), ("sqft",)),
     "Min. Term": (("minimum", "term"), ("min", "term"), ("term",)),
     "Marketing Price (Based on Min Term) PCM": (("monthly", "rate"), ("pcm",), ("per", "month")),
@@ -107,9 +109,14 @@ def _find_header_tables(tables):
     for table_index, table in enumerate(tables):
         for index, row in enumerate(table[:20]):
             columns = _header_columns(row)
-            if len(columns) < _MIN_HEADER_MATCHES:
-                continue
             if "Floor/Unit" not in columns or "Size (sq ft)" not in columns:
+                continue
+            # Area exports (Clerkenwell & Farringdon, Midtown, …) label the
+            # building column with the sub-market name, not "City". Infer it
+            # before the match-count / Building checks so parse() is not empty
+            # while detect() still matched on Floor+Size+Brochure.
+            columns = _infer_building_column(row, columns)
+            if len(columns) < _MIN_HEADER_MATCHES:
                 continue
             if "Building" not in columns and "Brochure PDF" not in columns:
                 continue
@@ -122,7 +129,7 @@ def _header_columns(row):
     result = {}
     for index, raw in enumerate(row):
         text = re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).strip()
-        if not text:
+        if not text or text.startswith("unnamed"):
             continue
         for target, alternatives in _HEADER_ALIASES.items():
             if target in result:
@@ -131,6 +138,45 @@ def _header_columns(row):
                 result[target] = index
                 break
     return result
+
+
+def _infer_building_column(row, columns):
+    """Map the building-name column when its header is the area name.
+
+    Confirmed real (2026-07): single-tab exports like
+    ``UNION - … Clerkenwell & Farringdon.xlsx`` use headers such as
+    ``Clerkenwell & Farringdon | Floor | … | Brochure`` — detect() matched
+    (filename + Floor/Size/Brochure) but parse() skipped every row because
+    Building was unmapped, so the pipeline fell through to Gemini and OOM'd.
+    """
+    if "Building" in columns:
+        return columns
+    floor_idx = columns.get("Floor/Unit")
+    if floor_idx is None or floor_idx < 1:
+        return columns
+    # Prefer the nearest non-empty / non-Unnamed cell left of Floor.
+    chosen = None
+    for cand in range(floor_idx - 1, -1, -1):
+        if cand >= len(row):
+            continue
+        text = str(row[cand] or "").strip()
+        if not text or text.lower().startswith("unnamed"):
+            continue
+        # Do not steal a column already claimed as another field.
+        if cand in columns.values():
+            continue
+        chosen = cand
+        break
+    if chosen is None:
+        # Fallback: immediate left of Floor (standard UNION grid layout).
+        cand = floor_idx - 1
+        if cand not in columns.values():
+            chosen = cand
+    if chosen is None:
+        return columns
+    out = dict(columns)
+    out["Building"] = chosen
+    return out
 
 
 def _looks_like_header(row):

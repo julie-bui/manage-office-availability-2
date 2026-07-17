@@ -25,7 +25,13 @@ RULES = [
 
 
 def try_rules(content):
-    """Returns (rule_name, records) for the first matching rule, or (None, None)."""
+    """Returns (rule_name, records) for the first matching rule, or (None, None).
+
+    UNION is special-cased: if detect() matches but parse() returns nothing,
+    we still return ``("UNION", [])`` so the pipeline can refuse the Gemini
+    fallback (confirmed 2026-07: Clerkenwell & Farringdon area exports OOMed
+    after that silent fall-through).
+    """
     for name, module in RULES:
         try:
             if module.detect(content):
@@ -49,6 +55,13 @@ def try_rules(content):
                         "(likely an email/document template variant this rule wasn't built for) "
                         "— falling back to the LLM instead of trusting it"
                     )
+                    continue
+                if name == "UNION":
+                    print(
+                        "[rules] 'UNION' matched but parse() returned no rows "
+                        "— refusing LLM fallback (area-tab header / OOM guard)"
+                    )
+                    return name, []
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as exc:
             # A rule erroring out just means it doesn't apply cleanly —
             # fall through to the next rule / eventually the LLM.
