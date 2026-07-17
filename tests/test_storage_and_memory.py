@@ -343,6 +343,147 @@ def test_small_host_keeps_html_gallery_skips_nested_pdf(monkeypatch):
     brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
     assert fetched == ["https://property.test/listing"]
     assert len(prop.values.get("_high_res_candidates") or []) >= 5
+    # Soft-skip nested PDFs on 1GB, but still assign the HTML floorplan.pdf link.
+    assert prop.values.get("Floor Plan") == "https://cdn.property.test/floorplan.pdf"
+
+
+def test_floorplan_pdf_fallback_when_no_bitmap(monkeypatch):
+    """When no plan bitmap is extracted, Floor Plan keeps the website floorplan.pdf."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 0.0)
+
+    plan_pdf = "https://cdn.property.test/media/level-2_2d-floorplans_a4.pdf"
+
+    def fetch(url, deadline=None):
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-1.4 empty", "application/pdf", url, url)
+        return BrochureResource(b"<html>listing</html>", "text/html", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        if payload.startswith(b"%PDF"):
+            # Nested extract runs but yields no bitmap plan.
+            return BrochureExtraction(source_document, identity_text="Example House, EC1A 1AA")
+        photos = [
+            classify_candidate(
+                AssetCandidate(
+                    f"https://cdn.property.test/media/{name}.jpg",
+                    source_document,
+                    alt_text=name,
+                    association_confidence=0.85,
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                )
+            )
+            for name in ("a", "b", "c", "d", "e")
+        ]
+        return BrochureExtraction(
+            source_document,
+            assets=photos
+            + [
+                classify_candidate(
+                    AssetCandidate(
+                        plan_pdf,
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        alt_text="Floor plan",
+                    )
+                ),
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/brochure.pdf",
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.BROCHURE,
+                        confidence=0.9,
+                        anchor_text="Download brochure",
+                    )
+                ),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://property.test/listing",
+            }
+        ),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert prop.values.get("Floor Plan") == plan_pdf
+    # PDF seed must not count as finished — nested brochure still hunted.
+    assert not brochure._floor_plan_already_seeded(prop)
+
+
+def test_floorplan_bitmap_url_wins_over_pdf(monkeypatch):
+    """Hosted plan image replaces / beats a floorplan.pdf seed when both exist."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
+    monkeypatch.setattr(brochure, "_RSS_ENRICHMENT_CEILING_MB", 3900.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 0.0)
+
+    plan_pdf = "https://cdn.property.test/media/level-2_2d-floorplans_a4.pdf"
+    plan_png = "https://cdn.property.test/media/level-2-floorplan.png"
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"<html>listing</html>", "text/html", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        return BrochureExtraction(
+            source_document,
+            assets=[
+                classify_candidate(
+                    AssetCandidate(
+                        plan_pdf,
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        alt_text="Floor plan PDF",
+                    )
+                ),
+                classify_candidate(
+                    AssetCandidate(
+                        plan_png,
+                        source_document,
+                        mime_type="image/png",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.95,
+                        alt_text="Floor plan",
+                    )
+                ),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://property.test/listing",
+                "Floor Plan": plan_pdf,
+            }
+        ),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert prop.values.get("Floor Plan") == plan_png
 
 
 def test_hosted_box_pdf_light_extract_prefers_photos_when_real_plan_seeded(monkeypatch):
@@ -533,11 +674,11 @@ def test_floorplan_pdf_link_on_page_still_fetches_nested_brochure_for_bitmap(mon
 
     Confirmed real (GPE 2026-07): property pages expose *floorplans*.pdf
     assets. Counting them as has_floorplan_seed skipped the nested brochure
-    bitmap extract, while merge/finalize also refuse .pdf Floor Plan cells —
-    leaving Floor Plan blank.
+    bitmap extract. PDF links may still be kept as a Floor Plan click-through
+    fallback when no bitmap is produced (see test_floorplan_pdf_fallback_*).
 
     Requires ≥2GB host (high-memory path). On Railway 1GB this nested PDF
-    path soft-skips before fetch — Floor Plan stays blank until plan upgrade.
+    path soft-skips before fetch — Floor Plan still gets the HTML pdf link.
     """
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
     monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)

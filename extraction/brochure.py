@@ -728,8 +728,9 @@ def _is_box_host(host: str) -> bool:
 def _is_viewer_floorplan_url(url: str) -> bool:
     """True when Floor Plan still points at a document/viewer rather than a bitmap.
 
-    Box/Drive/Dropbox/.pdf placeholders are temporary enrichment seeds only;
-    they must not count as a finished Floor Plan cell value.
+    Box/Drive/Dropbox/.pdf placeholders must not count as a *finished* Floor
+    Plan for nested bitmap hunting. Dedicated .pdf links may still be kept as
+    a click-through fallback when no hosted plan image was extracted.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -752,6 +753,47 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
         return True
     return False
+
+
+def _is_floor_plan_pdf_fallback_url(url: str) -> bool:
+    """True for a keepable .pdf Floor Plan click-through when no bitmap exists.
+
+    Dedicated *floorplan*.pdf links and other landlord/website PDFs qualify.
+    Box/Drive/Dropbox brochure shells do not — those stay Brochure PDF only.
+    """
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    path = (parsed.path or "").lower()
+    if not path.endswith(".pdf"):
+        return False
+    low = text.lower()
+    if any(token in low for token in ("floorplan", "floor-plan", "floor_plan")):
+        return True
+    host = (parsed.hostname or "").lower()
+    if _is_box_host(host):
+        return False
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return False
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return False
+    return True
+
+
+def _shareable_floor_plan_value(values) -> str:
+    """Bitmap Floor Plan, or a .pdf click-through fallback — not Box/Drive shells."""
+    plan = str(values.get("Floor Plan") or "").strip()
+    if not plan:
+        return ""
+    if not _is_viewer_floorplan_url(plan):
+        return plan
+    if _is_floor_plan_pdf_fallback_url(plan):
+        return plan
+    return ""
 
 
 def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
@@ -1613,8 +1655,8 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
     only finish the first few unique brochure URLs before the deadline —
     without this, the bottom half of the sheet stays on a single featured
     email image even though a sibling floor already has a full gallery.
-    Also copies a real (non-viewer) Floor Plan when siblings still have a
-    Box/Drive viewer placeholder or blank cell.
+    Also copies a real Floor Plan (hosted image or .pdf fallback) when siblings
+    still have a Box/Drive viewer placeholder or blank cell.
     """
     by_building = defaultdict(list)
     for prop in properties:
@@ -1629,7 +1671,7 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
             key=lambda item: (
                 _source_photo_count(item),
                 len(item.values.get("_brochure_embedded_assets") or []),
-                1 if _usable_floor_plan_value(item.values) else 0,
+                1 if _shareable_floor_plan_value(item.values) else 0,
             ),
         )
         donor_count = _source_photo_count(donor)
@@ -1638,7 +1680,7 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
         donor_image = str(donor.values.get("High Res Images") or "").strip()
         if donor_image and ".html" not in donor_image.lower():
             donor_candidates = list(dict.fromkeys([donor_image] + donor_candidates))
-        donor_plan = _usable_floor_plan_value(donor.values)
+        donor_plan = _shareable_floor_plan_value(donor.values)
         if donor_count < 1 and not donor_embeds and not donor_plan:
             continue
         # Share whenever a sibling is under-filled or missing a real plan —
@@ -1665,7 +1707,13 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
                         dict.fromkeys(existing + donor_candidates)
                     )[:_SOFT_MAX_EMBEDDED_PHOTOS]
             sibling_plan = str(prop.values.get("Floor Plan") or "").strip()
-            if donor_plan and (not sibling_plan or _is_viewer_floorplan_url(sibling_plan)):
+            sibling_shareable = _shareable_floor_plan_value(prop.values)
+            donor_is_image = bool(donor_plan) and not _is_viewer_floorplan_url(donor_plan)
+            if donor_plan and (
+                not sibling_plan
+                or (not sibling_shareable and _is_viewer_floorplan_url(sibling_plan))
+                or (donor_is_image and _is_floor_plan_pdf_fallback_url(sibling_plan))
+            ):
                 prop.values["Floor Plan"] = donor_plan
 
 
@@ -2222,10 +2270,11 @@ def _retrieve(
                 documents.append(doc_url)
             if len(documents) >= 2:
                 break
-    # Dedicated *floorplan*.pdf links on the property page are not usable
-    # Floor Plan cell values (cleared as document placeholders), but they
-    # are excellent nested sources for a plan bitmap when the brochure
-    # pull is thin — follow one alongside Download brochure.
+    # Dedicated *floorplan*.pdf links on the property page are not finished
+    # Floor Plan cell values for nested bitmap hunting, but they are excellent
+    # nested sources for a plan bitmap when the brochure pull is thin — follow
+    # one alongside Download brochure. Soft-skip / failed extract still keeps
+    # them as a Floor Plan click-through fallback in _merge.
     if need_nested_plans:
         for asset in combined.assets:
             if asset.classification != AssetType.FLOORPLAN or not asset.url:
@@ -2418,13 +2467,38 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     property_images = [
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
     ][:_MAX_PROPERTY_IMAGES]
-    floorplans = [
+    # Prefer hosted/bitmap Floor Plan URLs. Fall back to dedicated .pdf plan
+    # links (old GPE behaviour) when nested bitmap extract soft-skipped or
+    # failed — never treat those PDFs as finished for has_floorplan_seed.
+    image_floorplans = [
         a.url
         for a in prop.assets
         if a.classification == AssetType.FLOORPLAN
         and a.url
         and not _is_viewer_floorplan_url(a.url)
     ]
+    brochure_norm = normalize_url(str(prop.values.get("Brochure PDF") or "")) or ""
+
+    def _pdf_plan_rank(url: str) -> tuple:
+        low = (url or "").lower()
+        named = 0 if any(token in low for token in ("floorplan", "floor-plan", "floor_plan", "floor plan")) else 1
+        return (named, low)
+
+    pdf_floorplan_fallbacks = sorted(
+        {
+            a.url
+            for a in prop.assets
+            if a.classification == AssetType.FLOORPLAN
+            and a.url
+            and _is_floor_plan_pdf_fallback_url(a.url)
+            and (normalize_url(a.url) or a.url) != brochure_norm
+        },
+        key=_pdf_plan_rank,
+    )
+    has_embedded_plan = any(
+        a.classification == AssetType.FLOORPLAN and a.content
+        for a in (prop.values.get("_brochure_embedded_assets") or [])
+    )
     existing_images = str(prop.values.get("High Res Images") or "")
     # Brochure/PDF seeds are click-through fallbacks, not photos — real
     # property images must replace them (UNION High Res coverage path).
@@ -2461,13 +2535,21 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     ):
         prop.values["High Res Images"] = ""
     existing_plan = str(prop.values.get("Floor Plan") or "")
-    if floorplans:
-        plan_evidence = _evidence(floorplans[0], extraction.source_document, 0.9)
+    if image_floorplans:
+        plan_evidence = _evidence(image_floorplans[0], extraction.source_document, 0.9)
         if not existing_plan:
             _apply(prop, "Floor Plan", plan_evidence)
         elif _is_viewer_floorplan_url(existing_plan):
             # Primary xlsx_links often pre-fills Box/Drive viewer URLs at
             # confidence 1.0 — still replace them with a real plan asset URL.
+            _set_value(prop, "Floor Plan", plan_evidence)
+    elif not has_embedded_plan and pdf_floorplan_fallbacks:
+        # No bitmap URL and no embedded plan bytes — keep website floorplan.pdf
+        # (or similar) so the cell is not blank after soft-skip / extract fail.
+        plan_evidence = _evidence(pdf_floorplan_fallbacks[0], extraction.source_document, 0.75)
+        if not existing_plan:
+            _apply(prop, "Floor Plan", plan_evidence)
+        elif _is_viewer_floorplan_url(existing_plan) and not _is_floor_plan_pdf_fallback_url(existing_plan):
             _set_value(prop, "Floor Plan", plan_evidence)
     # Building-level text fills (contacts, features, term, postcode, …).
     for field, evidence in extraction.fields.items():

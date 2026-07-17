@@ -1587,6 +1587,31 @@ def test_finalize_clears_brochure_high_res_and_floor_plan_document_urls(tmp_path
     assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" in statuses
 
 
+def test_finalize_keeps_floorplan_pdf_fallback_when_no_bitmap(tmp_path):
+    """Dedicated website floorplan.pdf survives finalize when no plan image exists."""
+    plan_pdf = "https://cdn.property.test/media/level-2_2d-floorplans_a4.pdf"
+    photo = "https://cdn.test/office.jpg"
+    record = {
+        "Building": "Example House",
+        "Brochure PDF": "https://cdn.property.test/brochure.pdf",
+        "Floor Plan": plan_pdf,
+        "High Res Images": "",
+        "_high_res_candidates": [photo],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record["Floor Plan"] == plan_pdf
+    assert record["High Res Images"] == photo
+    # High Res must still never keep a brochure PDF seed.
+    assert not app_module._is_brochure_media_seed_url(record["High Res Images"])
+
+
 def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     photo = "https://cdn.test/office.jpg"

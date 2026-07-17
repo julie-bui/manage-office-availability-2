@@ -853,7 +853,8 @@ def _is_replaceable_viewer_url(url):
     UNION pre-fills Floor Plan with app.box.com/s/… (and sometimes
     /shared/static/….pdf) and Workplace Plus / MetSpace use Drive viewers —
     those block materialising a real plan bitmap unless overwritten here.
-    Brochure PDF keeps the document URL; Floor Plan must end as a real image.
+    Brochure PDF keeps the document URL. When no bitmap exists, a direct
+    .pdf Floor Plan click-through may remain (see _clear_document_media_placeholders).
     """
     text = str(url or "").strip()
     if not text:
@@ -878,6 +879,35 @@ def _is_replaceable_viewer_url(url):
     if any(token in host for token in ("canva.com", "canva.link", "pitch.com")):
         return True
     return False
+
+
+def _is_floor_plan_pdf_fallback_url(url):
+    """True for a keepable .pdf Floor Plan click-through when no bitmap exists.
+
+    Dedicated *floorplan*.pdf links and other landlord/website PDFs qualify.
+    Box/Drive/Dropbox brochure shells do not — those stay Brochure PDF only.
+    """
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    path = (parsed.path or "").lower()
+    if not path.endswith(".pdf"):
+        return False
+    low = text.lower()
+    if any(token in low for token in ("floorplan", "floor-plan", "floor_plan")):
+        return True
+    host = (parsed.hostname or parsed.netloc or "").lower()
+    if "box.com" in host:
+        return False
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return False
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return False
+    return True
 
 
 def _is_brochure_media_seed_url(url):
@@ -914,11 +944,12 @@ def _is_brochure_media_seed_url(url):
 
 
 def _clear_document_media_placeholders(records):
-    """Strip brochure/document URLs from Floor Plan and High Res final cells.
+    """Strip brochure/document URLs from High Res; keep Floor Plan .pdf fallbacks.
 
-    Brochure PDF is the only column that may keep Box/Drive/.pdf links.
-    High Res must be a hosted image or gallery HTML; Floor Plan a real plan
-    image (or blank).
+    Brochure PDF is the only column that may keep Box/Drive viewer shells.
+    High Res must be a hosted image or gallery HTML (never a brochure PDF).
+    Floor Plan prefers a real plan image; when none exists, a dedicated
+    website/brochure floorplan.pdf click-through is kept rather than blanked.
     """
     for record in records:
         high_res = str(record.get("High Res Images") or "").strip()
@@ -933,6 +964,9 @@ def _clear_document_media_placeholders(records):
                 )
             )
         floor_plan = str(record.get("Floor Plan") or "").strip()
+        if floor_plan and _is_floor_plan_pdf_fallback_url(floor_plan):
+            # Old-way fallback: dedicated floorplan.pdf when no bitmap was extracted.
+            continue
         if floor_plan and (
             _is_brochure_media_seed_url(floor_plan) or _is_replaceable_viewer_url(floor_plan)
         ):
@@ -1498,7 +1532,11 @@ def _share_materialized_media_across_buildings(records):
 
     def _usable_floor_plan(record):
         plan = str(record.get("Floor Plan") or "").strip()
-        if not plan or _is_replaceable_viewer_url(plan):
+        if not plan:
+            return ""
+        if _is_floor_plan_pdf_fallback_url(plan):
+            return plan
+        if _is_replaceable_viewer_url(plan):
             return ""
         return plan
 
@@ -1528,7 +1566,13 @@ def _share_materialized_media_across_buildings(records):
                     dict.fromkeys(existing + donor_candidates)
                 )[:MAX_HIGH_RES_IMAGES]
             sibling_plan = str(record.get("Floor Plan") or "").strip()
-            if donor_plan and (not sibling_plan or _is_replaceable_viewer_url(sibling_plan)):
+            sibling_usable = _usable_floor_plan(record)
+            donor_is_image = bool(donor_plan) and not _is_floor_plan_pdf_fallback_url(donor_plan)
+            if donor_plan and (
+                not sibling_plan
+                or (not sibling_usable and _is_replaceable_viewer_url(sibling_plan))
+                or (donor_is_image and _is_floor_plan_pdf_fallback_url(sibling_plan))
+            ):
                 record["Floor Plan"] = donor_plan
 
 
@@ -1546,11 +1590,20 @@ def _share_finalized_media_across_buildings(records):
         if building:
             by_building[building].append(record)
 
+    def _shareable_plan(record):
+        plan = str(record.get("Floor Plan") or "").strip()
+        if not plan:
+            return ""
+        if _is_floor_plan_pdf_fallback_url(plan):
+            return plan
+        if _is_replaceable_viewer_url(plan):
+            return ""
+        return plan
+
     def _hr_score(record):
         hr = str(record.get("High Res Images") or "").strip()
         count = int(record.get("_high_res_image_count") or (1 if hr else 0))
-        plan = str(record.get("Floor Plan") or "").strip()
-        usable_plan = 1 if plan and not _is_replaceable_viewer_url(plan) else 0
+        usable_plan = 1 if _shareable_plan(record) else 0
         return (count, usable_plan, 1 if hr else 0)
 
     for group in by_building.values():
@@ -1559,9 +1612,7 @@ def _share_finalized_media_across_buildings(records):
         donor = max(group, key=_hr_score)
         donor_hr = str(donor.get("High Res Images") or "").strip()
         donor_count = int(donor.get("_high_res_image_count") or (1 if donor_hr else 0))
-        donor_plan = str(donor.get("Floor Plan") or "").strip()
-        if donor_plan and _is_replaceable_viewer_url(donor_plan):
-            donor_plan = ""
+        donor_plan = _shareable_plan(donor)
         if not donor_hr and not donor_plan:
             continue
         for record in group:
@@ -1579,7 +1630,13 @@ def _share_finalized_media_across_buildings(records):
                     )
                 )
             sibling_plan = str(record.get("Floor Plan") or "").strip()
-            if donor_plan and (not sibling_plan or _is_replaceable_viewer_url(sibling_plan)):
+            sibling_shareable = _shareable_plan(record)
+            donor_is_image = bool(donor_plan) and not _is_floor_plan_pdf_fallback_url(donor_plan)
+            if donor_plan and (
+                not sibling_plan
+                or (not sibling_shareable and _is_replaceable_viewer_url(sibling_plan))
+                or (donor_is_image and _is_floor_plan_pdf_fallback_url(sibling_plan))
+            ):
                 record["Floor Plan"] = donor_plan
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic(
