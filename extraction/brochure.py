@@ -40,6 +40,7 @@ from .text_utils import (
     clean_special_features,
     is_useful_primary_special_features,
     looks_like_long_or_messy_features,
+    looks_like_ocr_layout_noise,
 )
 
 # Raised from 20MB after confirming real UNION Box shared brochures arrive
@@ -213,6 +214,12 @@ _SECTION_FIELDS = {
     "rent": "Special Features",
     "pricing": "Special Features",
 }
+# Prefer bullet amenity sections; description / commercial notes often pull
+# multi-column PDF layout OCR and should only fill when amenity sections are empty.
+_PREFERRED_FEATURE_HEADINGS = frozenset({"amenities", "features", "specification"})
+_FALLBACK_FEATURE_HEADINGS = frozenset(
+    {"description", "sustainability", "epc", "service charge", "business rates", "rates", "rent", "pricing"}
+)
 _HEADING_RE = re.compile(
     r"^(description|specification|amenities|features|sustainability|epc|"
     r"lease terms|minimum term|min term|term|availability|available|"
@@ -942,12 +949,18 @@ def _extract_fields(text: str, source_document: str):
                 sections.setdefault(current, []).append(match.group(2).strip())
         elif current and len(line) < 500:
             sections.setdefault(current, []).append(line)
-    feature_parts = []
+    preferred_features = []
+    fallback_features = []
     for heading, parts in sections.items():
         value = _dedupe_text("; ".join(parts))
         field = _SECTION_FIELDS[heading]
         if field == "Special Features":
-            feature_parts.append(value)
+            if heading in _PREFERRED_FEATURE_HEADINGS:
+                preferred_features.append(value)
+            elif heading in _FALLBACK_FEATURE_HEADINGS:
+                fallback_features.append(value)
+            else:
+                preferred_features.append(value)
         elif field == "Min. Term" and value:
             term = _normalize_min_term(value) or value
             fields[field] = _evidence(term, source_document, 0.72)
@@ -959,11 +972,8 @@ def _extract_fields(text: str, source_document: str):
             fields[field] = _evidence(value, source_document, 0.72)
         elif value and field not in _ADDRESS_LOCKED_FIELDS:
             fields[field] = _evidence(value, source_document, 0.72)
-    if feature_parts:
-        features = clean_special_features(
-            _dedupe_text("; ".join(feature_parts)),
-            force_amenity_list=True,
-        )
+    features = _brochure_special_features(preferred_features, fallback_features)
+    if features:
         fields["Special Features"] = _evidence(features, source_document, 0.74)
 
     if "Min. Term" not in fields:
@@ -989,6 +999,41 @@ def _extract_fields(text: str, source_document: str):
     for locked in _ADDRESS_LOCKED_FIELDS:
         fields.pop(locked, None)
     return fields
+
+
+def _brochure_special_features(preferred_parts, fallback_parts):
+    """Build Special Features from brochure sections, skipping OCR layout noise.
+
+    Amenity / features / specification bullets win. Description and commercial
+    fallback sections are used only when preferred sections are absent, and
+    only when the cleaned result is not PDF multi-column/vertical OCR junk.
+    """
+    for parts, is_fallback in ((preferred_parts, False), (fallback_parts, True)):
+        if not parts:
+            continue
+        raw = _dedupe_text("; ".join(parts))
+        if not raw:
+            continue
+        if looks_like_ocr_layout_noise(raw):
+            continue
+        if is_fallback and not _section_looks_like_amenity_bullets(raw):
+            continue
+        features = clean_special_features(raw, force_amenity_list=True)
+        if features:
+            return features
+    return ""
+
+
+def _section_looks_like_amenity_bullets(text):
+    """True when section text looks like amenity bullets rather than page OCR."""
+    if not text or looks_like_ocr_layout_noise(text):
+        return False
+    parts = [p.strip() for p in re.split(r"[;\n•·]+", text) if p.strip()]
+    if len(parts) >= 2:
+        avg = sum(len(p.split()) for p in parts) / len(parts)
+        return avg <= 12
+    words = text.split()
+    return 2 <= len(words) <= 40
 
 
 def _evidence(value, source_document, confidence):
@@ -2279,7 +2324,8 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
                 )
             )
         return
-    # Prefer short/useful primary sheet Special Features over long brochure essays.
+    # Prefer short/useful primary sheet Special Features (UNION Current Spec,
+    # price-drop notes, etc.) — never append or replace with brochure OCR/essays.
     if (
         field == "Special Features"
         and existing not in (None, "")
@@ -2287,16 +2333,40 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
     ):
         if _equivalent(existing, incoming):
             return
-        if looks_like_long_or_messy_features(incoming):
-            return
-        # Two short competing notes — keep primary and flag for review below.
+        # Keep the sheet value; only flag when brochure offers a different short note.
+        if not looks_like_long_or_messy_features(incoming):
+            prop.add_issue(
+                ValidationIssue(
+                    field,
+                    "Brochure value conflicts with the retained primary-source value.",
+                    Severity.WARNING,
+                    f"Primary: {existing} | Brochure: {incoming} | Source: {evidence.source_document}",
+                    "Compare the primary source and brochure before upload.",
+                    "brochure_conflict_resolution",
+                )
+            )
+        return
     if existing in (None, ""):
+        if field == "Special Features" and looks_like_long_or_messy_features(incoming):
+            # Still allow a cleaned amenity list through _set_value; skip raw OCR noise.
+            cleaned = clean_special_features(incoming, force_amenity_list=True) if isinstance(incoming, str) else ""
+            if not cleaned:
+                return
+            evidence = ExtractedValue(
+                cleaned,
+                evidence.source,
+                evidence.source_document,
+                evidence.extraction_method,
+                evidence.confidence,
+            )
         if evidence.confidence >= BROCHURE_RELIABLE_CONFIDENCE:
             _set_value(prop, field, evidence)
         return
     if _equivalent(existing, incoming):
         return
     if existing_confidence < PRIMARY_STRONG_CONFIDENCE and evidence.confidence > existing_confidence:
+        if field == "Special Features" and looks_like_long_or_messy_features(incoming):
+            return
         _set_value(prop, field, evidence)
         return
     prop.add_issue(
@@ -2315,6 +2385,8 @@ def _set_value(prop: Property, field: str, evidence: ExtractedValue) -> None:
     value = _dedupe_text(evidence.value) if isinstance(evidence.value, str) and ";" in evidence.value else evidence.value
     if field == "Special Features" and isinstance(value, str):
         value = clean_special_features(value, force_amenity_list=True)
+        if not value:
+            return
     prop.values[field] = value
     prop.provenance[field] = FieldProvenance(
         source=evidence.source,

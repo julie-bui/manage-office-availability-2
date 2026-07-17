@@ -9,10 +9,20 @@ from extraction.text_utils import (
     cap_special_features,
     clean_special_features,
     is_useful_primary_special_features,
+    looks_like_ocr_layout_noise,
 )
 
 
 BROCHURE = "https://files.example.test/example-brochure.pdf"
+
+# Confirmed real-style UNION brochure OCR: reversed words, exploded vertical
+# label, camelCase sheet headers mixed with one real amenity phrase.
+USER_OCR_MESSY = (
+    "SPACE; dr3; Currentfloortype 8desks; Fully fitted & "
+    "furnished 4 agile work stations; Squarefootage "
+    "Kitchen; 624; ecaps; A; noinU; morf; d; n; 2; h; t; u; o; "
+    "S"
+)
 
 
 def _words(n, stem="word"):
@@ -100,6 +110,38 @@ def test_clean_messy_brochure_amenity_dump():
     assert "Showers" in cleaned
 
 
+def test_clean_rejects_reversed_and_vertical_ocr_layout_noise():
+    assert looks_like_ocr_layout_noise(USER_OCR_MESSY)
+    cleaned = clean_special_features(USER_OCR_MESSY)
+    force = clean_special_features(USER_OCR_MESSY, force_amenity_list=True)
+    # Mostly garbage brochure fill → blank (do not salvage one phrase from OCR soup).
+    assert cleaned == ""
+    assert force == ""
+    for junk in (
+        "ecaps",
+        "noinU",
+        "morf",
+        "Currentfloortype",
+        "Squarefootage",
+        "dr3",
+        "624",
+        "d; n; 2; h; t; u; o; S",
+    ):
+        assert junk not in cleaned
+        assert junk not in force
+
+
+def test_clean_drops_reversed_words_and_single_char_runs_in_isolation():
+    assert clean_special_features("ecaps; noinU; morf", force_amenity_list=True) == ""
+    assert clean_special_features("d; n; 2; h; t; u; o; S", force_amenity_list=True) == ""
+    assert "Currentfloortype" not in clean_special_features(
+        "Currentfloortype 8desks; Bike storage", force_amenity_list=True
+    )
+    assert "Bike storage" in clean_special_features(
+        "Currentfloortype 8desks; Bike storage", force_amenity_list=True
+    )
+
+
 def test_clean_force_amenity_list_truncates_long_lists():
     items = [f"Feature {i}" for i in range(20)]
     cleaned = clean_special_features("; ".join(items), force_amenity_list=True)
@@ -135,8 +177,52 @@ def test_useful_primary_preferred_over_long_brochure_essay_without_conflict():
     assert not any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
 
 
+def test_useful_primary_preferred_over_ocr_layout_noise_fill():
+    primary = normalize_record(
+        {"Building": "Example House", "Brochure PDF": BROCHURE, "Special Features": "Fitted"}
+    )
+    prop = Property.from_record(primary, "primary.xlsx", "UNION", "rule:UNION")
+    result = BrochureExtraction(
+        BROCHURE,
+        {
+            "Special Features": ExtractedValue(
+                USER_OCR_MESSY, "brochure", BROCHURE, "test:brochure", 0.85
+            )
+        },
+    )
+    enriched = enrich_properties(
+        [prop],
+        fetcher=lambda url: (b"brochure", "application/pdf"),
+        extractor=lambda payload, content_type, source: result,
+    )[0]
+    assert enriched.values["Special Features"] == "Fitted"
+    assert not any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
+
+
+def test_blank_primary_does_not_fill_from_ocr_layout_noise():
+    primary = normalize_record(
+        {"Building": "Example House", "Brochure PDF": BROCHURE, "Special Features": ""}
+    )
+    prop = Property.from_record(primary, "primary.xlsx", "UNION", "rule:UNION")
+    result = BrochureExtraction(
+        BROCHURE,
+        {
+            "Special Features": ExtractedValue(
+                USER_OCR_MESSY, "brochure", BROCHURE, "test:brochure", 0.85
+            )
+        },
+    )
+    enriched = enrich_properties(
+        [prop],
+        fetcher=lambda url: (b"brochure", "application/pdf"),
+        extractor=lambda payload, content_type, source: result,
+    )[0]
+    assert not enriched.values.get("Special Features")
+
+
 def test_is_useful_primary_special_features():
     assert is_useful_primary_special_features("Fitted")
     assert is_useful_primary_special_features("Price drop: now £120 psf")
     assert not is_useful_primary_special_features("")
     assert not is_useful_primary_special_features(_words(100, "essay"))
+    assert not is_useful_primary_special_features(USER_OCR_MESSY)
