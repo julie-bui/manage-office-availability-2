@@ -27,16 +27,42 @@ LINK_LABELS = {
     "Floor Plan": "Floor Plan",
     "High Res Images": "High Res Images",
 }
-# Free-text columns that can run long enough to overflow into neighboring
-# cells — wrapped within their own cell instead, with row height grown to fit.
-WRAP_COLS = {"Special Features", "Contacts", "Assigned Agents"}
-# Every cell is centered on both axes, including the wrapped long-text
-# columns (Special Features/Contacts/Assigned Agents) — those just add
-# wrap_text on top of the same centering, so alignment is consistent
-# across every column rather than a mix of "center" and "top".
+# Every data cell wraps long text within its column (capped width below)
+# rather than spilling sideways; row height is grown to fit after widths
+# are finalized. Hyperlink columns keep short display labels so they stay
+# compact.
 CENTER_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 WRAP_ALIGNMENT = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LINE_HEIGHT = 15  # approx. points needed per wrapped line at 11pt Calibri
+MAX_COL_WIDTH = 45
+
+
+def _estimate_wrapped_lines(text, width):
+    """Estimate how many display lines wrapped text needs at the given column width."""
+    if not text:
+        return 1
+    col_width = max(width or 10, 1)
+    lines = 0
+    for paragraph in str(text).splitlines() or [""]:
+        # Empty paragraph (from a trailing newline / blank line) still takes a row.
+        lines += max(1, math.ceil(len(paragraph) / col_width)) if paragraph else 1
+    return max(lines, 1)
+
+
+def _apply_row_heights(ws, start_row, end_row, col_count):
+    """Set explicit row heights so wrap_text is visible without Excel AutoFit."""
+    for row_idx in range(start_row, end_row + 1):
+        max_lines = 1
+        for col_idx in range(1, col_count + 1):
+            letter = get_column_letter(col_idx)
+            cell = ws.cell(row=row_idx, column=col_idx)
+            text = str(cell.value) if cell.value is not None else ""
+            if not text:
+                continue
+            width = ws.column_dimensions[letter].width or 10
+            max_lines = max(max_lines, _estimate_wrapped_lines(text, width))
+        if max_lines > 1:
+            ws.row_dimensions[row_idx].height = max_lines * LINE_HEIGHT
 
 
 def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=False):
@@ -73,7 +99,7 @@ def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=False):
         for row_idx in range(2, last_row + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
             val = cell.value
-            cell.alignment = CENTER_ALIGNMENT
+            cell.alignment = WRAP_ALIGNMENT
             if col_name in CURRENCY_COLS and isinstance(val, (int, float)) and val != "":
                 cell.number_format = "£#,##0.00" if col_name.endswith("PSF") else "£#,##0"
             elif col_name in NUMBER_COLS and isinstance(val, (int, float)) and val != "":
@@ -89,27 +115,14 @@ def write_xlsx(path, records, sheet_title="Listings", include_qa_sheet=False):
                 cell.hyperlink = actual_url
                 cell.font = Font(color="FF0563C1", underline="single")
                 val = cell.value
-            elif col_name in WRAP_COLS:
-                cell.alignment = WRAP_ALIGNMENT
             max_len = max(max_len, len(str(val)) if val is not None else 0)
-        ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 45)
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 10), MAX_COL_WIDTH)
 
     # wrap_text alone doesn't make Excel grow the row to fit — that's a
     # rendering computation Excel only does when a human triggers "AutoFit
     # Row Height", not on file load. So estimate wrapped line count from the
-    # now-final column widths and set row height explicitly.
-    wrap_col_letters = [get_column_letter(i) for i, c in enumerate(COLUMNS, start=1) if c in WRAP_COLS]
-    for row_idx in range(2, last_row + 1):
-        max_lines = 1
-        for letter in wrap_col_letters:
-            cell = ws[f"{letter}{row_idx}"]
-            text = str(cell.value) if cell.value is not None else ""
-            if not text:
-                continue
-            width = ws.column_dimensions[letter].width or 10
-            max_lines = max(max_lines, math.ceil(len(text) / max(width, 1)))
-        if max_lines > 1:
-            ws.row_dimensions[row_idx].height = max_lines * LINE_HEIGHT
+    # now-final column widths and set row height explicitly for every column.
+    _apply_row_heights(ws, 2, last_row, len(COLUMNS))
 
     if include_qa_sheet:
         _write_qa_sheet(wb, records)
@@ -185,7 +198,10 @@ def _write_qa_sheet(workbook, records):
     if qa.max_row == 1:
         qa.append(["", "", "", "No validation issues detected", "INFO", "", "No action required"])
     for idx, name in enumerate(QA_COLUMNS, start=1):
-        qa.column_dimensions[get_column_letter(idx)].width = min(max(len(name) + 2, 16), 45)
+        qa.column_dimensions[get_column_letter(idx)].width = min(max(len(name) + 2, 16), MAX_COL_WIDTH)
     for row in qa.iter_rows():
         for cell in row:
             cell.alignment = WRAP_ALIGNMENT
+    # Same as Listings: wrap_text needs an explicit height estimate so long
+    # Issue / action text is visible without Excel AutoFit.
+    _apply_row_heights(qa, 2, qa.max_row, len(QA_COLUMNS))

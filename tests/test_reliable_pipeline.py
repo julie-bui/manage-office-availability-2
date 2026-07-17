@@ -8,7 +8,7 @@ from extraction.models import AssetCandidate, AssetType, Property
 from extraction.pipeline import _address_retry_candidates
 from extraction.schema import COLUMNS, normalize_record
 from extraction.validation import validate_property
-from spreadsheet import QA_COLUMNS, write_xlsx
+from spreadsheet import LINE_HEIGHT, QA_COLUMNS, _estimate_wrapped_lines, write_xlsx
 
 
 def test_postcode_extraction_and_normalisation():
@@ -78,6 +78,60 @@ def test_spreadsheet_named_mapping_hyperlinks_and_qa_sheet(tmp_path: Path):
     brochure_cell = listings.cell(2, COLUMNS.index("Brochure PDF") + 1)
     assert brochure_cell.hyperlink.target == "https://example.com/brochure.pdf"
     assert [cell.value for cell in workbook["QA Review"][1]] == QA_COLUMNS
+
+
+def test_spreadsheet_wraps_all_columns_and_grows_row_height(tmp_path: Path):
+    long_building = "A very long building name that should wrap within the capped column width instead of spilling sideways into neighbouring cells"
+    long_issue = (
+        "This validation issue message is intentionally long enough that the QA Review "
+        "sheet must estimate a multi-line row height once wrap_text is applied."
+    )
+    record = normalize_record(
+        {
+            "Building": long_building,
+            "Special Features": "Short feature",
+            "Brochure PDF": "https://example.com/brochure.pdf",
+            "_validation_issues": [
+                {
+                    "field": "Building",
+                    "message": long_issue,
+                    "severity": "warning",
+                    "value": long_building,
+                    "action": "Confirm the building name against the source document.",
+                }
+            ],
+        }
+    )
+    path = tmp_path / "wrap.xlsx"
+    write_xlsx(path, [record], include_qa_sheet=True)
+    workbook = load_workbook(path)
+    listings = workbook["Listings"]
+
+    for col_idx in range(1, len(COLUMNS) + 1):
+        cell = listings.cell(2, col_idx)
+        assert cell.alignment.wrap_text is True
+        assert cell.alignment.vertical == "center"
+        assert listings.column_dimensions[cell.column_letter].width <= 45
+
+    brochure_cell = listings.cell(2, COLUMNS.index("Brochure PDF") + 1)
+    assert brochure_cell.value == "Here"
+    assert brochure_cell.hyperlink.target == "https://example.com/brochure.pdf"
+
+    building_letter = listings.cell(2, COLUMNS.index("Building") + 1).column_letter
+    building_width = listings.column_dimensions[building_letter].width or 10
+    expected_lines = _estimate_wrapped_lines(long_building, building_width)
+    assert expected_lines > 1
+    assert listings.row_dimensions[2].height == expected_lines * LINE_HEIGHT
+
+    qa = workbook["QA Review"]
+    issue_cell = qa.cell(2, QA_COLUMNS.index("Issue") + 1)
+    assert issue_cell.alignment.wrap_text is True
+    issue_letter = issue_cell.column_letter
+    issue_width = qa.column_dimensions[issue_letter].width or 10
+    qa_lines = _estimate_wrapped_lines(long_issue, issue_width)
+    assert qa_lines > 1
+    assert qa.row_dimensions[2].height >= qa_lines * LINE_HEIGHT
+    assert qa.row_dimensions[2].height > LINE_HEIGHT
 
 
 def test_source_reference_survives_model_validation_and_spreadsheet_export(tmp_path: Path):
