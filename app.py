@@ -1,5 +1,6 @@
 import gc
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -17,6 +18,12 @@ from dotenv import load_dotenv
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
 load_dotenv()
+
+# pdfminer/pdfium emit noisy FontBBox warnings on many landlord PDFs —
+# harmless and unrelated to OOM; keep them out of Railway log spam.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
+logging.getLogger("pdfminer.pdffont").setLevel(logging.ERROR)
 
 import storage
 from extraction import address_lookup, geocode as geocode_module, html_images, memlog, pdf_images, xlsx_links

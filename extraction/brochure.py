@@ -68,10 +68,71 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-# Paid Railway defaults: several concurrent large Box/Drive PDFs when RSS
-# allows. Override with ENRICHMENT_FETCH_WORKERS / ENRICHMENT_PARALLEL_RSS_MB.
-_ENRICHMENT_FETCH_WORKERS = _env_positive_int("ENRICHMENT_FETCH_WORKERS", 6)
-_ENRICHMENT_PARALLEL_RSS_MB = _env_positive_float("ENRICHMENT_PARALLEL_RSS_MB", 2400.0)
+def _detect_host_ram_mb() -> float:
+    """Best-effort container/host RAM limit in MiB (cgroup, then psutil)."""
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read().strip()
+            if not raw or raw == "max":
+                continue
+            value = int(raw)
+            # cgroup v1 "unlimited" sentinel is a huge number.
+            if 0 < value < (1 << 62):
+                return value / (1024 * 1024)
+        except Exception:
+            continue
+    try:
+        import psutil
+
+        total = psutil.virtual_memory().total
+        if total > 0:
+            return total / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _default_fetch_workers(host_ram_mb: float) -> int:
+    # Confirmed real (Railway GPE, 2026-07): 6 parallel workers + nested
+    # landlord PDFs SIGKILL'd a ~512MB–1GB worker. Scale with container RAM.
+    if host_ram_mb >= 4000:
+        return 4
+    if host_ram_mb >= 1800:
+        return 2
+    return 1
+
+
+def _default_parallel_rss_mb(host_ram_mb: float) -> float:
+    if host_ram_mb >= 4000:
+        return 2400.0
+    if host_ram_mb > 0:
+        return max(250.0, host_ram_mb * 0.4)
+    # Unknown host → assume moderate Railway, serialize early.
+    return 400.0
+
+
+def _default_rss_ceiling_mb(host_ram_mb: float) -> float:
+    if host_ram_mb >= 6000:
+        return 6144.0
+    if host_ram_mb > 0:
+        return max(400.0, host_ram_mb * 0.78)
+    # Unknown host → stop before a typical 1GB container hard-kill.
+    return 768.0
+
+
+_HOST_RAM_MB = _detect_host_ram_mb()
+# Memory-aware defaults; override with ENRICHMENT_FETCH_WORKERS /
+# ENRICHMENT_PARALLEL_RSS_MB / ENRICHMENT_RSS_CEILING_MB.
+_ENRICHMENT_FETCH_WORKERS = _env_positive_int(
+    "ENRICHMENT_FETCH_WORKERS", _default_fetch_workers(_HOST_RAM_MB)
+)
+_ENRICHMENT_PARALLEL_RSS_MB = _env_positive_float(
+    "ENRICHMENT_PARALLEL_RSS_MB", _default_parallel_rss_mb(_HOST_RAM_MB)
+)
 # Soft caps on embedded bitmaps retained per brochure PDF. Matches
 # app.MAX_HIGH_RES_IMAGES so RSS does not hold uncapped MetSpace Drive
 # embeds until materialise. Floor plans capped separately.
@@ -83,13 +144,15 @@ _MIN_HIGH_RES_TARGET = 5
 _LIGHT_MAX_PHOTOS = 3
 _LIGHT_MAX_PAGES = 5
 # Skip *optional* nested PDFs on property HTML pages that already expose a
-# confident photo gallery (Knotel). Never used to skip Drive/Box/Dropbox
+# confident photo gallery (Knotel/GPE). Never used to skip Drive/Box/Dropbox
 # download targets — those viewer shells often have ≥2 chrome images and
 # are the ONLY photo/floorplan source for MetSpace / Workplace Plus.
 _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
-# Soft stop before container OOM. Paid Railway high-RAM default (~6GiB);
-# still well below a hard kill. Override with ENRICHMENT_RSS_CEILING_MB.
-_RSS_ENRICHMENT_CEILING_MB = _env_positive_float("ENRICHMENT_RSS_CEILING_MB", 6144.0)
+# Soft stop before container OOM — scaled to detected RAM, not a fixed 6GiB
+# that never trips on a 512MB–1GB Railway service.
+_RSS_ENRICHMENT_CEILING_MB = _env_positive_float(
+    "ENRICHMENT_RSS_CEILING_MB", _default_rss_ceiling_mb(_HOST_RAM_MB)
+)
 # When many unique hosted PDFs remain, stop deepening already-complete
 # galleries so blank High Res rows still get a fetch attempt.
 _SKIP_COMPLETE_WHEN_UNIQUE_GE = 24
@@ -1461,9 +1524,9 @@ def enrich_properties(
     # Fetch in small waves and apply immediately. Holding every UNION Box
     # PDF (~22MB) plus extracted page images in one giant cache (the old
     # "fetch all, then merge" approach) blew past Render's free-tier RSS
-    # ceiling before spreadsheet write. Paid Railway: several concurrent
-    # static fetches when RSS is below ENRICHMENT_PARALLEL_RSS_MB; serialize
-    # only when memory is genuinely high.
+    # ceiling before spreadsheet write. Scale concurrency from detected
+    # RAM / current RSS — GPE HTML pages with nested landlord PDFs are as
+    # heavy as Box/Drive static downloads and must serialize under pressure.
     hosted_pending = any(
         "/shared/static/" in (urlparse(url).path or "")
         or _box_shared_name(url)
@@ -1474,10 +1537,13 @@ def enrich_properties(
     )
     rss = _rss_mb()
     workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
-    if hosted_pending and rss >= _ENRICHMENT_PARALLEL_RSS_MB:
+    # Always serialize when RSS is already high — not only for hosted PDFs.
+    # Confirmed real (Railway GPE): parallel HTML→nested-PDF waves OOM'd
+    # while hosted_pending was False, so the old guard never fired.
+    if rss >= _ENRICHMENT_PARALLEL_RSS_MB:
         workers = 1
-    elif not hosted_pending:
-        workers = min(_ENRICHMENT_FETCH_WORKERS, len(pending))
+    elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
+        workers = min(workers, 1)
     wave_size = max(1, workers)
 
     def _apply_result(brochure_url, extraction):
@@ -1610,9 +1676,11 @@ def enrich_properties(
                     )
                     _seed_high_res_fallback(prop, brochure_url)
             break
-        # Shrink wave when RSS is climbing so several large Box PDFs do not land together.
+        # Shrink wave when RSS is climbing so several large PDFs do not land together.
         effective_wave = wave_size
-        if hosted_pending and rss >= _ENRICHMENT_PARALLEL_RSS_MB:
+        if rss >= _ENRICHMENT_PARALLEL_RSS_MB:
+            effective_wave = 1
+        elif hosted_pending and _HOST_RAM_MB and _HOST_RAM_MB < 1800:
             effective_wave = 1
         wave = pending[wave_start : wave_start + effective_wave]
         prefer_photos = any(
@@ -1796,7 +1864,11 @@ def _retrieve(
     # Always follow Drive/Box/Dropbox. Follow explicit "Download brochure"
     # PDFs when the HTML gallery is under target (photos) OR when the page
     # has no floor-plan asset yet (GPE plans live inside the landlord PDF).
-    need_nested_photos = page_gallery_urls < _MIN_HIGH_RES_TARGET and page_photos < _MIN_HIGH_RES_TARGET
+    html_gallery_ready = (
+        page_gallery_urls >= _MIN_HIGH_RES_TARGET
+        or page_photos >= _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS
+    )
+    need_nested_photos = not html_gallery_ready
     need_nested_plans = not has_floorplan_seed and not prefer_photos
     must_follow = []
     optional_docs = []
@@ -1825,13 +1897,35 @@ def _retrieve(
     # still need their download target — those are the only photo source.
     if skip_nested_documents:
         documents = [u for u in documents if _is_hosted_document_download(u)][:1]
-    # When HTML already supplies the High Res gallery, still pull a couple
-    # of nested-PDF embeds as Floor Plan + High Res backup (Railway has
-    # enough RAM; brochure URL seeds should stay a last resort).
-    nested_max_photos = None if need_nested_photos else 2
-    nested_stop_plans = None if need_nested_photos else 2
+    rss_now = _rss_mb()
+    memory_tight = rss_now >= _ENRICHMENT_PARALLEL_RSS_MB
+    # When HTML already supplies High Res, prefer those photos and only
+    # lightly pull nested PDFs for a floor plan. Decoding marketing photos
+    # again from large landlord PDFs spikes RSS on moderate Railway
+    # (SIGKILL / "Perhaps out of memory?"). Under memory pressure, skip
+    # nested landlord PDFs entirely once the page gallery + plan exist.
+    if html_gallery_ready and not need_nested_photos:
+        nested_max_photos = 0
+        nested_stop_plans = 1 if need_nested_plans else 0
+        if memory_tight and not need_nested_plans:
+            documents = [u for u in documents if _is_hosted_document_download(u)]
+        elif memory_tight and need_nested_plans:
+            # One light nested PDF only — enough for a plan bitmap.
+            hosted = [u for u in documents if _is_hosted_document_download(u)]
+            nested = [u for u in documents if u not in hosted][:1]
+            documents = hosted[:1] + nested
+        else:
+            # Cap concurrent nested landlord PDFs per property page.
+            hosted = [u for u in documents if _is_hosted_document_download(u)]
+            nested = [u for u in documents if u not in hosted][:1]
+            documents = hosted[:1] + nested
+    else:
+        nested_max_photos = None if need_nested_photos else 0
+        nested_stop_plans = None if need_nested_photos else 1
     if light_pdf and need_nested_photos:
         nested_max_photos = _LIGHT_MAX_PHOTOS
+    # Prefer light page scan when we only need a floor plan from nested PDF.
+    nested_light_pages = light_pdf or (html_gallery_ready and not need_nested_photos)
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(
@@ -1841,7 +1935,7 @@ def _retrieve(
         try:
             nested = _coerce_resource(_fetch_resource(fetcher, document_url, deadline), document_url)
             if extractor is extract_brochure and (
-                nested_max_photos is not None or light_pdf or prefer_photos
+                nested_max_photos is not None or light_pdf or prefer_photos or nested_light_pages
             ):
                 nested_extraction = extract_brochure(
                     nested.payload,
@@ -1849,7 +1943,7 @@ def _retrieve(
                     nested.final_url,
                     max_photos=0 if nested_max_photos == 0 else (nested_max_photos if nested_max_photos is not None else _LIGHT_MAX_PHOTOS if light_pdf else None),
                     stop_after_floorplans=(
-                        nested_stop_plans or 2
+                        nested_stop_plans or 1
                         if nested_max_photos == 0
                         else (
                             nested_stop_plans
@@ -1858,11 +1952,15 @@ def _retrieve(
                         )
                     ),
                     prefer_photos=prefer_photos or light_pdf,
-                    max_pages=_LIGHT_MAX_PAGES if light_pdf else None,
+                    max_pages=_LIGHT_MAX_PAGES if nested_light_pages else None,
                 )
             else:
                 nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
+            # Drop the raw nested body once extract has kept its embeds —
+            # several GPE landlord PDFs alive across a wave was a confirmed
+            # Railway SIGKILL path.
+            del nested
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)
             # Reuse nested PDF/HTML text already extracted in this pass for

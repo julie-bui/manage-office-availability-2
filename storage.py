@@ -17,13 +17,49 @@ Env vars:
 """
 import os
 
-_BUCKET = os.environ.get("S3_BUCKET", "")
-_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL") or None
-_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY_ID", "")
-_SECRET_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
-_REGION = os.environ.get("S3_REGION", "auto")
-
 _client = None
+
+
+def _env(name, default=""):
+    """Read an S3_* env var and strip whitespace/newlines.
+
+    Confirmed real (Railway): a leading newline in S3_ACCESS_KEY_ID breaks
+    SigV4 with `Invalid header value b'AWS4-HMAC-SHA256 Credential=\\n...'`.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip()
+
+
+def _load_config():
+    return {
+        "bucket": _env("S3_BUCKET"),
+        "endpoint_url": _env("S3_ENDPOINT_URL") or None,
+        "access_key": _env("S3_ACCESS_KEY_ID"),
+        "secret_key": _env("S3_SECRET_ACCESS_KEY"),
+        "region": _env("S3_REGION", "auto") or "auto",
+    }
+
+
+_CONFIG = _load_config()
+_BUCKET = _CONFIG["bucket"]
+_ENDPOINT_URL = _CONFIG["endpoint_url"]
+_ACCESS_KEY = _CONFIG["access_key"]
+_SECRET_KEY = _CONFIG["secret_key"]
+_REGION = _CONFIG["region"]
+
+
+def reload_from_env():
+    """Re-read S3_* env vars (used by tests after monkeypatch)."""
+    global _CONFIG, _BUCKET, _ENDPOINT_URL, _ACCESS_KEY, _SECRET_KEY, _REGION, _client
+    _CONFIG = _load_config()
+    _BUCKET = _CONFIG["bucket"]
+    _ENDPOINT_URL = _CONFIG["endpoint_url"]
+    _ACCESS_KEY = _CONFIG["access_key"]
+    _SECRET_KEY = _CONFIG["secret_key"]
+    _REGION = _CONFIG["region"]
+    _client = None
 
 
 def enabled():
