@@ -174,11 +174,11 @@ def test_dropbox_hosted_document_gets_direct_download_candidate():
     assert "dl=1" in candidates[0].url
 
 
-def test_budget_skip_seeds_high_res_for_drive_and_property_pages():
-    """Under enrichment deadline, any brochure URL keeps High Res non-blank.
+def test_budget_skip_seeds_high_res_for_drive_not_property_pages():
+    """Under enrichment deadline, resolvable document PDFs seed High Res.
 
-    Covers Drive (MetSpace/WP+) and plain property pages (Knotel/GPE) —
-    not only Box/UNION static PDFs.
+    Drive/Box/.pdf keep a usable High Res click-through. Plain HTML property
+    pages stay on Brochure PDF only — blank High Res beats a non-image seed.
     """
     from extraction.brochure import enrich_properties
     from extraction.models import Property
@@ -216,7 +216,8 @@ def test_budget_skip_seeds_high_res_for_drive_and_property_pages():
         deadline=time.monotonic() - 1,
     )
     assert "drive.usercontent.google.com" in (props[0].values.get("High Res Images") or "")
-    assert props[1].values.get("High Res Images") == page
+    assert props[1].values.get("Brochure PDF") == page
+    assert not props[1].values.get("High Res Images")
 
 
 def test_finalize_keeps_featured_photo_and_property_page_fallback(tmp_path):

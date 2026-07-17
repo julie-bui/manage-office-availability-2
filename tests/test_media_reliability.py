@@ -591,8 +591,10 @@ def test_enrichment_wave_hard_stops_at_deadline():
     # 3s pre-deadline margin with a 0.3s budget → no wave starts.
     assert calls == []
     assert time.monotonic() - started < 0.8
-    # Skipped unique URLs still get a usable High Res brochure seed.
-    assert all(prop.values.get("High Res Images") for prop in props)
+    # HTML property-page seeds are kept on Brochure PDF but are no longer
+    # copied into High Res (prefer blank over a non-image click-through).
+    assert all(prop.values.get("Brochure PDF") for prop in props)
+    assert all(not prop.values.get("High Res Images") for prop in props)
 
 
 def test_retrieve_skips_nested_pdf_when_page_has_gallery_and_floorplan():

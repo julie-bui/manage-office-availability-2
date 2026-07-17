@@ -47,29 +47,31 @@ BROCHURE_RELIABLE_CONFIDENCE = 0.7
 # Box/Drive static fetches when headroom exists so high unique-URL sheets
 # (UNION City) cover more buildings before the batch deadline.
 _ENRICHMENT_FETCH_WORKERS = 2
-_ENRICHMENT_PARALLEL_RSS_MB = 220.0
+# Softened for Railway (≥1GB services): previously 220 for Render ~512MB.
+# Two concurrent ~22MB Box PDFs are fine until RSS is genuinely high.
+_ENRICHMENT_PARALLEL_RSS_MB = 400.0
 # Soft caps on embedded bitmaps retained per brochure PDF. Matches
-# app.MAX_HIGH_RES_IMAGES so free-tier RSS does not hold uncapped MetSpace
-# Drive embeds until materialise. Floor plans capped separately (1–2 is
-# enough for the spreadsheet cell).
+# app.MAX_HIGH_RES_IMAGES so RSS does not hold uncapped MetSpace Drive
+# embeds until materialise. Floor plans capped separately.
 _SOFT_MAX_EMBEDDED_PHOTOS = 8
 _SOFT_MAX_EMBEDDED_FLOORPLANS = 4
 _MIN_HIGH_RES_TARGET = 5
-# Light extract under deadline pressure: first-page photos beat blank High
-# Res. Full galleries still run when budget/RSS allow.
-_LIGHT_MAX_PHOTOS = 2
-_LIGHT_MAX_PAGES = 3
+# Light extract under deadline pressure: a few first-page photos beat blank
+# High Res. Full galleries still run when budget/RSS allow.
+_LIGHT_MAX_PHOTOS = 3
+_LIGHT_MAX_PAGES = 5
 # Skip *optional* nested PDFs on property HTML pages that already expose a
 # confident photo gallery (Knotel). Never used to skip Drive/Box/Dropbox
 # download targets — those viewer shells often have ≥2 chrome images and
 # are the ONLY photo/floorplan source for MetSpace / Workplace Plus.
 _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
-# Leave headroom on 512MB–1GB hosts. Checked between waves and during PDF
-# image extract so a mid-decode spike can stop before SIGKILL.
-_RSS_ENRICHMENT_CEILING_MB = 360.0
+# Soft stop before container OOM. Tuned for Railway services with ~1GB+
+# (Render free-tier was 360 on ~512MB). Still well below a hard kill so
+# brochure URL seeds remain a last resort, not the default.
+_RSS_ENRICHMENT_CEILING_MB = 750.0
 # When many unique hosted PDFs remain, stop deepening already-complete
 # galleries so blank High Res rows still get a fetch attempt.
-_SKIP_COMPLETE_WHEN_UNIQUE_GE = 12
+_SKIP_COMPLETE_WHEN_UNIQUE_GE = 24
 
 _SECTION_FIELDS = {
     "description": "Special Features",
@@ -225,7 +227,7 @@ def fetch_brochure(url: str, timeout: float = 6.0, deadline: float = None) -> Br
                     # Cap under the remaining enrichment window so a late
                     # UNION wave cannot overrun batch_deadline and erase
                     # earlier files' galleries at finalize time.
-                    effective_timeout = min(12.0, max(0.5, deadline - time.monotonic()))
+                    effective_timeout = min(18.0, max(0.5, deadline - time.monotonic()))
                 else:
                     effective_timeout = max(float(timeout), 20.0)
             else:
@@ -1129,17 +1131,138 @@ def _usable_high_res_seed_url(url: str) -> str:
     return normalize_url(text) or text
 
 
-def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
-    """Ensure High Res is never blank merely because Floor Plan was seeded.
+def _is_js_only_brochure_viewer(url: str) -> bool:
+    """True for pitch/canva presentation shells — never Brochure PDF targets."""
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return any(token in host for token in ("canva.com", "canva.link", "pitch.com"))
 
-    When enrichment cannot finish a unique Box/Drive PDF, leave a direct
-    brochure link in High Res so the cell stays usable. Real photo embeds
+
+def _is_direct_document_pdf(url: str) -> bool:
+    """True for a fetchable PDF/document URL (not an HTML property page)."""
+    text = str(url or "").strip()
+    if not text or _is_js_only_brochure_viewer(text):
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    if path.endswith(".pdf"):
+        return True
+    if host.endswith("drive.usercontent.google.com") and "export=download" in query:
+        return True
+    if ("dropbox.com" in host or host.endswith("dropboxusercontent.com")) and "dl=1" in query:
+        return True
+    return False
+
+
+def _brochure_pdf_cell_rank(url: str) -> int:
+    """Prefer actual PDF > resolvable viewer > property HTML page > nothing/JS."""
+    text = str(url or "").strip()
+    if not text:
+        return 0
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return 0
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        return 0
+    if _is_js_only_brochure_viewer(text):
+        return 0
+    if _is_direct_document_pdf(text):
+        return 3
+    resolved = _usable_high_res_seed_url(text)
+    if resolved and _is_direct_document_pdf(resolved):
+        return 2
+    return 1
+
+
+def _as_brochure_document_url(url: str) -> str:
+    """Return a direct document URL when `url` is or resolves to one."""
+    text = str(url or "").strip()
+    if not text or _is_js_only_brochure_viewer(text):
+        return ""
+    if _is_direct_document_pdf(text):
+        return normalize_url(text) or text
+    resolved = _usable_high_res_seed_url(text)
+    if resolved and _is_direct_document_pdf(resolved):
+        return normalize_url(resolved) or resolved
+    return ""
+
+
+def _best_brochure_document_url(extraction: BrochureExtraction, seed_url: str = "") -> str:
+    """Best real document PDF discovered during linked-source enrichment."""
+    candidates = []
+
+    def add(url):
+        document = _as_brochure_document_url(url)
+        if document and document not in candidates:
+            candidates.append(document)
+
+    add(seed_url)
+    add(extraction.source_document)
+    for asset in extraction.assets:
+        if asset.classification == AssetType.BROCHURE:
+            add(asset.url)
+    for diagnostic in extraction.diagnostics:
+        if diagnostic.resource_type == "pdf":
+            add(diagnostic.final_url)
+            add(diagnostic.original_url)
+    return candidates[0] if candidates else ""
+
+
+def _promote_brochure_pdf_cell(prop: Property, extraction: BrochureExtraction) -> None:
+    """Set Brochure PDF to a real document URL when enrichment discovers one.
+
+    Property/listing HTML pages remain valid seeds and are stashed on
+    `_brochure_source_page` so gallery enrichment can still use them. Never
+    blank the cell, and never promote pitch/canva JS viewers.
+    """
+    current = str(prop.values.get("Brochure PDF") or "").strip()
+    best = _best_brochure_document_url(extraction, current)
+    if not best:
+        return
+    if normalize_url(best) == normalize_url(current):
+        return
+    if _brochure_pdf_cell_rank(best) <= _brochure_pdf_cell_rank(current):
+        return
+    if current and _brochure_pdf_cell_rank(current) > 0:
+        prop.values.setdefault("_brochure_source_page", current)
+    _set_value(
+        prop,
+        "Brochure PDF",
+        ExtractedValue(
+            best,
+            "brochure",
+            extraction.source_document or best,
+            "brochure:resolved_document",
+            0.9,
+        ),
+    )
+
+
+def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
+    """Last-resort High Res seed from a real document PDF URL only.
+
+    When enrichment cannot finish Box/Drive/.pdf embeds, leave a direct
+    document link in High Res so the cell stays usable. Real photo embeds
     replace this seed when a later fetch succeeds. Never seed after an
     identity conflict — that brochure does not belong to this listing.
 
-    Always stash the seed on `_high_res_candidates` even when a featured
-    photo already exists, so finalize can fall back if soft-accept rejects
-    that photo under deadline (Knotel last-row / sparse email galleries).
+    HTML property/listing pages are NOT seeded into High Res (Railway-era
+    preference: blank or real photos beat a non-image click-through).
+    Brochure PDF still keeps the page URL / promoted PDF separately.
+
+    Always stash a document seed on `_high_res_candidates` even when a
+    featured photo already exists, so finalize can fall back if soft-accept
+    rejects that photo under deadline.
     """
     conflict = {
         "LINK_IDENTITY_HARD_CONFLICT",
@@ -1151,7 +1274,13 @@ def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
             if original == brochure_url or original == normalize_url(brochure_url):
                 return
     seed = _usable_high_res_seed_url(brochure_url)
-    if not seed:
+    # Prefer promoted Brochure PDF document when the enrichment seed was
+    # still the HTML property page.
+    brochure_cell = str(prop.values.get("Brochure PDF") or "").strip()
+    brochure_doc = _as_brochure_document_url(brochure_cell)
+    if brochure_doc:
+        seed = brochure_doc
+    if not seed or not _is_direct_document_pdf(seed):
         return
     candidates = list(prop.values.get("_high_res_candidates") or [])
     if seed not in candidates:
@@ -1277,8 +1406,13 @@ def enrich_properties(
     for index, prop in enumerate(properties):
         seed_urls = []
         primary = str(prop.values.get("Brochure PDF") or "").strip()
+        source_page = str(prop.values.get("_brochure_source_page") or "").strip()
         if primary:
             seed_urls.append(primary)
+        # When Brochure PDF was promoted to a real document, still enrich from
+        # the original property page so HTML galleries remain available.
+        if source_page and source_page not in seed_urls:
+            seed_urls.append(source_page)
         for extra in prop.values.get("_extra_brochure_urls") or []:
             text = str(extra or "").strip()
             if text and text not in seed_urls:
@@ -1442,11 +1576,13 @@ def enrich_properties(
         # for remaining property pages instead of hard-skipping — nested
         # landlord PDFs are what burn the budget.
         remaining = None if deadline is None else deadline - time.monotonic()
-        html_only = remaining is not None and remaining < 12.0
-        light_pdf = remaining is not None and remaining < 25.0
+        # Softened for Railway: keep fetching real nested/hosted PDFs longer
+        # before falling back to HTML-only or light first-page extracts.
+        html_only = remaining is not None and remaining < 8.0
+        light_pdf = remaining is not None and remaining < 15.0
         # Many unique hosted PDFs: prefer light first-page photos for the
         # whole wave so later buildings still get High Res, not only Floor Plan.
-        if len(pending) - wave_start >= 8 and hosted_pending:
+        if len(pending) - wave_start >= 16 and hosted_pending:
             light_pdf = True
         if deadline is not None and remaining <= 3.0:
             for brochure_url in pending[wave_start:]:
@@ -1693,9 +1829,10 @@ def _retrieve(
     # still need their download target — those are the only photo source.
     if skip_nested_documents:
         documents = [u for u in documents if _is_hosted_document_download(u)][:1]
-    # When HTML already supplies the High Res gallery, nested landlord PDFs
-    # are only needed for Floor Plan — extract plans only and stop early.
-    nested_max_photos = None if need_nested_photos else 0
+    # When HTML already supplies the High Res gallery, still pull a couple
+    # of nested-PDF embeds as Floor Plan + High Res backup (Railway has
+    # enough RAM; brochure URL seeds should stay a last resort).
+    nested_max_photos = None if need_nested_photos else 2
     nested_stop_plans = None if need_nested_photos else 2
     if light_pdf and need_nested_photos:
         nested_max_photos = _LIGHT_MAX_PHOTOS
@@ -1708,7 +1845,7 @@ def _retrieve(
         try:
             nested = _coerce_resource(_fetch_resource(fetcher, document_url, deadline), document_url)
             if extractor is extract_brochure and (
-                nested_max_photos == 0 or light_pdf or prefer_photos
+                nested_max_photos is not None or light_pdf or prefer_photos
             ):
                 nested_extraction = extract_brochure(
                     nested.payload,
@@ -1718,7 +1855,11 @@ def _retrieve(
                     stop_after_floorplans=(
                         nested_stop_plans or 2
                         if nested_max_photos == 0
-                        else (0 if prefer_photos and light_pdf else 1 if light_pdf else None)
+                        else (
+                            nested_stop_plans
+                            if nested_max_photos is not None and not need_nested_photos
+                            else (0 if prefer_photos and light_pdf else 1 if light_pdf else None)
+                        )
                     ),
                     prefer_photos=prefer_photos or light_pdf,
                     max_pages=_LIGHT_MAX_PAGES if light_pdf else None,
@@ -1790,6 +1931,9 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         prop.add_issue(ValidationIssue("Brochure PDF", warning, Severity.INFO, extraction.source_document, "Primary extraction and any successfully extracted brochure-page evidence were preserved.", "brochure_enrichment"))
     for candidate in classify_candidates(extraction.assets):
         _add_asset(prop, candidate)
+    # Prefer a real nested/hosted PDF in Brochure PDF over the HTML property
+    # page that seeded enrichment (GPE Download brochure, Drive/Box static).
+    _promote_brochure_pdf_cell(prop, extraction)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:
         # Soft-cap photos (floor plans uncapped). Exact content-hash dedupe

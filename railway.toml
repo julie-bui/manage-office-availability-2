@@ -3,6 +3,6 @@
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 20 --max-requests-jitter 5"
+startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 180 --max-requests 20 --max-requests-jitter 5"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

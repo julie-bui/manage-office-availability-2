@@ -4,18 +4,15 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    # --timeout 120: gunicorn's own default (30s) kills a worker mid-request
-    # for a legitimately slow batch — a source with many distinct addresses
-    # hits Nominatim's mandatory 1-req/sec throttle (extraction/geocode.py)
-    # on top of the LLM extraction call itself; confirmed a real ~26-second
-    # cold run (Crown Estate, ~26 distinct buildings) sits right at the old
-    # limit even before counting Render's own network latency.
+    # --timeout 180: raised with Railway (was 120 for Render free-tier).
+    # Multi-file batches with Box/Drive brochure PDFs need more wall-clock
+    # for real embed extraction; BATCH_DEADLINE_SECONDS tracks under this.
     #
     # --max-requests 20: recycle often enough to bound RSS growth without the
     # thrash loop seen at max-requests 3 (worker restarting every request).
     # IMPORTANT: if the host Dashboard "Start Command" is set, it OVERRIDES
     # this file — update Railway/Render start command to match Procfile.
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --max-requests 20 --max-requests-jitter 5
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 180 --max-requests 20 --max-requests-jitter 5
     envVars:
       - key: GEMINI_API_KEY
         sync: false

@@ -37,11 +37,10 @@ from .validation import validate_properties
 # completeness (those rows fall back to "Needs manual lookup", the same
 # honest flag used for any other geocoding gap) for a guaranteed response
 # within the timeout, rather than a silent SIGKILL that returns nothing
-# at all. 100s (not the full 120s) deliberately leaves ~20s of margin for
-# whatever still needs to happen after geocoding finishes — image
-# attachment, spreadsheet writing — for this file and any others already
-# queued in the same batch.
-BATCH_DEADLINE_SECONDS = 100
+# at all. Raised with Railway gunicorn --timeout 180: 160s leaves ~20s
+# margin for finalize/write after enrichment (real Box/Drive PDF embeds
+# need the extra wall-clock vs Render free-tier's old 100/120 split).
+BATCH_DEADLINE_SECONDS = 160
 # Do not start another optional address/geocode operation unless there is
 # enough shared time for the longest bounded lookup (Gemini: 25s) plus a
 # small scheduling margin. Core extraction and spreadsheet writing win.
@@ -52,7 +51,7 @@ OPTIONAL_LOOKUP_START_SECONDS = 30
 # with OPTIONAL_IMAGE_VALIDATION_SKIPPED for every Directus URL.
 # Galleries now use absolute download URLs (not inlined base64), so finalize
 # needs less reserve — free those seconds for Knotel/GPE under-target rows.
-ENRICHMENT_FINALIZE_RESERVE_SECONDS = 15
+ENRICHMENT_FINALIZE_RESERVE_SECONDS = 18
 # Confirmed real (2026-07 batch MetSpace+Knotel+WP+Union): enrichment used
 # ONE absolute deadline shared by every file. MetSpace (first) consumed the
 # budget fetching Drive brochure photos; Knotel (second) kept only its

@@ -521,3 +521,89 @@ def test_multi_unit_brochure_skips_unlabeled_price_copy():
     enriched = run(prop(**{"Floor/Unit": "3rd"}), result)
     assert enriched.values.get("Marketing Price (Based on Min Term) PCM") in (None, "")
     assert enriched.values["Size (sq ft)"] == 2000.0
+
+
+def test_gpe_style_nested_brochure_promotes_into_brochure_pdf_cell():
+    """Property-page seed stays for enrichment; Brochure PDF becomes the nested PDF."""
+    page = "https://www.gpe.co.uk/property/16-dufours-place"
+    pdf = "https://www.gpe.co.uk/media/lf1dh5wc/gpe-16-dufours-place-brochure.pdf"
+
+    def fetch(url, deadline=None):
+        if url == page:
+            html = (
+                f"<html><body><h1>16 Dufour's Place</h1>"
+                f"<a href='{pdf}'>Download brochure</a></body></html>"
+            ).encode()
+            return BrochureResource(html, "text/html", page, page)
+        return BrochureResource(b"%PDF-1.4 brochure", "application/pdf", pdf, pdf)
+
+    record = normalize_record({
+        "Building": "16 Dufour's Place",
+        "Property Postcode": "W1F 7SP",
+        "Brochure PDF": page,
+    })
+    property_ = Property.from_record(record, "gpe.eml", "GPE", "rule:GPE")
+    enriched = enrich_properties([property_], fetcher=fetch)[0]
+    assert enriched.values["Brochure PDF"] == pdf
+    assert enriched.values.get("_brochure_source_page") == page
+
+
+def test_generic_hosted_document_promotes_resolved_pdf_into_brochure_pdf_cell():
+    """Non-GPE: Drive viewer seed promotes to the resolvable download URL."""
+    viewer = "https://drive.google.com/file/d/abc123file/view"
+    download = "https://drive.usercontent.google.com/download?id=abc123file&export=download"
+
+    def fetch(url, deadline=None):
+        if "usercontent" in url or url == download:
+            return BrochureResource(b"%PDF-1.4 drive", "application/pdf", download, download)
+        return BrochureResource(b"<html>Drive viewer</html>", "text/html", viewer, viewer)
+
+    record = normalize_record({
+        "Building": "9-10 Market Place",
+        "Property Postcode": "W1W 8AQ",
+        "Brochure PDF": viewer,
+    })
+    property_ = Property.from_record(record, "metspace.eml", "MetSpace", "rule:MetSpace")
+    enriched = enrich_properties([property_], fetcher=fetch)[0]
+    assert enriched.values["Brochure PDF"] == download
+    assert enriched.values.get("_brochure_source_page") == viewer
+
+
+def test_html_only_property_page_keeps_brochure_pdf_cell():
+    """Knotel-style thin pages with no nested PDF must not blank Brochure PDF."""
+    page = "https://www.knotel.com/buildings/example-house"
+
+    def fetch(url, deadline=None):
+        html = b"<html><body><h1>Example House EC1A 1AA</h1><p>Available now</p></body></html>"
+        return BrochureResource(html, "text/html", page, page)
+
+    record = normalize_record({
+        "Building": "Example House",
+        "Property Postcode": "EC1A 1AA",
+        "Brochure PDF": page,
+    })
+    property_ = Property.from_record(record, "knotel.eml", "Knotel", "rule:Knotel")
+    enriched = enrich_properties([property_], fetcher=fetch)[0]
+    assert enriched.values["Brochure PDF"] == page
+    assert not enriched.values.get("_brochure_source_page")
+
+
+def test_pitch_viewer_is_never_promoted_into_brochure_pdf_cell():
+    page = "https://property.example.test/listing"
+    pitch = "https://pitch.com/v/fake-brochure"
+
+    def fetch(url, deadline=None):
+        html = (
+            f"<html><body><a href='{pitch}'>Download brochure</a></body></html>"
+        ).encode()
+        return BrochureResource(html, "text/html", page, page)
+
+    record = normalize_record({
+        "Building": "Example House",
+        "Property Postcode": "EC1A 1AA",
+        "Brochure PDF": page,
+    })
+    property_ = Property.from_record(record, "source.eml", "Example", "rule:test")
+    enriched = enrich_properties([property_], fetcher=fetch)[0]
+    assert enriched.values["Brochure PDF"] == page
+    assert "pitch.com" not in (enriched.values.get("Brochure PDF") or "")
