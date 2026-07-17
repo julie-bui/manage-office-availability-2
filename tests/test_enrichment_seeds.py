@@ -81,3 +81,43 @@ def test_knotel_ignores_pitch_brochure_as_extra_seed():
     }
     assert knotel._best_brochure_link(group) == group["property"]
     assert knotel._extra_brochure_urls(group, group["property"]) == []
+
+
+def test_resolve_source_date_reads_filename_month_day():
+    from extraction.naming import extract_date_from_filename, resolve_source_date
+
+    assert extract_date_from_filename("UNION - Availability - June 26 - City 2.xlsx", 2026) == "2026-06-26"
+    assert extract_date_from_filename("Fw_ Knotel Availability _ 30_06_2026.eml") == "2026-06-30"
+    assert extract_date_from_filename("Workplace Plus - Availability 14th July.eml", 2026) == "2026-07-14"
+    assert (
+        resolve_source_date(
+            {
+                "filename": "UNION - Availability - June 26 - City 2.xlsx",
+                "file_mtime_year": 2026,
+            }
+        )
+        == "2026-06-26"
+    )
+
+
+def test_union_seeds_floor_plan_from_brochure_click_here():
+    content = {
+        "filename": "UNION - Availability - June 26 - City.xlsx",
+        "sheet_names": ["City"],
+        "tables": [
+            [
+                ["", "City", "Floor", "Current Spec", "Size sq.ft", "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+                ["", "Example House", "3rd", "Fitted", "1466", "2 Years", "20157", "165", "CLICK HERE"],
+            ]
+        ],
+        "row_links": [
+            {
+                "sheet_name": "City",
+                "row_text": "Example House | 3rd | Fitted | 1466 | CLICK HERE",
+                "links": [("CLICK HERE", "https://app.box.com/s/examplebrochure")],
+            }
+        ],
+    }
+    records = union.parse(content)
+    assert records[0]["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
+    assert records[0]["Floor Plan"] == "https://app.box.com/s/examplebrochure"

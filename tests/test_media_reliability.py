@@ -593,8 +593,8 @@ def test_enrichment_wave_hard_stops_at_deadline():
     assert time.monotonic() - started < 0.8
 
 
-def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
-    """Knotel HTML galleries should not burn time fetching nested brochures."""
+def test_retrieve_skips_nested_pdf_when_page_has_gallery_and_floorplan():
+    """Knotel HTML galleries with a plan seed should not fetch nested brochures."""
     fetched = []
 
     def fetch(url, deadline=None):
@@ -619,6 +619,15 @@ def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
         return BrochureExtraction(
             final_url,
             assets=photos + [
+                classify_candidate(
+                    AssetCandidate(
+                        f"{final_url}/plan.jpg",
+                        final_url,
+                        alt_text="Floor plan",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                    )
+                ),
                 classify_candidate(AssetCandidate(f"{final_url}/brochure.pdf", final_url, anchor_text="Download brochure")),
             ],
             identity_text="Example House, 1 Example Street, EC1A 1AA",
@@ -637,6 +646,81 @@ def test_retrieve_skips_nested_pdf_when_page_has_gallery_photos():
     enrich_properties([prop], fetcher=fetch, extractor=extract)
     assert fetched == ["https://property.test/listing"]
     assert len(prop.values.get("_high_res_candidates") or []) >= 2
+
+
+def test_retrieve_follows_nested_pdf_for_floorplan_when_gallery_full():
+    """GPE: HTML gallery is enough for High Res, but plans live in Download brochure."""
+    fetched = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-1.4 plan", "application/pdf", url, url)
+        return BrochureResource(b"<html>Example House EC1A 1AA</html>", "text/html", url, url)
+
+    def extract(payload, content_type, final_url):
+        if payload.startswith(b"%PDF"):
+            return BrochureExtraction(
+                final_url,
+                assets=[
+                    AssetCandidate(
+                        "",
+                        final_url,
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        content=b"plan-bytes",
+                        content_hash="planhash1",
+                        association_confidence=0.0,
+                    )
+                ],
+                identity_text="Example House, 1 Example Street, EC1A 1AA",
+            )
+        photos = [
+            classify_candidate(
+                AssetCandidate(
+                    f"https://cdn.property.test/{name}.jpg",
+                    final_url,
+                    alt_text=name,
+                    association_confidence=0.85,
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                )
+            )
+            for name in ("a", "b", "c", "d", "e")
+        ]
+        return BrochureExtraction(
+            final_url,
+            assets=photos + [
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/brochure.pdf",
+                        final_url,
+                        mime_type="application/pdf",
+                        classification=AssetType.BROCHURE,
+                        confidence=0.9,
+                        anchor_text="Download brochure",
+                    )
+                ),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    prop = Property.from_record(
+        normalize_record({
+            "Building": "Example House, 1 Example Street",
+            "Property Postcode": "EC1A 1AA",
+            "Brochure PDF": "https://property.test/listing",
+        }),
+        "gpe.eml",
+        "GPE",
+        "rule:GPE",
+    )
+    enrich_properties([prop], fetcher=fetch, extractor=extract)
+    assert any(url.endswith(".pdf") for url in fetched)
+    assert prop.values.get("Floor Plan") or any(
+        a.classification == AssetType.FLOORPLAN
+        for a in (prop.values.get("_brochure_embedded_assets") or [])
+    )
 
 
 def test_retrieve_always_follows_drive_download_despite_viewer_chrome():

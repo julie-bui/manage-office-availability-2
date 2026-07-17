@@ -225,8 +225,20 @@ def _validate_remote_url(url):
         raise LinkedResourceError("Linked destination is not a public HTTP(S) host", "LINK_UNSUPPORTED", url)
 
 
-def extract_brochure(payload: bytes, content_type: str, source_document: str) -> BrochureExtraction:
-    """Best-effort extraction based on actual response content, not suffix."""
+def extract_brochure(
+    payload: bytes,
+    content_type: str,
+    source_document: str,
+    *,
+    max_photos: int = None,
+    stop_after_floorplans: int = None,
+) -> BrochureExtraction:
+    """Best-effort extraction based on actual response content, not suffix.
+
+    max_photos / stop_after_floorplans let callers that already have an HTML
+    gallery (GPE property pages) pull only a floor-plan bitmap from a nested
+    landlord PDF without decoding every marketing photo page.
+    """
     resource_type = _resource_type(payload, content_type)
     if resource_type == "html":
         return _extract_html(payload, source_document)
@@ -247,7 +259,19 @@ def extract_brochure(payload: bytes, content_type: str, source_document: str) ->
                     links.append(AssetCandidate(uri, source_document, page_number=page_number))
     text = "\n".join(text_parts)
     fields = _extract_fields(text, source_document)
-    return BrochureExtraction(source_document, fields, classify_candidates(links) + _extract_pdf_visuals(payload, source_document, text_parts), identity_text=text)
+    return BrochureExtraction(
+        source_document,
+        fields,
+        classify_candidates(links)
+        + _extract_pdf_visuals(
+            payload,
+            source_document,
+            text_parts,
+            max_photos=max_photos,
+            stop_after_floorplans=stop_after_floorplans,
+        ),
+        identity_text=text,
+    )
 
 
 def _resource_type(payload: bytes, content_type: str) -> str:
@@ -449,7 +473,14 @@ def _is_hosted_document_download(url: str) -> bool:
     return False
 
 
-def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[str]) -> List[AssetCandidate]:
+def _extract_pdf_visuals(
+    payload: bytes,
+    source_document: str,
+    pages_text: List[str],
+    *,
+    max_photos: int = None,
+    stop_after_floorplans: int = None,
+) -> List[AssetCandidate]:
     """Extract embedded PDF visuals conservatively for later hosting."""
     try:
         import fitz
@@ -467,9 +498,15 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     photo_kept = 0
     floorplan_kept = 0
     # Soft-cap photos tighter for large Box/Drive payloads on small hosts.
-    photo_cap = _SOFT_MAX_EMBEDDED_PHOTOS
+    photo_cap = _SOFT_MAX_EMBEDDED_PHOTOS if max_photos is None else max(0, int(max_photos))
+    floorplan_cap = (
+        _SOFT_MAX_EMBEDDED_FLOORPLANS
+        if stop_after_floorplans is None
+        else max(0, int(stop_after_floorplans))
+    )
     if len(payload) >= 8 * 1024 * 1024 or _is_hosted_document_download(source_document):
-        photo_cap = min(photo_cap, 5)
+        if max_photos is None:
+            photo_cap = min(photo_cap, 5)
     # Scan every page so floor plans later in UNION/Workplace Plus brochures
     # are not skipped after early photo pages. Exact content hashes prevent
     # the same bitmap being kept twice; blank/near-solid slides are dropped.
@@ -477,6 +514,8 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
     try:
         rss_tight = False
         for page_number, page in enumerate(document):
+            if stop_after_floorplans is not None and floorplan_kept >= floorplan_cap and photo_kept >= photo_cap:
+                break
             if _rss_mb() >= _RSS_ENRICHMENT_CEILING_MB:
                 rss_tight = True
             for image in page.get_images(full=True):
@@ -498,7 +537,7 @@ def _extract_pdf_visuals(payload: bytes, source_document: str, pages_text: List[
                     # PDFs) must never become PROPERTY_IMAGE later via
                     # classify_candidates' association_confidence path.
                     if is_floorplan:
-                        if floorplan_kept >= _SOFT_MAX_EMBEDDED_FLOORPLANS:
+                        if floorplan_kept >= floorplan_cap:
                             continue
                         # Keep collecting floor plans even when RSS is tight —
                         # photos stop first so Floor Plan cells are not stranded.
@@ -845,7 +884,12 @@ def enrich_properties(
         # Stop before starting a wave that cannot finish inside this file's
         # fair share. Drive/Box fetches use up to ~20s; keep a margin so the
         # last wave does not wipe Knotel/Workplace Plus enrichment time.
-        if deadline is not None and time.monotonic() >= deadline - 4.0:
+        # When only a little time remains, still attempt HTML-only retrieval
+        # for remaining property pages (GPE/Knotel galleries) instead of
+        # hard-skipping — nested landlord PDFs are what burn the budget.
+        remaining = None if deadline is None else deadline - time.monotonic()
+        html_only = remaining is not None and remaining < 12.0
+        if deadline is not None and remaining <= 4.0:
             for brochure_url in pending[wave_start:]:
                 for _, prop, _ in by_url[brochure_url]:
                     _record_diagnostic(prop, "LINK_ENRICHMENT_SKIPPED", brochure_url, detail="Bounded batch enrichment budget was exhausted.")
@@ -876,7 +920,10 @@ def enrich_properties(
         if len(wave) == 1:
             brochure_url = wave[0]
             try:
-                result = _retrieve(brochure_url, fetcher, extractor, deadline)
+                result = _retrieve(
+                    brochure_url, fetcher, extractor, deadline,
+                    skip_nested_documents=html_only,
+                )
             except Exception as exc:
                 result = exc
             _apply_result(brochure_url, result)
@@ -888,7 +935,9 @@ def enrich_properties(
         # Knotel's lighter HTML gallery fetches (confirmed 2026-07 4-file batch).
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
             futures = {
-                pool.submit(_retrieve, brochure_url, fetcher, extractor, deadline): brochure_url
+                pool.submit(
+                    _retrieve, brochure_url, fetcher, extractor, deadline, html_only
+                ): brochure_url
                 for brochure_url in wave
             }
             for future in as_completed(futures):
@@ -914,7 +963,7 @@ def _fetch_resource(fetcher, url, deadline):
     return fetcher(url)
 
 
-def _retrieve(url, fetcher, extractor, deadline=None):
+def _retrieve(url, fetcher, extractor, deadline=None, skip_nested_documents=False):
     resource = _coerce_resource(_fetch_resource(fetcher, url, deadline), url)
     resource_type = _resource_type(resource.payload, resource.content_type)
     payload = resource.payload
@@ -961,15 +1010,59 @@ def _retrieve(url, fetcher, extractor, deadline=None):
                 count += 1
         return count
 
+    def _page_gallery_url_count(assets):
+        """Image-like HTTP URLs on the page usable as High Res candidates.
+
+        Broader than _confident_page_photo_count: empty-alt GPE /media/
+        thumbs still count so we can skip a slow nested PDF when the
+        website gallery alone can fill the 5–8 target. Non-image chrome
+        URLs (even if mis-labeled PROPERTY_IMAGE) do not count.
+        """
+        seen = set()
+        skip = {
+            AssetType.FLOORPLAN,
+            AssetType.LOGO,
+            AssetType.MAP,
+            AssetType.TRACKING_OR_DECORATIVE,
+            AssetType.DOCUMENT_PREVIEW,
+            AssetType.BROCHURE,
+        }
+        for asset in assets:
+            if asset.content or asset.classification in skip:
+                continue
+            url = normalize_url(asset.url or "")
+            if not url or url in seen:
+                continue
+            low = url.lower()
+            if any(
+                token in low
+                for token in (
+                    ".jpg", ".jpeg", ".png", ".webp", "/assets/", "/media/",
+                    "/digitalassets", "/image", "/photo", "/gallery/",
+                )
+            ):
+                seen.add(url)
+        return len(seen)
+
     page_photos = _confident_page_photo_count(combined.assets)
+    # Broader gallery signal for the nested-PDF skip decision: image-like
+    # HTTP URLs on the property page (GPE /media/, Knotel /assets/) even
+    # when alt text is empty. Prefer these over burning the enrichment
+    # window on a multi-MB "Download brochure" PDF per building.
+    page_gallery_urls = _page_gallery_url_count(combined.assets)
+    has_floorplan_seed = any(
+        a.classification == AssetType.FLOORPLAN and (a.url or a.content)
+        for a in combined.assets
+    )
     brochure_assets = [
         a for a in combined.assets
         if a.classification == AssetType.BROCHURE and a.url and a.url != resource.final_url
     ]
     # Always follow Drive/Box/Dropbox. Follow explicit "Download brochure"
-    # PDFs (GPE) when the HTML gallery is still under the High Res target.
-    # Other nested PDFs stay optional so Knotel pages with a full HTML
-    # gallery do not burn the enrichment window.
+    # PDFs when the HTML gallery is under target (photos) OR when the page
+    # has no floor-plan asset yet (GPE plans live inside the landlord PDF).
+    need_nested_photos = page_gallery_urls < _MIN_HIGH_RES_TARGET and page_photos < _MIN_HIGH_RES_TARGET
+    need_nested_plans = not has_floorplan_seed
     must_follow = []
     optional_docs = []
     for asset in brochure_assets:
@@ -977,22 +1070,30 @@ def _retrieve(url, fetcher, extractor, deadline=None):
         is_download_brochure = (
             ("brochure" in label and ("download" in label or label.strip().endswith(".pdf")))
             or bool(re.search(r"download\s+(?:the\s+)?(?:brochure|pdf)", label))
+            or bool(re.search(r"(?:^|[-_/])brochure(?:[-_.]|\.pdf|$)", label))
         )
         if _is_hosted_document_download(asset.url):
             must_follow.append(asset.url)
-        elif is_download_brochure and page_photos < _MIN_HIGH_RES_TARGET:
-            # Explicit CTA — follow even when a couple of HTML heroes exist
-            # so GPE/landlord PDFs can fill the 5–8 High Res band.
+        elif is_download_brochure and (need_nested_photos or need_nested_plans):
             must_follow.append(asset.url)
         else:
             optional_docs.append(asset.url)
     documents = list(dict.fromkeys(must_follow))[:2]
-    if page_photos < _MIN_HIGH_RES_TARGET:
-        for url in optional_docs:
-            if url not in documents:
-                documents.append(url)
+    if need_nested_photos:
+        for doc_url in optional_docs:
+            if doc_url not in documents:
+                documents.append(doc_url)
             if len(documents) >= 2:
                 break
+    # Caller may request HTML-only (tight deadline): still expose page
+    # gallery URLs without nested landlord-PDF fetches. Drive/Box viewers
+    # still need their download target — those are the only photo source.
+    if skip_nested_documents:
+        documents = [u for u in documents if _is_hosted_document_download(u)][:1]
+    # When HTML already supplies the High Res gallery, nested landlord PDFs
+    # are only needed for Floor Plan — extract plans only and stop early.
+    nested_max_photos = None if need_nested_photos else 0
+    nested_stop_plans = None if need_nested_photos else 2
     for document_url in documents:
         if deadline is not None and time.monotonic() >= deadline:
             combined.warnings.append(
@@ -1001,7 +1102,16 @@ def _retrieve(url, fetcher, extractor, deadline=None):
             break
         try:
             nested = _coerce_resource(_fetch_resource(fetcher, document_url, deadline), document_url)
-            nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
+            if nested_max_photos == 0 and extractor is extract_brochure:
+                nested_extraction = extract_brochure(
+                    nested.payload,
+                    nested.content_type,
+                    nested.final_url,
+                    max_photos=0,
+                    stop_after_floorplans=nested_stop_plans or 2,
+                )
+            else:
+                nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)

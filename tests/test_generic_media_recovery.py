@@ -48,6 +48,22 @@ def test_xlsx_floor_plan_label_dual_fills_brochure_without_provider_rule():
     assert records[0]["Floor Plan"] == "https://files.example.test/s/row-share"
     assert records[0]["Brochure PDF"] == "https://files.example.test/s/row-share"
 
+    click_records = [
+        {"Building": "200 Example Street", "Floor Plan": "", "Brochure PDF": ""},
+    ]
+    enrich_xlsx(
+        click_records,
+        [
+            {
+                "row_text": "200 Example Street | 2nd | CLICK HERE",
+                "links": [("CLICK HERE", "https://files.example.test/s/click-only")],
+            }
+        ],
+    )
+    # Brochure-only rows seed Floor Plan with the same replaceable viewer URL.
+    assert click_records[0]["Brochure PDF"] == "https://files.example.test/s/click-only"
+    assert click_records[0]["Floor Plan"] == "https://files.example.test/s/click-only"
+
 
 def test_html_sparse_photo_seeds_brochure_from_listing_cta():
     """One featured photo + View listing CTA → Brochure PDF enrichment seed."""

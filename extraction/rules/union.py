@@ -204,3 +204,11 @@ def _attach_row_links(records, row_links):
                 record["Floor Plan"] = floorplan_url
             if brochure_url and not record.get("Brochure PDF"):
                 record["Brochure PDF"] = brochure_url
+            # Seed Floor Plan with the brochure Box/Drive share when the row
+            # only had a "CLICK HERE" brochure label (most UNION rows). That
+            # URL is a replaceable viewer seed — enrichment / materialise
+            # overwrite it with a real plan bitmap when one is found, and
+            # it keeps a clickable Floor Plan cell for rows whose unique
+            # PDF is skipped later by the enrichment budget.
+            if brochure_url and not record.get("Floor Plan"):
+                record["Floor Plan"] = brochure_url

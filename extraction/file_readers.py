@@ -31,22 +31,30 @@ def read_file(path):
     ext = Path(path).suffix.lower()
     try:
         if ext == ".pdf":
-            return _read_pdf(path)
-        if ext == ".docx":
-            return _read_docx(path)
-        if ext in (".xlsx", ".xls"):
-            return _read_xlsx(path)
-        if ext == ".csv":
-            return _read_csv(path)
-        if ext == ".eml":
-            return _read_eml(path)
-        if ext in (".html", ".htm"):
-            return _read_html(path)
+            content = _read_pdf(path)
+        elif ext == ".docx":
+            content = _read_docx(path)
+        elif ext in (".xlsx", ".xls"):
+            content = _read_xlsx(path)
+        elif ext == ".csv":
+            content = _read_csv(path)
+        elif ext == ".eml":
+            content = _read_eml(path)
+        elif ext in (".html", ".htm"):
+            content = _read_html(path)
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
     except ValueError:
         raise
     except Exception as e:
         raise ValueError(f"Could not read {ext} file: {e}")
-    raise ValueError(f"Unsupported file type: {ext}")
+    # mtime year backs filename month/day fragments for External Ref when
+    # the upload itself has no email Date / PDF metadata (UNION xlsx).
+    try:
+        content["file_mtime_year"] = _date.fromtimestamp(Path(path).stat().st_mtime).year
+    except OSError:
+        content["file_mtime_year"] = None
+    return content
 
 
 def _clean_pdf_cell(cell):

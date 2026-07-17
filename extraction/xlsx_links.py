@@ -122,6 +122,11 @@ def enrich_records(records, row_links):
             record["Floor Plan"] = floorplan_url
         if brochure_url and not record.get("Brochure PDF"):
             record["Brochure PDF"] = brochure_url
+        # Same replaceable-viewer Floor Plan seed as the UNION rule: a
+        # brochure-only row still gets a Floor Plan cell that enrichment
+        # can overwrite with a real plan image.
+        if brochure_url and not record.get("Floor Plan"):
+            record["Floor Plan"] = brochure_url
 
 
 def _best_brochure_candidate(urls):

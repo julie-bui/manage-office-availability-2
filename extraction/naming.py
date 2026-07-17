@@ -2,6 +2,7 @@
 names unique within a batch.
 """
 import re
+from datetime import date as _date
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -25,6 +26,12 @@ _MONTH_NAMES = (
     r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
     r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
 )
+_MONTH_LOOKUP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
 # A "Month Day" or "Day Month" date fragment (e.g. "June 26", "26 June",
 # "Dec 3rd") — deliberately NOT just "any segment with a digit in it":
 # confirmed real (2026-07), a UNION filename's own trailing segment can be
@@ -35,6 +42,23 @@ _MONTH_NAMES = (
 _DATE_FRAGMENT_RE = re.compile(
     rf"^(?:(?:{_MONTH_NAMES})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?|\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTH_NAMES})\.?)$",
     re.IGNORECASE,
+)
+# Filename date shapes used for External Ref when email/PDF metadata is
+# missing (UNION "June 26", Knotel "30_06_2026", "14th July", ISO dates).
+_FILENAME_DATE_PATTERNS = (
+    re.compile(
+        rf"(?P<month>{_MONTH_NAMES})\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?P<month>{_MONTH_NAMES})\.?"
+        rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?P<year>20\d{2})[-_./](?P<month>\d{1,2})[-_./](?P<day>\d{1,2})"),
+    re.compile(r"(?P<day>\d{1,2})[-_./](?P<month>\d{1,2})[-_./](?P<year>20\d{2})"),
+    re.compile(r"(?P<day>\d{1,2})_(?P<month>\d{1,2})_(?P<year>20\d{2})"),
 )
 
 
@@ -62,15 +86,68 @@ def extract_date(content):
         return None
 
 
+def extract_date_from_filename(filename, fallback_year=None):
+    """Best-effort YYYY-MM-DD from a source filename date fragment.
+
+    Confirmed real (2026-07): UNION xlsx uploads carry no email Date and no
+    spreadsheet file_date, but the filename itself includes "June 26".
+    Without this, External Ref fell back to today's processing date.
+
+    Year resolution when the fragment is month+day only: prefer an explicit
+    year elsewhere in the same filename, else fallback_year (typically the
+    file's mtime year), else the current calendar year.
+    """
+    stem = Path(filename or "").stem
+    if not stem:
+        return None
+    stem = LEADING_REPLY_PREFIX.sub("", stem).strip()
+    year_hint = fallback_year
+    year_match = re.search(r"(?<!\d)(20\d{2})(?!\d)", stem)
+    if year_match:
+        year_hint = int(year_match.group(1))
+    if year_hint is None:
+        year_hint = _date.today().year
+
+    for pattern in _FILENAME_DATE_PATTERNS:
+        match = pattern.search(stem)
+        if not match:
+            continue
+        parts = match.groupdict()
+        try:
+            day = int(parts["day"])
+            raw_month = parts["month"]
+            if raw_month.isdigit():
+                month = int(raw_month)
+            else:
+                month = _MONTH_LOOKUP.get(raw_month.lower().rstrip("."))
+            if not month:
+                continue
+            year = int(parts["year"]) if parts.get("year") else int(year_hint)
+            return _date(year, month, day).isoformat()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
 def resolve_source_date(content):
     """Best-effort YYYY-MM-DD for when the source document was actually
     created/sent, in priority order:
       1. An email's Date header (the actual sent date) — extract_date().
       2. PDF/DOCX metadata (creation date, then modified date, whichever
          file_readers could read) — content["file_date"].
-    Returns None if neither is available anywhere — the caller should fall
-    back to the processing date as a last resort rather than guessing."""
-    return extract_date(content) or (content or {}).get("file_date")
+      3. A date fragment in the uploaded filename (e.g. UNION "June 26",
+         Knotel "30_06_2026") — extract_date_from_filename().
+    Returns None if nothing is available — the caller should fall back to
+    the processing date as a last resort rather than guessing."""
+    content = content or {}
+    return (
+        extract_date(content)
+        or content.get("file_date")
+        or extract_date_from_filename(
+            content.get("filename") or content.get("source_file_name") or "",
+            fallback_year=content.get("file_mtime_year"),
+        )
+    )
 
 
 def extract_area_hint(filename, provider_name=None):

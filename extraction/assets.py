@@ -160,6 +160,15 @@ def classify_candidate(candidate: AssetCandidate) -> AssetCandidate:
             classification, confidence = AssetType.DECORATIVE, 0.86
         elif _PROPERTY_RE.search(context) or candidate.association_confidence >= 0.8:
             classification, confidence = AssetType.PROPERTY_IMAGE, 0.82
+        elif (
+            candidate.association_confidence >= 0.55
+            and _IMAGE_LIKE_PATH_RE.search(parsed.path or "")
+        ):
+            # Property-page galleries (confirmed GPE /media/…, Knotel
+            # /assets/…) often ship empty alt text. Association from a
+            # <main>/<article> container is enough to treat image-like
+            # paths as listing photos without requiring a nested PDF.
+            classification, confidence = AssetType.PROPERTY_IMAGE, 0.75
         else:
             classification, confidence = AssetType.UNKNOWN, 0.25
     else:

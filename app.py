@@ -53,8 +53,11 @@ PDF_IMAGE_ENRICHED_METHODS = {"llm", "llm:chunked", "rule:BC", "rule:Breezblok"}
 MIN_HIGH_RES_IMAGES = 5
 MAX_HIGH_RES_IMAGES = 8
 # URL/filename floor-plan tokens — cheap pre-filter before pixel validation
-# (MetSpace / brochure CDN paths that literally say "floorplan").
-_FLOORPLAN_URL_RE = re.compile(r"floor[\s_-]*plan|floorplan|\blayout\b", re.I)
+# (MetSpace / brochure CDN paths that literally say "floorplan" / "floor_plan").
+_FLOORPLAN_URL_RE = re.compile(
+    r"floor[\s_-]*plan|floorplan|\blayout\b|level[-_]?\d+[-_].*plan|2d[-_]?floor",
+    re.I,
+)
 # Sources confirmed to ship availability with literally no property photos
 # (tabular PDF only). Blank High Res is expected, not a coverage failure.
 IMAGE_EXEMPT_METHODS = {"rule:BC"}
@@ -894,6 +897,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 ))
                 if _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
                     record["Floor Plan"] = plan_url
+                    floor_plan_url = normalize_url(plan_url)
         trusted = set(merge_candidate_urls(source_candidates))
         valid = []
         seen_hashes = set()
@@ -1012,6 +1016,17 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     continue
                 if content_hash:
                     seen_hashes.add(content_hash)
+                # Final guard: never keep the Floor Plan cell URL in High Res
+                # even if a soft-accept path admitted it under deadline.
+                if floor_plan_url and normalize_url(resolved) == floor_plan_url:
+                    rejected.append((candidate, "IMAGE_IS_FLOORPLAN"))
+                    continue
+                if _FLOORPLAN_URL_RE.search(resolved or ""):
+                    rejected.append((candidate, "IMAGE_IS_FLOORPLAN"))
+                    if _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
+                        record["Floor Plan"] = resolved
+                        floor_plan_url = normalize_url(resolved)
+                    continue
                 valid.append(resolved)
             else:
                 rejected.append((candidate, result.get("status") or "IMAGE_REJECTED"))
