@@ -91,6 +91,10 @@ CONTENT_TYPES = {
     ".png": "image/png",
     ".webp": "image/webp",
     ".gif": "image/gif",
+    # JPEG 2000 from landlord PDFs — prefer converting to PNG on materialise;
+    # keep types so a raw .jpx fallback still has a usable Content-Type.
+    ".jpx": "image/jpx",
+    ".jp2": "image/jp2",
 }
 # Extensions a browser can render natively — served as `inline` so
 # clicking a downloaded source artifact opens it directly in-browser instead of
@@ -1294,6 +1298,32 @@ def _image_coverage_warning(records, method):
     return "Image coverage check: " + "; ".join(parts) + "."
 
 
+def _normalize_embedded_image_bytes(content: bytes, extension: str):
+    """Return (bytes, extension) suitable for browser-viewable Floor Plan / High Res.
+
+    Landlord PDFs (GPE and others) often embed JPEG 2000 (.jpx/.jp2). Browsers
+    and Excel hyperlink previews cannot display those — convert to PNG when
+    Pillow can decode them so Floor Plan cells open as real images.
+    """
+    ext = (extension or "png").lower().lstrip(".")
+    if not content:
+        return content, ext
+    if ext not in {"jpx", "jp2", "j2k", "j2c"}:
+        return content, ext
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(BytesIO(content)) as bitmap:
+            bitmap.load()
+            rgb = bitmap.convert("RGB")
+            out = BytesIO()
+            rgb.save(out, format="PNG", optimize=True)
+            return out.getvalue(), "png"
+    except Exception:
+        return content, ext
+
+
 def _materialize_brochure_assets(records, batch_dir, batch_id, name):
     """Persist classified embedded brochure visuals after batch URLs exist.
 
@@ -1384,9 +1414,10 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                     continue
             if digest not in saved:
                 extension = (candidate.extension or "png").lower().lstrip(".")
+                payload, extension = _normalize_embedded_image_bytes(candidate.content, extension)
                 filename = f"{name}_brochure_r{record_index}_{digest[:10]}.{extension}"
                 path = batch_dir / filename
-                path.write_bytes(candidate.content)
+                path.write_bytes(payload)
                 jobs.append((f"{batch_id}/{filename}", path))
                 saved[digest] = _download_url(batch_id, filename)
                 saved_kind[digest] = (

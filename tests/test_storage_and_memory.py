@@ -151,7 +151,7 @@ def test_enrichment_skips_remaining_urls_when_rss_near_ceiling(monkeypatch):
 
 
 def test_hosted_box_pdf_forces_light_extract_under_modest_rss(monkeypatch):
-    """UNION Box PDFs on ~1GB hosts must use light first-page extract kwargs."""
+    """UNION Box PDFs on ~1GB hosts must use light extract kwargs (deep when plan missing)."""
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
     monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
     seen = []
@@ -187,8 +187,95 @@ def test_hosted_box_pdf_forces_light_extract_under_modest_rss(monkeypatch):
         extractor=brochure.extract_brochure,
     )
     assert seen
-    assert seen[0].get("max_pages") == brochure._LIGHT_MAX_PAGES
+    # Blank Floor Plan → plan-hunting light extract (deeper page window + one plan).
+    assert seen[0].get("max_pages") == max(brochure._LIGHT_MAX_PAGES, brochure._PLAN_ONLY_MAX_PAGES)
     assert seen[0].get("max_photos") == brochure._LIGHT_MAX_PHOTOS
+    assert seen[0].get("stop_after_floorplans") == 1
+    assert seen[0].get("prefer_photos") is False
+
+
+def test_hosted_box_pdf_light_extract_prefers_photos_when_real_plan_seeded(monkeypatch):
+    """Usable Floor Plan seed keeps the shallow photo-focused light window."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    seen = []
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"%PDF-1.4 brochure", "application/pdf", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        seen.append(dict(kwargs))
+        return BrochureExtraction(
+            source_document,
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://app.box.com/shared/static/abc123.pdf",
+                "Floor Plan": "https://cdn.example.test/plans/level-2.png",
+            }
+        ),
+        "union.xlsx",
+        "UNION",
+        "rule:UNION",
+    )
+    brochure.enrich_properties(
+        [prop],
+        fetcher=fetch,
+        extractor=brochure.extract_brochure,
+    )
+    assert seen
+    assert seen[0].get("max_pages") == brochure._LIGHT_MAX_PAGES
+    assert seen[0].get("prefer_photos") is True
+    assert seen[0].get("stop_after_floorplans") == 0
+
+
+def test_viewer_floor_plan_seed_does_not_skip_plan_hunt(monkeypatch):
+    """Box/Drive viewer URLs must not count as a finished Floor Plan seed."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 100.0)
+    seen = []
+
+    def fetch(url, deadline=None):
+        return BrochureResource(b"%PDF-1.4 brochure", "application/pdf", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        seen.append(dict(kwargs))
+        return BrochureExtraction(
+            source_document,
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://drive.google.com/file/d/abc/view",
+                "Floor Plan": "https://drive.google.com/file/d/abc/view",
+            }
+        ),
+        "metspace.xlsx",
+        "MetSpace",
+        "rule:MetSpace",
+    )
+    brochure.enrich_properties(
+        [prop],
+        fetcher=fetch,
+        extractor=brochure.extract_brochure,
+    )
+    assert seen
+    assert seen[0].get("prefer_photos") is False
+    assert seen[0].get("stop_after_floorplans") == 1
+    assert seen[0].get("max_pages") == max(brochure._LIGHT_MAX_PAGES, brochure._PLAN_ONLY_MAX_PAGES)
 
 
 def test_retrieve_prefers_html_gallery_and_limits_nested_pdf_photos(monkeypatch):
@@ -269,9 +356,114 @@ def test_retrieve_prefers_html_gallery_and_limits_nested_pdf_photos(monkeypatch)
     assert any(url.endswith(".pdf") for url in fetched)
     assert nested_kwargs
     assert all(kw.get("max_photos") == 0 for kw in nested_kwargs)
+    assert all(kw.get("prefer_photos") is False for kw in nested_kwargs)
+    assert all(
+        kw.get("max_pages") == max(brochure._LIGHT_MAX_PAGES, brochure._PLAN_ONLY_MAX_PAGES)
+        for kw in nested_kwargs
+    )
     candidates = prop.values.get("_high_res_candidates") or []
     assert len(candidates) >= 5
     assert all("media/" in url for url in candidates[:5])
+
+
+def test_floorplan_pdf_link_on_page_still_fetches_nested_brochure_for_bitmap(monkeypatch):
+    """HTML floorplan.pdf links must not count as a finished plan seed.
+
+    Confirmed real (GPE 2026-07): property pages expose *floorplans*.pdf
+    assets. Counting them as has_floorplan_seed skipped the nested brochure
+    bitmap extract, while merge/finalize also refuse .pdf Floor Plan cells —
+    leaving Floor Plan blank.
+    """
+    fetched = []
+    nested_kwargs = []
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        if url.endswith(".pdf"):
+            return BrochureResource(b"%PDF-1.4 plan", "application/pdf", url, url)
+        return BrochureResource(b"<html>listing</html>", "text/html", url, url)
+
+    def fake_extract(payload, content_type, source_document, **kwargs):
+        if payload.startswith(b"%PDF"):
+            nested_kwargs.append(dict(kwargs))
+            return BrochureExtraction(
+                source_document,
+                assets=[
+                    AssetCandidate(
+                        "",
+                        source_document,
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        content=b"plan-bytes",
+                        content_hash="planhashpdfseed",
+                        extension="png",
+                    )
+                ],
+                identity_text="Example House, 1 Example Street, EC1A 1AA",
+            )
+        photos = [
+            classify_candidate(
+                AssetCandidate(
+                    f"https://cdn.property.test/media/{name}.jpg",
+                    source_document,
+                    alt_text=name,
+                    association_confidence=0.85,
+                    classification=AssetType.PROPERTY_IMAGE,
+                    confidence=0.85,
+                )
+            )
+            for name in ("a", "b", "c", "d", "e")
+        ]
+        return BrochureExtraction(
+            source_document,
+            assets=photos
+            + [
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/media/level-2_2d-floorplans_a4.pdf",
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.FLOORPLAN,
+                        confidence=0.9,
+                        alt_text="Floor plan",
+                    )
+                ),
+                classify_candidate(
+                    AssetCandidate(
+                        "https://cdn.property.test/brochure.pdf",
+                        source_document,
+                        mime_type="application/pdf",
+                        classification=AssetType.BROCHURE,
+                        confidence=0.9,
+                        anchor_text="Download brochure",
+                    )
+                ),
+            ],
+            identity_text="Example House, 1 Example Street, EC1A 1AA",
+        )
+
+    monkeypatch.setattr(brochure, "extract_brochure", fake_extract)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 0.0)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "Example House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": "https://property.test/listing",
+            }
+        ),
+        "provider.eml",
+        "Provider",
+        "rule:Provider",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert any(url.endswith("brochure.pdf") for url in fetched)
+    assert nested_kwargs
+    assert all(kw.get("max_photos") == 0 for kw in nested_kwargs)
+    assert all(kw.get("stop_after_floorplans") == 1 for kw in nested_kwargs)
+    embeds = prop.values.get("_brochure_embedded_assets") or []
+    assert any(a.classification == AssetType.FLOORPLAN and a.content for a in embeds)
 
 
 def test_retrieve_skips_nested_landlord_pdf_when_gallery_and_plan_and_rss_tight(monkeypatch):

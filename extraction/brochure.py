@@ -167,10 +167,13 @@ _MIN_HIGH_RES_TARGET = 5
 # photos beat blank High Res. Full galleries run whenever budget/RSS allow.
 _LIGHT_MAX_PHOTOS = 3
 _LIGHT_MAX_PAGES = 5
+# Plan-only / missing-plan light extracts scan deeper than the photo window —
+# CAD diagrams often sit after the first marketing pages (any provider PDF).
+_PLAN_ONLY_MAX_PAGES = 25
 # Skip *optional* nested PDFs on property HTML pages that already expose a
-# confident photo gallery (Knotel/GPE). Never used to skip Drive/Box/Dropbox
+# confident photo gallery (Knotel/GPE/…). Never used to skip Drive/Box/Dropbox
 # download targets — those viewer shells often have ≥2 chrome images and
-# are the ONLY photo/floorplan source for MetSpace / Workplace Plus.
+# are the ONLY photo/floorplan source for MetSpace / Workplace Plus / UNION.
 _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS = 3
 # Soft stop before container OOM — scaled to detected RAM, not a fixed 6GiB
 # that never trips on a 512MB–1GB Railway service.
@@ -496,13 +499,12 @@ def extract_brochure(
     """Best-effort extraction based on actual response content, not suffix.
 
     max_photos / stop_after_floorplans let callers that already have an HTML
-    gallery (GPE property pages) pull only a floor-plan bitmap from a nested
-    landlord PDF without decoding every marketing photo page.
+    gallery (property pages) pull only a floor-plan bitmap from a nested
+    brochure PDF without decoding every marketing photo page.
 
     prefer_photos / max_pages are the light path for high unique-URL batches
-    (UNION Box): get at least one High Res bitmap quickly when Floor Plan is
-    already seeded with a viewer URL and full-gallery decode would blow the
-    deadline.
+    (UNION Box / MetSpace Drive): get High Res bitmaps quickly when a real
+    Floor Plan already exists and full-gallery decode would blow the deadline.
     """
     resource_type = _resource_type(payload, content_type)
     if resource_type == "html":
@@ -518,8 +520,8 @@ def extract_brochure(
         text_parts = []
         links = []
         # Always read text from (almost) the whole brochure so State of Space /
-        # Special Features are not lost when the visual scan is light (GPE
-        # nested "Download brochure" with max_pages for bitmaps only).
+        # Special Features are not lost when the visual scan is light (nested
+        # brochure with max_pages for bitmaps only — any provider).
         visual_page_limit = None if max_pages is None else max(1, int(max_pages))
         with pdfplumber.open(BytesIO(payload)) as pdf:
             text_page_limit = len(pdf.pages)
@@ -840,16 +842,16 @@ def _extract_pdf_visuals(
                     if is_floorplan:
                         if floorplan_kept >= floorplan_cap:
                             continue
-                        # Plan-only / light nested extracts (GPE HTML gallery
+                        # Plan-only / light nested extracts (HTML gallery
                         # already has photos): require pixel evidence so a
                         # marketing banner on a "Floor plan" labelled page
                         # cannot consume the single floorplan slot and leave
                         # the real CAD diagram behind.
                         if stop_after_floorplans is not None and not pixel_floorplan:
                             continue
-                        # When Floor Plan is already seeded (viewer URL) or
-                        # RSS is tight, prefer High Res photos over another
-                        # plan bitmap — blank High Res is the user-visible gap.
+                        # When a real Floor Plan already exists or RSS is
+                        # tight, prefer High Res photos over another plan
+                        # bitmap — blank High Res is the user-visible gap.
                         if prefer_photos and photo_kept < max(1, min(photo_cap, _LIGHT_MAX_PHOTOS)):
                             continue
                         if rss_tight and prefer_photos:
@@ -1488,8 +1490,8 @@ def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
 
 
 def _floor_plan_already_seeded(prop: Property) -> bool:
-    plan = str(prop.values.get("Floor Plan") or "").strip()
-    return bool(plan)
+    """True only for a usable Floor Plan — Box/Drive/PDF viewer seeds do not count."""
+    return bool(_usable_floor_plan_value(prop.values))
 
 
 def _rss_mb() -> float:
@@ -1883,7 +1885,10 @@ def enrich_properties(
                 deadline,
                 skip_nested_documents=skip_nested,
                 light_pdf=light_pdf,
-                prefer_photos=prefer_photos or light_pdf,
+                # Prefer photos only when a *usable* Floor Plan already exists.
+                # light_pdf alone must still hunt for a real plan bitmap
+                # (viewer URL / blank Floor Plan — MetSpace Drive, UNION Box, …).
+                prefer_photos=prefer_photos,
             )
 
         stop_for_memory = False
@@ -1961,11 +1966,14 @@ def _retrieve(
     final_url = resource.final_url
     extract_kwargs = {}
     if light_pdf and resource_type == "pdf" and extractor is extract_brochure:
+        # Missing / viewer-only Floor Plan: scan deep enough for CAD pages and
+        # keep one pixel plan. Usable plan already present: stay photo-light.
+        need_plans = not prefer_photos
         extract_kwargs = {
             "max_photos": _LIGHT_MAX_PHOTOS,
-            "stop_after_floorplans": 1 if not prefer_photos else 0,
+            "stop_after_floorplans": 1 if need_plans else 0,
             "prefer_photos": prefer_photos,
-            "max_pages": _LIGHT_MAX_PAGES,
+            "max_pages": max(_LIGHT_MAX_PAGES, _PLAN_ONLY_MAX_PAGES) if need_plans else _LIGHT_MAX_PAGES,
         }
         combined = extract_brochure(payload, content_type, final_url, **extract_kwargs)
     elif prefer_photos and resource_type == "pdf" and extractor is extract_brochure:
@@ -2059,7 +2067,11 @@ def _retrieve(
     # window on a multi-MB "Download brochure" PDF per building.
     page_gallery_urls = _page_gallery_url_count(combined.assets)
     has_floorplan_seed = any(
-        a.classification == AssetType.FLOORPLAN and (a.url or a.content)
+        a.classification == AssetType.FLOORPLAN
+        and (
+            bool(a.content)
+            or (bool(a.url) and not _is_viewer_floorplan_url(a.url))
+        )
         for a in combined.assets
     )
     brochure_assets = [
@@ -2068,12 +2080,13 @@ def _retrieve(
     ]
     # Always follow Drive/Box/Dropbox. Follow explicit "Download brochure"
     # PDFs when the HTML gallery is under target (photos) OR when the page
-    # has no floor-plan asset yet (GPE plans live inside the landlord PDF).
+    # has no usable floor-plan asset yet (plans often live inside the brochure PDF).
     html_gallery_ready = (
         page_gallery_urls >= _MIN_HIGH_RES_TARGET
         or page_photos >= _NESTED_PDF_SKIP_WHEN_PAGE_PHOTOS
     )
     need_nested_photos = not html_gallery_ready
+    # Viewer URL "plans" are not usable — still fetch nested brochure for a bitmap.
     need_nested_plans = not has_floorplan_seed and not prefer_photos
     must_follow = []
     optional_docs = []
@@ -2095,6 +2108,24 @@ def _retrieve(
         for doc_url in optional_docs:
             if doc_url not in documents:
                 documents.append(doc_url)
+            if len(documents) >= 2:
+                break
+    # Dedicated *floorplan*.pdf links on the property page are not usable
+    # Floor Plan cell values (cleared as document placeholders), but they
+    # are excellent nested sources for a plan bitmap when the brochure
+    # pull is thin — follow one alongside Download brochure.
+    if need_nested_plans:
+        for asset in combined.assets:
+            if asset.classification != AssetType.FLOORPLAN or not asset.url:
+                continue
+            plan_url = asset.url
+            if not _is_viewer_floorplan_url(plan_url):
+                continue
+            path = (urlparse(plan_url).path or "").lower()
+            if not (path.endswith(".pdf") or _is_hosted_document_download(plan_url)):
+                continue
+            if plan_url not in documents:
+                documents.append(plan_url)
             if len(documents) >= 2:
                 break
     # Caller may request HTML-only (tight deadline): still expose page
@@ -2137,11 +2168,11 @@ def _retrieve(
         nested_max_photos = _LIGHT_MAX_PHOTOS
     # Prefer light page scan when we only need a floor plan from nested PDF,
     # or when RSS/host headroom is already modest. Plan-only nested extracts
-    # still scan deeper than the photo light window — GPE CAD diagrams often
-    # sit after the first marketing pages.
+    # still scan deeper than the photo light window — CAD diagrams often
+    # sit after the first marketing pages (any provider brochure PDF).
     nested_light_pages = light_pdf or memory_tight or (html_gallery_ready and not need_nested_photos)
     if nested_light_pages and nested_max_photos == 0 and need_nested_plans:
-        nested_visual_pages = max(_LIGHT_MAX_PAGES, 25)
+        nested_visual_pages = max(_LIGHT_MAX_PAGES, _PLAN_ONLY_MAX_PAGES)
     elif nested_light_pages:
         nested_visual_pages = _LIGHT_MAX_PAGES
     else:
@@ -2157,6 +2188,7 @@ def _retrieve(
             if extractor is extract_brochure and (
                 nested_max_photos is not None or light_pdf or prefer_photos or nested_light_pages
             ):
+                plan_only_nested = nested_max_photos == 0 and need_nested_plans
                 nested_extraction = extract_brochure(
                     nested.payload,
                     nested.content_type,
@@ -2171,14 +2203,16 @@ def _retrieve(
                             else (0 if prefer_photos and light_pdf else 1 if light_pdf else None)
                         )
                     ),
-                    prefer_photos=prefer_photos or light_pdf,
+                    # Plan-only nested pulls must not prefer_photos — that gate
+                    # skips every floorplan while photo_cap is 0.
+                    prefer_photos=False if plan_only_nested else prefer_photos,
                     max_pages=nested_visual_pages,
                 )
             else:
                 nested_extraction = extractor(nested.payload, nested.content_type, nested.final_url)
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
             # Drop the raw nested body once extract has kept its embeds —
-            # several GPE landlord PDFs alive across a wave was a confirmed
+            # several landlord PDFs alive across a wave was a confirmed
             # Railway SIGKILL path.
             del nested
             for field, value in nested_extraction.fields.items():
@@ -2246,7 +2280,7 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     for candidate in classify_candidates(extraction.assets):
         _add_asset(prop, candidate)
     # Prefer a real nested/hosted PDF in Brochure PDF over the HTML property
-    # page that seeded enrichment (GPE Download brochure, Drive/Box static).
+    # page that seeded enrichment (Download brochure, Drive/Box static).
     _promote_brochure_pdf_cell(prop, extraction)
     embedded = [a for a in prop.assets if a.content and a.classification in {AssetType.PROPERTY_IMAGE, AssetType.FLOORPLAN}]
     if embedded:

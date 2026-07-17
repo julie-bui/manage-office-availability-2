@@ -1,9 +1,13 @@
-"""GPE nested brochure: Floor Plan needs a real plan bitmap; SoS is status-only."""
+"""Provider-neutral brochure Floor Plan depth/pixel gates + Kitts SoS tags."""
 from io import BytesIO
 
 from PIL import Image
 
-from extraction.brochure import extract_brochure
+from extraction.brochure import (
+    _PLAN_ONLY_MAX_PAGES,
+    _LIGHT_MAX_PAGES,
+    extract_brochure,
+)
 from extraction.models import AssetType
 from extraction.pdf_images import is_floorplan_image
 from extraction.text_utils import clean_state_of_space, extract_state_of_space_status
@@ -24,7 +28,6 @@ def _floorplan_png(size=(800, 600)):
     """Near-white CAD-like diagram that passes is_floorplan_image."""
     image = Image.new("RGB", size, (250, 250, 250))
     pixels = image.load()
-    # Sparse dark lines so unique colours stay low.
     for x in range(0, size[0], 40):
         for y in range(size[1]):
             pixels[x, y] = (20, 20, 20)
@@ -87,13 +90,48 @@ def test_capped_floorplan_extract_skips_text_only_banner_keeps_pixel_plan():
     result = extract_brochure(
         payload,
         "application/pdf",
-        "https://example.test/gpe-brochure.pdf",
+        "https://cdn.example.test/landlord-brochure.pdf",
         max_photos=0,
         stop_after_floorplans=1,
         prefer_photos=False,
         max_pages=5,
     )
     plans = [a for a in result.assets if a.classification == AssetType.FLOORPLAN and a.content]
+    assert len(plans) == 1
+    assert is_floorplan_image(plans[0].content)
+
+
+def test_plan_only_extract_scans_deeper_than_photo_light_window():
+    """Nested/missing-plan light extracts must reach CAD pages past _LIGHT_MAX_PAGES."""
+    assert _PLAN_ONLY_MAX_PAGES > _LIGHT_MAX_PAGES
+    pages = []
+    for i in range(_LIGHT_MAX_PAGES + 2):
+        pages.append((f"Marketing page {i + 1}", _photo_jpeg(i + 1)))
+    # Real CAD after the shallow photo window (page index == _LIGHT_MAX_PAGES + 2).
+    pages.append(("Floor plan Level 3", _floorplan_png()))
+    payload = _pdf_with_pages(pages)
+    shallow = extract_brochure(
+        payload,
+        "application/pdf",
+        "https://drive.example.test/shared/brochure.pdf",
+        max_photos=0,
+        stop_after_floorplans=1,
+        prefer_photos=False,
+        max_pages=_LIGHT_MAX_PAGES,
+    )
+    assert not [
+        a for a in shallow.assets if a.classification == AssetType.FLOORPLAN and a.content
+    ]
+    deep = extract_brochure(
+        payload,
+        "application/pdf",
+        "https://drive.example.test/shared/brochure.pdf",
+        max_photos=0,
+        stop_after_floorplans=1,
+        prefer_photos=False,
+        max_pages=max(_LIGHT_MAX_PAGES, _PLAN_ONLY_MAX_PAGES),
+    )
+    plans = [a for a in deep.assets if a.classification == AssetType.FLOORPLAN and a.content]
     assert len(plans) == 1
     assert is_floorplan_image(plans[0].content)
 
