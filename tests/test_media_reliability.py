@@ -588,9 +588,11 @@ def test_enrichment_wave_hard_stops_at_deadline():
         for i in range(6)
     ]
     enrich_properties(props, fetcher=slow_fetch, extractor=extract, deadline=deadline)
-    # 4s pre-deadline margin with a 0.3s budget → no wave starts.
+    # 3s pre-deadline margin with a 0.3s budget → no wave starts.
     assert calls == []
     assert time.monotonic() - started < 0.8
+    # Skipped unique URLs still get a usable High Res brochure seed.
+    assert all(prop.values.get("High Res Images") for prop in props)
 
 
 def test_retrieve_skips_nested_pdf_when_page_has_gallery_and_floorplan():
@@ -1487,3 +1489,87 @@ def test_finalize_soft_accept_under_deadline_rejects_floorplan_named_url(tmp_pat
     assert "floorplan" not in (record.get("High Res Images") or "").lower()
     assert record.get("_high_res_image_count") == 1
     assert any(item.status == "IMAGE_IS_FLOORPLAN" for item in record["_link_diagnostics"])
+
+
+def test_enrichment_seeds_high_res_when_budget_skips_unique_box_urls():
+    """Floor Plan seed alone must not leave High Res blank under deadline."""
+    from extraction.brochure import _usable_high_res_seed_url
+
+    props = []
+    for i in range(15):
+        box = f"https://app.box.com/s/share{i:04d}abcd"
+        props.append(
+            Property.from_record(
+                normalize_record({
+                    "Building": f"Example House {i}, 1 Example Street",
+                    "Property Postcode": "EC1A 1AA",
+                    "Floor/Unit": "1st",
+                    "Brochure PDF": box,
+                    "Floor Plan": box,
+                }),
+                "union.xlsx",
+                "UNION",
+                "rule:UNION",
+            )
+        )
+
+    enrich_properties(props, fetcher=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")), extractor=lambda *a, **k: None, deadline=time.monotonic() - 1)
+    for prop in props:
+        hr = prop.values.get("High Res Images") or ""
+        assert hr, "High Res must be seeded when enrichment is skipped"
+        assert "/shared/static/" in hr and hr.endswith(".pdf")
+        assert hr == _usable_high_res_seed_url(prop.values["Brochure PDF"])
+        # Floor Plan seed is independent — still present.
+        assert prop.values.get("Floor Plan")
+
+
+def test_finalize_preserves_brochure_high_res_seed(tmp_path):
+    seed = "https://app.box.com/shared/static/examplebrochure.pdf"
+    record = {
+        "Building": "Example House",
+        "Floor Plan": "https://app.box.com/s/examplebrochure",
+        "High Res Images": seed,
+        "_high_res_candidates": [seed],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
+        )
+    assert record["High Res Images"] == seed
+    assert any(item.status == "HIGH_RES_BROCHURE_SEEDED" for item in record["_link_diagnostics"])
+
+
+def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
+    seed = "https://app.box.com/shared/static/examplebrochure.pdf"
+    photo = "https://cdn.test/office.jpg"
+    record = {
+        "Building": "Example House",
+        "High Res Images": seed,
+        "_high_res_candidates": [seed, photo],
+        "_source_high_res_candidates": [photo],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
+        )
+    assert record["High Res Images"] == photo
+    assert "box.com" not in (record.get("High Res Images") or "")
+
+
+def test_usable_high_res_seed_rewrites_box_and_drive():
+    from extraction.brochure import _usable_high_res_seed_url, _is_brochure_media_seed_url
+
+    box = "https://app.box.com/s/abc123share"
+    assert _usable_high_res_seed_url(box) == "https://app.box.com/shared/static/abc123share.pdf"
+    assert _is_brochure_media_seed_url(_usable_high_res_seed_url(box))
+    drive = "https://drive.google.com/file/d/FILEID123/view"
+    assert "drive.usercontent.google.com" in _usable_high_res_seed_url(drive)
+    assert _is_brochure_media_seed_url("https://cdn.test/office.jpg") is False

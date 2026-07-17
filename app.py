@@ -823,6 +823,32 @@ def _is_replaceable_viewer_url(url):
     return False
 
 
+def _is_brochure_media_seed_url(url):
+    """True for brochure/document URLs used as High Res click-through seeds.
+
+    Matches extraction.brochure seeding: Box/Drive/Dropbox/.pdf links keep
+    High Res non-blank when photo extraction cannot finish every unique URL.
+    """
+    text = str(url or "").strip()
+    if not text or "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "box.com" in host:
+        return True
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return True
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if path.endswith(".pdf"):
+        return True
+    return False
+
+
 def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validator=validate_image_url, deadline=None):
     """Validate, deduplicate and publish property-photo candidates.
 
@@ -844,9 +870,12 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         cands = list(record.get("_high_res_candidates") or [])
         cands.extend(record.get("_source_high_res_candidates") or [])
         existing = str(record.get("High Res Images") or "").strip()
-        if existing and ".html" not in existing.lower():
+        if existing and ".html" not in existing.lower() and not _is_brochure_media_seed_url(existing):
             cands.insert(0, existing)
-        count = len({normalize_url(url) for url in cands if url})
+        count = len({
+            normalize_url(url) for url in cands
+            if url and not _is_brochure_media_seed_url(url)
+        })
         if count <= 0:
             return 0
         if count < MIN_HIGH_RES_IMAGES:
@@ -861,7 +890,18 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
         if source_candidates:
             raw_candidates = source_candidates + list(raw_candidates or [])
         existing_image = str(record.get("High Res Images") or "")
+        brochure_seed = existing_image if _is_brochure_media_seed_url(existing_image) else ""
         if not raw_candidates and existing_image and ".html" not in existing_image.lower():
+            if brochure_seed:
+                record["_high_res_image_count"] = 0
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic(
+                        "HIGH_RES_BROCHURE_SEEDED",
+                        final_url=existing_image,
+                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
+                    )
+                )
+                continue
             raw_candidates = [existing_image]
         if not raw_candidates:
             if not existing_image:
@@ -870,7 +910,28 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
                 )
             continue
-        candidates = merge_candidate_urls(raw_candidates)
+        seed_from_candidates = [url for url in raw_candidates if _is_brochure_media_seed_url(url)]
+        if seed_from_candidates and not brochure_seed:
+            brochure_seed = seed_from_candidates[0]
+        photo_raw = [url for url in raw_candidates if not _is_brochure_media_seed_url(url)]
+        if not photo_raw:
+            if brochure_seed:
+                record["High Res Images"] = brochure_seed
+                record["_high_res_image_count"] = 0
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic(
+                        "HIGH_RES_BROCHURE_SEEDED",
+                        final_url=brochure_seed,
+                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
+                    )
+                )
+            elif not existing_image:
+                record["_high_res_image_count"] = 0
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")
+                )
+            continue
+        candidates = merge_candidate_urls(photo_raw)
         diagnostics = record.setdefault("_link_diagnostics", [])
         diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED", detail=f"{len(candidates)} candidate(s)"))
         # Never put the Floor Plan cell URL into High Res (MetSpace email
@@ -1042,9 +1103,20 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if status == "IMAGE_IS_FLOORPLAN" and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
                 record["Floor Plan"] = candidate
         if not valid:
-            record["High Res Images"] = ""
-            record["_high_res_image_count"] = 0
-            diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
+            # Prefer a brochure document seed over wiping High Res blank —
+            # UNION/Box rows skipped by enrichment budget still need a link.
+            if brochure_seed:
+                record["High Res Images"] = brochure_seed
+                record["_high_res_image_count"] = 0
+                diagnostics.append(LinkDiagnostic(
+                    "HIGH_RES_BROCHURE_SEEDED",
+                    final_url=brochure_seed,
+                    detail="Photo candidates rejected; kept brochure document URL as High Res fallback.",
+                ))
+            else:
+                record["High Res Images"] = ""
+                record["_high_res_image_count"] = 0
+                diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
             continue
 
         if len(candidates) > len(valid) and len(valid) >= MAX_HIGH_RES_IMAGES:
@@ -1257,13 +1329,23 @@ def _materialize_brochure_assets(records, batch_dir, batch_id, name):
                 photo_urls.append(url)
 
         if photo_urls:
-            existing_candidates = list(record.get("_high_res_candidates") or [])
+            existing_candidates = [
+                c for c in list(record.get("_high_res_candidates") or [])
+                if c and not _is_brochure_media_seed_url(c)
+            ]
             existing = str(record.get("High Res Images") or "")
             # CDN and redirect image URLs frequently have no useful extension.
             # A non-gallery value already assigned to this field is an image
-            # candidate and must survive the brochure merge.
-            if existing and Path(existing.split("?", 1)[0]).suffix.lower() != ".html":
+            # candidate and must survive the brochure merge — except brochure
+            # PDF/viewer seeds, which real embeds replace.
+            if (
+                existing
+                and Path(existing.split("?", 1)[0]).suffix.lower() != ".html"
+                and not _is_brochure_media_seed_url(existing)
+            ):
                 existing_candidates.insert(0, existing)
+            elif _is_brochure_media_seed_url(existing):
+                record["High Res Images"] = ""
             combined = list(dict.fromkeys(existing_candidates + photo_urls))[:MAX_HIGH_RES_IMAGES]
             # Always publish merged candidates. A blank High Res with only
             # embedded brochure bytes (MetSpace Drive / UNION Box / Workplace
@@ -1293,9 +1375,12 @@ def _share_materialized_media_across_buildings(records):
     def _candidate_count(record):
         cands = list(record.get("_high_res_candidates") or [])
         existing = str(record.get("High Res Images") or "").strip()
-        if existing and ".html" not in existing.lower():
+        if existing and ".html" not in existing.lower() and not _is_brochure_media_seed_url(existing):
             cands.insert(0, existing)
-        return len({normalize_url(url) for url in cands if url})
+        return len({
+            normalize_url(url) for url in cands
+            if url and not _is_brochure_media_seed_url(url)
+        })
 
     def _usable_floor_plan(record):
         plan = str(record.get("Floor Plan") or "").strip()

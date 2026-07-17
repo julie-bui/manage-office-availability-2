@@ -449,9 +449,28 @@ def process_files(
             # Fair share of remaining enrichment time when THIS file starts —
             # not an absolute clock from batch start (that left Knotel with
             # ~5s after MetSpace overrun while WP still got a full window).
+            # High unique-URL sheets (UNION Box / WP Drive) get a larger slice
+            # of remaining time so more buildings receive High Res before the
+            # batch deadline — still capped so later files keep a floor.
             files_remaining = max(1, total_files - file_index)
             remaining_enrich = max(0.0, _enrich_pool_end - time.monotonic())
-            enrichment_deadline = time.monotonic() + remaining_enrich / files_remaining
+            unique_brochure = len({
+                str(prop.values.get("Brochure PDF") or "").strip()
+                for prop in properties
+                if str(prop.values.get("Brochure PDF") or "").strip()
+            })
+            base_share = remaining_enrich / files_remaining
+            if unique_brochure >= 20 and files_remaining > 1:
+                # Weight toward this file without starving the rest: take up
+                # to ~70% of remaining when unique count is high.
+                weighted = remaining_enrich * min(0.7, 0.35 + unique_brochure / 200.0)
+                enrichment_deadline = time.monotonic() + max(base_share, weighted)
+            elif unique_brochure >= 12:
+                # Solo or last file with many unique PDFs: keep nearly all
+                # remaining (already the default for files_remaining==1).
+                enrichment_deadline = time.monotonic() + max(base_share, min(remaining_enrich, unique_brochure * 1.2))
+            else:
+                enrichment_deadline = time.monotonic() + base_share
             kwargs = {}
             if brochure_fetcher is not None:
                 kwargs["fetcher"] = brochure_fetcher
