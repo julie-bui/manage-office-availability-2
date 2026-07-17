@@ -79,7 +79,19 @@ _SECTION_FIELDS = {
     "sustainability": "Special Features",
     "epc": "Special Features",
     "lease terms": "Min. Term",
-    "availability": "Floor/Unit",
+    "minimum term": "Min. Term",
+    "min term": "Min. Term",
+    "term": "Min. Term",
+    # Availability notes describe state of space, never Floor/Unit identity.
+    "availability": "State of Space",
+    "available": "State of Space",
+    "state of space": "State of Space",
+    "condition": "State of Space",
+    "contacts": "Contacts",
+    "contact": "Contacts",
+    "get in touch": "Contacts",
+    "enquire": "Contacts",
+    "enquiries": "Contacts",
     "service charge": "Special Features",
     "business rates": "Special Features",
     "rates": "Special Features",
@@ -87,10 +99,88 @@ _SECTION_FIELDS = {
     "pricing": "Special Features",
 }
 _HEADING_RE = re.compile(
-    r"^(description|specification|amenities|features|sustainability|epc|lease terms|availability|service charge|business rates|rates|rent|pricing)\s*:?(.*)$",
+    r"^(description|specification|amenities|features|sustainability|epc|"
+    r"lease terms|minimum term|min term|term|availability|available|"
+    r"state of space|condition|contacts|contact|get in touch|enquire|enquiries|"
+    r"service charge|business rates|rates|rent|pricing)\s*:?(.*)$",
     re.I,
 )
 _SIZE_RE = re.compile(r"\b([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)\b", re.I)
+_DESKS_RE = re.compile(
+    r"\b(?:up\s+to\s+)?(\d+)\s*(?:-|–|to)\s*(\d+)\s*desks?\b|\b(?:up\s+to\s+)?(\d+)\s*desks?\b",
+    re.I,
+)
+_MIN_TERM_RE = re.compile(
+    r"(?:min(?:imum)?\.?\s*term|lease\s*term|term(?:\s+certain)?)"
+    r"[:\s]+(?:from\s+)?(\d+\s*(?:months?|years?|yrs?))|"
+    r"\b(\d+)\s*(months?|years?|yrs?)\s*(?:min(?:imum)?(?:\s+term)?|term)\b|"
+    r"\b(?:from\s+)?(\d+\s*(?:months?|years?|yrs?))\s*(?:minimum|min\.?\s*term)\b",
+    re.I,
+)
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_PHONE_RE = re.compile(
+    r"(?:\+44\s?\(?0?\)?[\d\s()-]{8,}|0\d[\d\s()-]{8,}|\+\d[\d\s()-]{8,})",
+)
+_CONTACT_NAME_RE = re.compile(
+    r"(?:contact|enquire|enquir(?:y|ies)|speak\s+to|get\s+in\s+touch(?:\s+with)?)"
+    r"[:\s]+([A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,3})",
+    re.I,
+)
+_FLOOR_TOKEN_RE = re.compile(
+    r"\b(?:(?P<nth>\d+)(?:st|nd|rd|th)|(?P<label>ground|basement|lower\s+ground|mezzanine|lg|g))"
+    r"(?:\s*(?:floor|fl|unit))?\b",
+    re.I,
+)
+_FLOOR_NEAR_SIZE_RE = re.compile(
+    r"(?P<floor>(?:\d+(?:st|nd|rd|th)|ground|basement|lower\s+ground|mezzanine|lg)\s*(?:floor|fl|unit)?)"
+    r".{0,120}?"
+    r"(?P<size>[\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)"
+    r"|"
+    r"(?P<size2>[\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)"
+    r".{0,120}?"
+    r"(?P<floor2>(?:\d+(?:st|nd|rd|th)|ground|basement|lower\s+ground|mezzanine|lg)\s*(?:floor|fl|unit)?)",
+    re.I | re.S,
+)
+_FLOOR_NEAR_DESKS_RE = re.compile(
+    r"(?P<floor>(?:\d+(?:st|nd|rd|th)|ground|basement|lower\s+ground|mezzanine|lg)\s*(?:floor|fl|unit)?)"
+    r".{0,120}?"
+    r"(?:up\s+to\s+)?(?:(?P<d1>\d+)\s*(?:-|–|to)\s*(?P<d2>\d+)|(?P<d3>\d+))\s*desks?"
+    r"|"
+    r"(?:up\s+to\s+)?(?:(?P<d4>\d+)\s*(?:-|–|to)\s*(?P<d5>\d+)|(?P<d6>\d+))\s*desks?"
+    r".{0,120}?"
+    r"(?P<floor2>(?:\d+(?:st|nd|rd|th)|ground|basement|lower\s+ground|mezzanine|lg)\s*(?:floor|fl|unit)?)",
+    re.I | re.S,
+)
+_PRICE_PCM_RE = re.compile(
+    r"(?:£|gbp)\s*([\d,]+(?:\.\d+)?)\s*(?:pcm|per\s*month|/month|p\.?m\.?)\b",
+    re.I,
+)
+_PRICE_PSF_RE = re.compile(
+    r"(?:£|gbp)\s*([\d,]+(?:\.\d+)?)\s*(?:psf|per\s*sq\.?\s*ft|/sq\.?\s*ft)\b",
+    re.I,
+)
+# Building-level brochure fills (safe when identity matched).
+_SAFE_BROCHURE_FIELDS = {
+    "Special Features",
+    "Contacts",
+    "Min. Term",
+    "State of Space",
+    "Property Postcode",
+}
+# Require same floor/unit evidence before applying to a row.
+_UNIT_SPECIFIC_FIELDS = {
+    "Size (sq ft)",
+    "Desks (max)",
+    "Marketing Price (Based on Min Term) PCM",
+    "Marketing Price (Based on Min Term) PSF",
+}
+# Never take address wording from a brochure — primary file owns identity text.
+_ADDRESS_LOCKED_FIELDS = {
+    "Building",
+    "Property Address 1",
+    "Property Address 2",
+    "Floor/Unit",
+}
 
 
 class LinkedResourceError(Exception):
@@ -667,6 +757,12 @@ def _extract_pdf_visuals(
 
 
 def _extract_fields(text: str, source_document: str):
+    """Deterministic building-level fields from brochure HTML/PDF text.
+
+    Size / desks / prices are resolved later in `_merge` against the row's
+    Floor/Unit so multi-unit brochures cannot copy one floor's numbers onto
+    another. Address identity fields are never emitted here.
+    """
     fields = {}
     sections = {}
     current = None
@@ -687,24 +783,269 @@ def _extract_fields(text: str, source_document: str):
         field = _SECTION_FIELDS[heading]
         if field == "Special Features":
             feature_parts.append(value)
-        elif value:
+        elif field == "Min. Term" and value:
+            term = _normalize_min_term(value) or value
+            fields[field] = _evidence(term, source_document, 0.72)
+        elif field == "Contacts" and value:
+            contact = _normalize_contact_text(value)
+            if contact:
+                fields[field] = _evidence(contact, source_document, 0.72)
+        elif field == "State of Space" and value:
+            fields[field] = _evidence(value, source_document, 0.72)
+        elif value and field not in _ADDRESS_LOCKED_FIELDS:
             fields[field] = _evidence(value, source_document, 0.72)
     if feature_parts:
         fields["Special Features"] = _evidence(_dedupe_text("; ".join(feature_parts)), source_document, 0.74)
-    size = _SIZE_RE.search(text)
-    if size:
-        fields["Size (sq ft)"] = _evidence(float(size.group(1).replace(",", "")), source_document, 0.76)
+
+    if "Min. Term" not in fields:
+        term = _find_min_term(text)
+        if term:
+            fields["Min. Term"] = _evidence(term, source_document, 0.78)
+    if "Contacts" not in fields:
+        contact = _find_contacts(text)
+        if contact:
+            fields["Contacts"] = _evidence(contact, source_document, 0.76)
+    if "State of Space" not in fields:
+        state = _find_state_of_space(text)
+        if state:
+            fields["State of Space"] = _evidence(state, source_document, 0.74)
+
     postcodes = sorted(set(filter(None, (extract_postcode(line) for line in text.splitlines()))))
     # One brochure belongs to one Property at this stage.  A single
     # unambiguous postcode is reliable secondary evidence; multiple
     # postcodes are deliberately left unresolved for conflict review.
     if len(postcodes) == 1:
         fields["Property Postcode"] = _evidence(postcodes[0], source_document, 0.84)
+    # Drop anything that must never come from a brochure.
+    for locked in _ADDRESS_LOCKED_FIELDS:
+        fields.pop(locked, None)
     return fields
 
 
 def _evidence(value, source_document, confidence):
     return ExtractedValue(value, "brochure", source_document, "deterministic:brochure", confidence)
+
+
+def _floor_token(value: str) -> str:
+    """Normalize '7th' / '7th Floor' / 'Ground' to a stable comparison token."""
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return ""
+    match = _FLOOR_TOKEN_RE.search(text)
+    if not match:
+        return re.sub(r"[^a-z0-9]+", "", text)
+    if match.group("nth"):
+        return match.group("nth")
+    label = (match.group("label") or "").lower()
+    label = re.sub(r"\s+", " ", label)
+    if label in {"g", "ground"}:
+        return "ground"
+    if label in {"lg", "lower ground"}:
+        return "lower ground"
+    return label
+
+
+def _brochure_floor_tokens(text: str) -> set:
+    return {
+        _floor_token(match.group(0))
+        for match in _FLOOR_TOKEN_RE.finditer(text or "")
+        if _floor_token(match.group(0))
+    }
+
+
+def _normalize_min_term(value: str) -> str:
+    match = _MIN_TERM_RE.search(value or "")
+    if not match:
+        loose = re.search(r"\b(\d+)\s*(months?|years?|yrs?)\b", value or "", re.I)
+        if not loose:
+            return ""
+        return f"{loose.group(1)} {loose.group(2).lower()}"
+    parts = [g for g in match.groups() if g]
+    if len(parts) >= 2 and str(parts[0]).isdigit() and re.match(r"months?|years?|yrs?", str(parts[1]), re.I):
+        unit = str(parts[1]).lower().replace("yrs", "years").replace("yr", "year")
+        return f"{parts[0]} {unit}"
+    if parts:
+        cleaned = " ".join(str(parts[0]).split()).lower()
+        cleaned = cleaned.replace("yrs", "years").replace("yr", "year")
+        if re.match(r"^\d+\s*(months?|years?)$", cleaned):
+            return cleaned
+        if cleaned.isdigit():
+            return cleaned
+        return cleaned
+    return ""
+
+
+def _find_min_term(text: str) -> str:
+    match = _MIN_TERM_RE.search(text or "")
+    if not match:
+        return ""
+    return _normalize_min_term(match.group(0))
+
+
+def _normalize_contact_text(value: str) -> str:
+    text = " ".join(str(value or "").split())
+    if not text or len(text) > 400:
+        return ""
+    emails = _EMAIL_RE.findall(text)
+    phones = [re.sub(r"\s+", " ", p).strip() for p in _PHONE_RE.findall(text)]
+    name_match = _CONTACT_NAME_RE.search(text)
+    name = name_match.group(1).strip() if name_match else ""
+    # Prefer structured contact signals; ignore nav chrome like "Contact us".
+    if not emails and not phones and not name:
+        if re.search(r"@|\+?\d[\d\s()-]{7,}\d", text):
+            return text
+        return ""
+    parts = []
+    if name and name.lower() not in {"us", "me", "team", "here"}:
+        parts.append(name)
+    parts.extend(emails)
+    for phone in phones:
+        if phone not in parts:
+            parts.append(phone)
+    return _dedupe_text("; ".join(parts)) if parts else ""
+
+
+def _find_contacts(text: str) -> str:
+    emails = list(dict.fromkeys(_EMAIL_RE.findall(text or "")))
+    phones = []
+    for phone in _PHONE_RE.findall(text or ""):
+        cleaned = re.sub(r"\s+", " ", phone).strip()
+        if cleaned not in phones:
+            phones.append(cleaned)
+    names = []
+    for match in _CONTACT_NAME_RE.finditer(text or ""):
+        name = match.group(1).strip()
+        if name.lower() in {"us", "me", "team", "here", "more"}:
+            continue
+        if name not in names:
+            names.append(name)
+    if not emails and not phones:
+        return ""
+    # A brochure with many unrelated emails is ambiguous — leave blank.
+    if len(emails) > 3:
+        return ""
+    parts = names[:2] + emails[:2] + phones[:2]
+    return _dedupe_text("; ".join(parts))
+
+
+def _find_state_of_space(text: str) -> str:
+    match = re.search(
+        r"\b(fully\s+fitted|cat\s*[ab]\s*(?:fit\s*out|fitted)?|plug\s*(?:and|&)\s*play|"
+        r"available\s+(?:now|immediately)|immediate\s+availability|vacant\s+possession|"
+        r"coming\s+soon|under\s+offer)\b",
+        text or "",
+        re.I,
+    )
+    if match:
+        return " ".join(match.group(0).split())
+    return ""
+
+
+def _parse_desks_match(match):
+    if not match:
+        return None
+    groups = match.groupdict() if hasattr(match, "groupdict") else {}
+    if groups:
+        if groups.get("d2") or groups.get("d5"):
+            return float(groups.get("d2") or groups.get("d5"))
+        for key in ("d3", "d6", "d1", "d4"):
+            if groups.get(key):
+                return float(groups[key])
+    if match.lastindex:
+        nums = [g for g in match.groups() if g and str(g).isdigit()]
+        if len(nums) >= 2:
+            return float(nums[1])
+        if nums:
+            return float(nums[0])
+    return None
+
+
+def _extract_unit_fields(text: str, floor_unit: str, source_document: str) -> dict:
+    """Size / desks / prices only when clearly tied to this row's floor/unit."""
+    fields = {}
+    text = text or ""
+    floor_token = _floor_token(floor_unit)
+    brochure_floors = _brochure_floor_tokens(text)
+    multi_floor = len(brochure_floors) > 1
+
+    # --- Size ---
+    size_by_floor = {}
+    for match in _FLOOR_NEAR_SIZE_RE.finditer(text):
+        floor_raw = match.group("floor") or match.group("floor2") or ""
+        size_raw = match.group("size") or match.group("size2") or ""
+        token = _floor_token(floor_raw)
+        if token and size_raw:
+            size_by_floor[token] = float(size_raw.replace(",", ""))
+    all_sizes = [float(m.group(1).replace(",", "")) for m in _SIZE_RE.finditer(text)]
+    size_value = None
+    size_confidence = 0.0
+    if floor_token and floor_token in size_by_floor:
+        size_value = size_by_floor[floor_token]
+        size_confidence = 0.82
+    elif not multi_floor and len(set(all_sizes)) == 1:
+        # Single unambiguous size — safe when brochure isn't multi-floor, or
+        # the row's floor (if any) agrees with the sole brochure floor.
+        if not floor_token or not brochure_floors or floor_token in brochure_floors:
+            size_value = all_sizes[0]
+            size_confidence = 0.76 if not brochure_floors else 0.8
+    if size_value is not None:
+        fields["Size (sq ft)"] = _evidence(size_value, source_document, size_confidence)
+
+    # --- Desks ---
+    desks_by_floor = {}
+    for match in _FLOOR_NEAR_DESKS_RE.finditer(text):
+        floor_raw = match.group("floor") or match.group("floor2") or ""
+        token = _floor_token(floor_raw)
+        desks = _parse_desks_match(match)
+        if token and desks is not None:
+            desks_by_floor[token] = desks
+    all_desk_matches = list(_DESKS_RE.finditer(text))
+    all_desks = [d for d in (_parse_desks_match(m) for m in all_desk_matches) if d is not None]
+    desks_value = None
+    desks_confidence = 0.0
+    if floor_token and floor_token in desks_by_floor:
+        desks_value = desks_by_floor[floor_token]
+        desks_confidence = 0.8
+    elif not multi_floor and len(set(all_desks)) == 1:
+        if not floor_token or not brochure_floors or floor_token in brochure_floors:
+            desks_value = all_desks[0]
+            desks_confidence = 0.74 if not brochure_floors else 0.78
+    if desks_value is not None:
+        fields["Desks (max)"] = _evidence(desks_value, source_document, desks_confidence)
+
+    # --- Prices: only with floor agreement; never cross floors blindly ---
+    pcm_matches = list(_PRICE_PCM_RE.finditer(text))
+    psf_matches = list(_PRICE_PSF_RE.finditer(text))
+    if floor_token and multi_floor:
+        for match in pcm_matches:
+            window = text[max(0, match.start() - 100) : match.end() + 100]
+            window_floors = _brochure_floor_tokens(window)
+            if floor_token in window_floors and len(window_floors) == 1:
+                fields["Marketing Price (Based on Min Term) PCM"] = _evidence(
+                    float(match.group(1).replace(",", "")), source_document, 0.75
+                )
+                break
+        for match in psf_matches:
+            window = text[max(0, match.start() - 100) : match.end() + 100]
+            window_floors = _brochure_floor_tokens(window)
+            if floor_token in window_floors and len(window_floors) == 1:
+                fields["Marketing Price (Based on Min Term) PSF"] = _evidence(
+                    float(match.group(1).replace(",", "")), source_document, 0.75
+                )
+                break
+    elif not multi_floor and (
+        not brochure_floors or not floor_token or floor_token in brochure_floors
+    ):
+        if len(pcm_matches) == 1:
+            fields["Marketing Price (Based on Min Term) PCM"] = _evidence(
+                float(pcm_matches[0].group(1).replace(",", "")), source_document, 0.72
+            )
+        if len(psf_matches) == 1:
+            fields["Marketing Price (Based on Min Term) PSF"] = _evidence(
+                float(psf_matches[0].group(1).replace(",", "")), source_document, 0.72
+            )
+
+    return fields
 
 
 def _source_photo_count(prop: Property) -> int:
@@ -1387,6 +1728,14 @@ def _retrieve(
             nested_extraction.diagnostics.extend(_resolution_diagnostics(nested, _resource_type(nested.payload, nested.content_type)))
             for field, value in nested_extraction.fields.items():
                 combined.fields.setdefault(field, value)
+            # Reuse nested PDF/HTML text already extracted in this pass for
+            # unit-scoped field matching — no extra fetch.
+            if nested_extraction.identity_text:
+                combined.identity_text = (
+                    f"{combined.identity_text}\n{nested_extraction.identity_text}"
+                    if combined.identity_text
+                    else nested_extraction.identity_text
+                )
             combined.assets.extend(nested_extraction.assets)
             combined.warnings.extend(nested_extraction.warnings)
             combined.diagnostics.extend(nested_extraction.diagnostics)
@@ -1504,7 +1853,20 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
             # Primary xlsx_links often pre-fills Box/Drive viewer URLs at
             # confidence 1.0 — still replace them with a real plan asset URL.
             _set_value(prop, "Floor Plan", plan_evidence)
+    # Building-level text fills (contacts, features, term, postcode, …).
     for field, evidence in extraction.fields.items():
+        if field in _UNIT_SPECIFIC_FIELDS or field in _ADDRESS_LOCKED_FIELDS:
+            continue
+        if field not in _SAFE_BROCHURE_FIELDS:
+            continue
+        _apply(prop, field, evidence)
+    # Size / desks / prices: only when the same floor/unit is clearly labeled.
+    unit_fields = _extract_unit_fields(
+        extraction.identity_text,
+        str(prop.values.get("Floor/Unit") or ""),
+        extraction.source_document,
+    )
+    for field, evidence in unit_fields.items():
         _apply(prop, field, evidence)
 
 
@@ -1513,6 +1875,21 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
     existing = prop.values.get(field)
     existing_provenance = prop.provenance.get(field)
     existing_confidence = existing_provenance.confidence if existing_provenance else (1.0 if existing not in (None, "") else 0.0)
+    # Primary file owns address / floor identity wording. Brochure may only
+    # fill Property Postcode when blank (handled as a normal empty-cell fill).
+    if field in _ADDRESS_LOCKED_FIELDS:
+        if existing not in (None, "") and not _equivalent(existing, incoming):
+            prop.add_issue(
+                ValidationIssue(
+                    field,
+                    "Brochure address/floor text was ignored; primary source retained.",
+                    Severity.WARNING,
+                    f"Primary: {existing} | Brochure: {incoming} | Source: {evidence.source_document}",
+                    "Primary Building / Property Address 1 / Floor/Unit are never replaced from a brochure.",
+                    "brochure_conflict_resolution",
+                )
+            )
+        return
     if existing in (None, ""):
         if evidence.confidence >= BROCHURE_RELIABLE_CONFIDENCE:
             _set_value(prop, field, evidence)

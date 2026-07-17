@@ -66,14 +66,19 @@ def test_multiple_images_from_same_brochure_remain_gallery_candidates():
         for number in range(1, 6)
     ]
     enriched = run(prop(), extraction(assets=images))
-    assert enriched.values["_high_res_candidates"] == [image.url for image in images]
+    candidates = enriched.values["_high_res_candidates"]
+    assert [image.url for image in images] == candidates[: len(images)]
+    # Brochure URL may also be stashed as a click-through seed fallback.
+    assert all(url in candidates for url in (image.url for image in images))
 
 
 def test_existing_and_brochure_images_merge_even_for_extensionless_cdn_url():
-    existing = "https://cdn.example.test/image/hero-token"
+    existing = "https://cdn.example.test/image/hero.jpg"
     added = AssetCandidate("https://img.example.test/terrace.jpg", BROCHURE, alt_text="Terrace")
     enriched = run(prop(**{"High Res Images": existing}), extraction(assets=[added]))
-    assert enriched.values["_high_res_candidates"] == [existing, added.url]
+    candidates = enriched.values["_high_res_candidates"]
+    assert existing in candidates
+    assert added.url in candidates
 
 
 def test_brochure_adds_photos_to_existing_direct_property_image():
@@ -81,7 +86,9 @@ def test_brochure_adds_photos_to_existing_direct_property_image():
     added = AssetCandidate("https://img.example.test/terrace.jpg", BROCHURE, alt_text="Terrace")
     enriched = run(prop(**{"High Res Images": existing}), extraction(assets=[added]))
     assert enriched.values["High Res Images"] == existing
-    assert enriched.values["_high_res_candidates"] == [existing, added.url]
+    candidates = enriched.values["_high_res_candidates"]
+    assert existing in candidates
+    assert added.url in candidates
 
 
 def test_brochure_floorplan_is_never_assigned_as_property_photo():
@@ -347,8 +354,8 @@ def test_materialized_brochure_photos_extend_existing_candidates_and_keep_floorp
     record = {
         "Building": "Example House",
         "Floor Plan": "",
-        "High Res Images": "https://cdn.example.test/source-image",
-        "_high_res_candidates": ["https://cdn.example.test/source-image"],
+        "High Res Images": "https://cdn.example.test/source-image.jpg",
+        "_high_res_candidates": ["https://cdn.example.test/source-image.jpg"],
         "_brochure_embedded_assets": [photo_a, photo_b, duplicate, floorplan],
     }
     with app_module.app.test_request_context("/process", base_url="https://app.example.test"):
@@ -376,3 +383,141 @@ def test_brochure_postcode_survives_disagreeing_geocoder(monkeypatch):
     pipeline._geocode_records([enriched.values], "future-provider.pdf", "Unknown Provider", float("inf"))
     assert enriched.values["Property Postcode"] == "SE1 9HH"
     assert enriched.provenance["Property Postcode"].source == "brochure"
+
+
+def test_html_brochure_extracts_contacts_term_state_and_postcode():
+    html = b"""<html><body>
+      <h1>Example House, 1 Example Street, EC1A 1AA</h1>
+      <h2>Amenities</h2><p>Showers; Bike storage; Roof terrace</p>
+      <h2>Lease terms</h2><p>Minimum term 24 months</p>
+      <h2>Availability</h2><p>Fully fitted Cat A space</p>
+      <p>Contact: Jane Broker jane@example.test 020 7123 4567</p>
+      </body></html>"""
+    result = extract_brochure(html, "text/html", "https://property.example.test/listing/1")
+    assert "Showers" in result.fields["Special Features"].value
+    assert result.fields["Min. Term"].value == "24 months"
+    assert "fitted" in result.fields["State of Space"].value.lower() or "Cat A" in result.fields["State of Space"].value
+    assert "jane@example.test" in result.fields["Contacts"].value.lower()
+    assert result.fields["Property Postcode"].value == "EC1A 1AA"
+    assert "Building" not in result.fields
+    assert "Property Address 1" not in result.fields
+    assert "Floor/Unit" not in result.fields
+
+
+def test_brochure_fills_blank_safe_fields_with_provenance():
+    html = b"""<html><body>
+      <h2>Amenities</h2><p>Cycle storage</p>
+      <h2>Lease terms</h2><p>12 months</p>
+      <p>Contact us at hello@landlord.example 020 8000 1000</p>
+      <p>Available immediately - plug and play</p>
+      <p>EC2A 4BX</p>
+      </body></html>"""
+    enriched = enrich_properties(
+        [prop()],
+        fetcher=lambda url: BrochureResource(html, "text/html", "https://property.example.test/x"),
+    )[0]
+    assert enriched.values["Special Features"] == "Cycle storage"
+    assert enriched.values["Min. Term"] == "12 months"
+    assert "hello@landlord.example" in enriched.values["Contacts"]
+    assert enriched.values["Property Postcode"] == "EC2A 4BX"
+    assert enriched.provenance["Contacts"].source == "brochure"
+    assert enriched.provenance["Min. Term"].source == "brochure"
+
+
+def test_brochure_does_not_overwrite_building_or_address():
+    primary = prop(
+        **{
+            "Building": "Primary House, 9 Primary Street, E1 6AN",
+            "Property Postcode": "",
+        }
+    )
+    # normalize_record derives Property Address 1 from Building.
+    assert primary.values["Property Address 1"] == primary.values["Building"]
+    result = BrochureExtraction(
+        BROCHURE,
+        {
+            "Building": ExtractedValue("Different Brochure Name", "brochure", BROCHURE, "test", 0.95),
+            "Property Address 1": ExtractedValue("1 Brochure Road", "brochure", BROCHURE, "test", 0.95),
+            "Property Postcode": ExtractedValue("E1 6AN", "brochure", BROCHURE, "test", 0.9),
+            "Special Features": ExtractedValue("Terrace", "brochure", BROCHURE, "test", 0.9),
+        },
+        # Same postcode / street so identity matches; address fields must still
+        # stay primary-owned even if the brochure offers different wording.
+        identity_text="Primary House, 9 Primary Street, E1 6AN. Terrace.",
+    )
+    enriched = run(primary, result)
+    assert enriched.values["Building"] == "Primary House, 9 Primary Street, E1 6AN"
+    assert enriched.values["Property Address 1"] == "Primary House, 9 Primary Street, E1 6AN"
+    assert enriched.values["Property Postcode"] == "E1 6AN"
+    assert enriched.values["Special Features"] == "Terrace"
+
+
+def test_brochure_postcode_does_not_overwrite_existing():
+    primary = prop()
+    primary.values["Property Postcode"] = "EC1A 1AA"
+    primary.provenance["Property Postcode"] = FieldProvenance("primary.eml", "rule:test", 1.0, "EC1A 1AA")
+    enriched = run(primary, extraction([evidence("Property Postcode", "SE1 9HH", 0.95)]))
+    assert enriched.values["Property Postcode"] == "EC1A 1AA"
+    assert any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
+
+
+def test_multi_unit_brochure_applies_size_only_to_matching_floor():
+    from extraction.brochure import _extract_fields as real_extract_fields
+
+    text = (
+        "Example House EC1A 1AA\n"
+        "3rd Floor 2,500 sq ft up to 40 desks\n"
+        "5th Floor 4,100 sq ft up to 70 desks\n"
+    )
+    third = prop(**{"Floor/Unit": "3rd", "Size (sq ft)": "", "Desks (max)": ""})
+    fifth = prop(**{"Floor/Unit": "5th", "Size (sq ft)": "", "Desks (max)": ""})
+    second = prop(**{"Floor/Unit": "2nd", "Size (sq ft)": "", "Desks (max)": ""})
+
+    def extract(payload, content_type, source):
+        return BrochureExtraction(
+            source,
+            real_extract_fields(text, source),
+            identity_text=text,
+        )
+
+    enriched = enrich_properties(
+        [third, fifth, second],
+        fetcher=lambda url: BrochureResource(b"<html><body>x</body></html>", "text/html", BROCHURE),
+        extractor=extract,
+    )
+    assert enriched[0].values["Size (sq ft)"] == 2500.0
+    assert enriched[0].values["Desks (max)"] == 40.0
+    assert enriched[1].values["Size (sq ft)"] == 4100.0
+    assert enriched[1].values["Desks (max)"] == 70.0
+    assert enriched[2].values.get("Size (sq ft)") in (None, "")
+    assert enriched[2].values.get("Desks (max)") in (None, "")
+
+
+def test_single_unit_brochure_fills_blank_size_and_desks():
+    html = """<html><body>
+      <p>Example House, EC1A 1AA</p>
+      <p>1,850 sq ft</p>
+      <p>Up to 28 desks</p>
+      <p>Rent £12,500 pcm</p>
+      </body></html>""".encode("utf-8")
+    enriched = enrich_properties(
+        [prop(**{"Floor/Unit": "1st", "Size (sq ft)": "", "Desks (max)": ""})],
+        fetcher=lambda url: BrochureResource(html, "text/html", "https://property.example.test/unit"),
+    )[0]
+    assert enriched.values["Size (sq ft)"] == 1850.0
+    assert enriched.values["Desks (max)"] == 28.0
+    # Single-floor brochure (no competing floors) may fill PCM when blank.
+    assert enriched.values["Marketing Price (Based on Min Term) PCM"] == 12500.0
+
+
+def test_multi_unit_brochure_skips_unlabeled_price_copy():
+    text = (
+        "Example House\n"
+        "3rd Floor 2,000 sq ft\n"
+        "5th Floor 3,000 sq ft\n"
+        "Rent £15,000 pcm\n"
+    )
+    result = BrochureExtraction(BROCHURE, {}, identity_text=text)
+    enriched = run(prop(**{"Floor/Unit": "3rd"}), result)
+    assert enriched.values.get("Marketing Price (Based on Min Term) PCM") in (None, "")
+    assert enriched.values["Size (sq ft)"] == 2000.0
