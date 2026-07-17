@@ -6,7 +6,7 @@ and the PCM/PSF relationship used across all three example sources.
 import re
 
 from .address import extract_postcode
-from .text_utils import clean_special_features
+from .text_utils import clean_special_features, clean_state_of_space
 
 # Fields a rule parser or the LLM fallback actually extracts from a source
 # document — must match the example output.
@@ -86,6 +86,7 @@ def normalize_record(record):
 
     # Clean amenity dumps / PDF junk, then sentence-cap any remaining prose.
     out["Special Features"] = clean_special_features(out["Special Features"])
+    out["State of Space"] = clean_state_of_space(out["State of Space"])
 
     out["Size (sq ft)"] = _to_number(out["Size (sq ft)"])
     out["Desks (max)"] = _to_number(out["Desks (max)"])

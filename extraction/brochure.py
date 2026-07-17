@@ -38,7 +38,10 @@ from .models import (
 )
 from .text_utils import (
     clean_special_features,
+    clean_state_of_space,
+    extract_state_of_space_status,
     is_useful_primary_special_features,
+    is_useful_primary_state_of_space,
     looks_like_long_or_messy_features,
     looks_like_ocr_layout_noise,
 )
@@ -969,7 +972,11 @@ def _extract_fields(text: str, source_document: str):
             if contact:
                 fields[field] = _evidence(contact, source_document, 0.72)
         elif field == "State of Space" and value:
-            fields[field] = _evidence(value, source_document, 0.72)
+            if looks_like_ocr_layout_noise(value):
+                continue
+            cleaned = clean_state_of_space(value, force_amenity_list=True)
+            if cleaned:
+                fields[field] = _evidence(cleaned, source_document, 0.72)
         elif value and field not in _ADDRESS_LOCKED_FIELDS:
             fields[field] = _evidence(value, source_document, 0.72)
     features = _brochure_special_features(preferred_features, fallback_features)
@@ -987,7 +994,9 @@ def _extract_fields(text: str, source_document: str):
     if "State of Space" not in fields:
         state = _find_state_of_space(text)
         if state:
-            fields["State of Space"] = _evidence(state, source_document, 0.74)
+            cleaned = clean_state_of_space(state)
+            if cleaned:
+                fields["State of Space"] = _evidence(cleaned, source_document, 0.74)
 
     postcodes = sorted(set(filter(None, (extract_postcode(line) for line in text.splitlines()))))
     # One brochure belongs to one Property at this stage.  A single
@@ -1143,16 +1152,8 @@ def _find_contacts(text: str) -> str:
 
 
 def _find_state_of_space(text: str) -> str:
-    match = re.search(
-        r"\b(fully\s+fitted|cat\s*[ab]\s*(?:fit\s*out|fitted)?|plug\s*(?:and|&)\s*play|"
-        r"available\s+(?:now|immediately)|immediate\s+availability|vacant\s+possession|"
-        r"coming\s+soon|under\s+offer)\b",
-        text or "",
-        re.I,
-    )
-    if match:
-        return " ".join(match.group(0).split())
-    return ""
+    """Prefer compact Kitt-style fit-out / availability status phrases."""
+    return extract_state_of_space_status(text or "")
 
 
 def _parse_desks_match(match):
@@ -2324,12 +2325,16 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
                 )
             )
         return
-    # Prefer short/useful primary sheet Special Features (UNION Current Spec,
-    # price-drop notes, etc.) — never append or replace with brochure OCR/essays.
+    # Prefer short/useful primary sheet Special Features / State of Space
+    # (UNION Current Spec, price-drop notes, "Immediate", etc.) — never append
+    # or replace with brochure OCR/essays.
     if (
-        field == "Special Features"
+        field in ("Special Features", "State of Space")
         and existing not in (None, "")
-        and is_useful_primary_special_features(existing)
+        and (
+            (field == "Special Features" and is_useful_primary_special_features(existing))
+            or (field == "State of Space" and is_useful_primary_state_of_space(existing))
+        )
     ):
         if _equivalent(existing, incoming):
             return
@@ -2347,9 +2352,10 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
             )
         return
     if existing in (None, ""):
-        if field == "Special Features" and looks_like_long_or_messy_features(incoming):
+        if field in ("Special Features", "State of Space") and looks_like_long_or_messy_features(incoming):
             # Still allow a cleaned amenity list through _set_value; skip raw OCR noise.
-            cleaned = clean_special_features(incoming, force_amenity_list=True) if isinstance(incoming, str) else ""
+            cleaner = clean_special_features if field == "Special Features" else clean_state_of_space
+            cleaned = cleaner(incoming, force_amenity_list=True) if isinstance(incoming, str) else ""
             if not cleaned:
                 return
             evidence = ExtractedValue(
@@ -2365,7 +2371,7 @@ def _apply(prop: Property, field: str, evidence: ExtractedValue) -> None:
     if _equivalent(existing, incoming):
         return
     if existing_confidence < PRIMARY_STRONG_CONFIDENCE and evidence.confidence > existing_confidence:
-        if field == "Special Features" and looks_like_long_or_messy_features(incoming):
+        if field in ("Special Features", "State of Space") and looks_like_long_or_messy_features(incoming):
             return
         _set_value(prop, field, evidence)
         return
@@ -2385,6 +2391,10 @@ def _set_value(prop: Property, field: str, evidence: ExtractedValue) -> None:
     value = _dedupe_text(evidence.value) if isinstance(evidence.value, str) and ";" in evidence.value else evidence.value
     if field == "Special Features" and isinstance(value, str):
         value = clean_special_features(value, force_amenity_list=True)
+        if not value:
+            return
+    if field == "State of Space" and isinstance(value, str):
+        value = clean_state_of_space(value, force_amenity_list=True)
         if not value:
             return
     prop.values[field] = value

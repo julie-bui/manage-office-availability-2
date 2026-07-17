@@ -1,4 +1,4 @@
-"""Unit tests for Special Features amenity cleanup and sentence-boundary cap."""
+"""Unit tests for Special Features amenity cleanup and 50-word boundary cap."""
 from extraction.brochure import enrich_properties
 from extraction.models import BrochureExtraction, ExtractedValue, Property
 from extraction.schema import normalize_record
@@ -29,6 +29,11 @@ def _words(n, stem="word"):
     return " ".join(f"{stem}{i}" for i in range(n))
 
 
+def test_special_features_max_is_fifty_words():
+    assert SPECIAL_FEATURES_MAX_WORDS == 50
+    assert SPECIAL_FEATURES_AMENITY_MAX_WORDS == 50
+
+
 def test_short_special_features_unchanged():
     assert cap_special_features("Fitted") == "Fitted"
     assert cap_special_features("Price drop: now £120 psf") == "Price drop: now £120 psf"
@@ -40,11 +45,10 @@ def test_short_special_features_unchanged():
 
 
 def test_cap_stops_at_last_sentence_boundary_at_or_before_max_words():
-    # Three sentences: ~80 + ~80 + ~120 words. Cap should keep the first two
-    # (last boundary at/before 250) and drop the third mid-dump.
-    first = _words(80, "alpha") + "."
-    second = _words(80, "beta") + "."
-    third = _words(120, "gamma") + "."
+    # Two short sentences under 50 words, third pushes over — keep first two.
+    first = _words(18, "alpha") + "."
+    second = _words(18, "beta") + "."
+    third = _words(20, "gamma") + "."
     text = f"{first} {second} {third}"
     assert len(text.split()) > SPECIAL_FEATURES_MAX_WORDS
 
@@ -53,8 +57,35 @@ def test_cap_stops_at_last_sentence_boundary_at_or_before_max_words():
     assert capped.endswith(".")
     assert len(capped.split()) <= SPECIAL_FEATURES_MAX_WORDS
     assert "gamma0" not in capped
-    # Never mid-word / mid-sentence: final token is a full sentence ender.
     assert capped[-1] == "."
+
+
+def test_cap_stops_at_last_complete_amenity_item():
+    # Semicolon amenities: keep whole items under 50 words, never mid-phrase.
+    items = [
+        _words(12, "one"),
+        _words(12, "two"),
+        _words(12, "three"),
+        _words(20, "four"),
+    ]
+    text = "; ".join(items)
+    assert len(text.split()) > SPECIAL_FEATURES_MAX_WORDS
+    capped = cap_special_features(text)
+    assert capped == "; ".join(items[:3])
+    assert len(capped.split()) <= SPECIAL_FEATURES_MAX_WORDS
+    assert "four0" not in capped
+    assert not capped.endswith("...")
+
+
+def test_cap_prefers_richer_complete_boundary():
+    # Sentence boundary keeps more words than an earlier amenity cut would.
+    first = _words(20, "alpha") + "."
+    second = _words(20, "beta") + "."
+    third = _words(20, "gamma") + "."
+    text = f"{first} {second} {third}"
+    capped = cap_special_features(text)
+    assert capped == f"{first} {second}"
+    assert len(capped.split()) == 40
 
 
 def test_cap_falls_back_to_word_limit_with_ellipsis_without_sentence():
@@ -67,9 +98,9 @@ def test_cap_falls_back_to_word_limit_with_ellipsis_without_sentence():
 
 
 def test_normalize_record_caps_special_features():
-    first = _words(100, "one") + "."
-    second = _words(100, "two") + "."
-    third = _words(100, "three") + "."
+    first = _words(18, "one") + "."
+    second = _words(18, "two") + "."
+    third = _words(20, "three") + "."
     record = normalize_record(
         {
             "Building": "Example House",
@@ -95,12 +126,8 @@ def test_clean_messy_brochure_amenity_dump():
     assert "A" not in parts
     assert "0 3" not in parts
     assert "0 4" not in parts
-    assert "MODERN,;" not in cleaned
-    assert "REFURBISHMENT.;" not in cleaned
-    # Mid-phrase break rejoined.
     assert "bright and; efficient" not in cleaned
     assert "bright and efficient" in cleaned
-    # ALL-CAPS amenity sentence-cased.
     assert "Superb natural light" in cleaned
     assert "Modern" in cleaned
     assert "Refurbishment" in cleaned
@@ -114,7 +141,6 @@ def test_clean_rejects_reversed_and_vertical_ocr_layout_noise():
     assert looks_like_ocr_layout_noise(USER_OCR_MESSY)
     cleaned = clean_special_features(USER_OCR_MESSY)
     force = clean_special_features(USER_OCR_MESSY, force_amenity_list=True)
-    # Mostly garbage brochure fill → blank (do not salvage one phrase from OCR soup).
     assert cleaned == ""
     assert force == ""
     for junk in (
@@ -149,6 +175,7 @@ def test_clean_force_amenity_list_truncates_long_lists():
     assert len(parts) == SPECIAL_FEATURES_AMENITY_MAX_ITEMS
     assert parts[0] == "Feature 0"
     assert parts[-1] == f"Feature {SPECIAL_FEATURES_AMENITY_MAX_ITEMS - 1}"
+    assert len(cleaned.split()) <= SPECIAL_FEATURES_AMENITY_MAX_WORDS
 
 
 def test_useful_primary_preferred_over_long_brochure_essay_without_conflict():

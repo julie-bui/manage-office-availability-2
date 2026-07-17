@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .text_utils import clean_special_features
+from .text_utils import clean_special_features, clean_state_of_space
 
 
 class Severity(str, Enum):
@@ -184,10 +184,12 @@ class Property:
 
     def to_record(self) -> Dict[str, Any]:
         record = dict(self.values)
-        # Brochure enrichment can fill Special Features after normalize_record;
-        # clean + cap again at export so every spreadsheet row benefits.
+        # Brochure enrichment can fill Special Features / State of Space after
+        # normalize_record; clean + cap again at export so every row benefits.
         if "Special Features" in record:
             record["Special Features"] = clean_special_features(record.get("Special Features"))
+        if "State of Space" in record:
+            record["State of Space"] = clean_state_of_space(record.get("State of Space"))
         record["_source_file"] = self.source_file_name
         record["_source_file_name"] = self.source_file_name
         record["_source_file_url"] = self.source_file_url

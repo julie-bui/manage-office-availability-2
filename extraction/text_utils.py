@@ -1,18 +1,34 @@
 import re
 
-# Soft target for long brochure amenity/description dumps in Special Features.
-# Keep short notes (price drops, "Fitted", etc.) untouched; only cap when the
-# text exceeds this word count, always ending on a complete sentence when one
-# exists at or before the limit.
-SPECIAL_FEATURES_MAX_WORDS = 250
-
-# Amenity-list target when cleaning brochure / semicolon dumps.
+# Special Features soft cap (Kitt-aligned): ~50 words, ending on a complete
+# sentence or complete `;`-separated amenity phrase — never mid-word/phrase.
+SPECIAL_FEATURES_MAX_WORDS = 50
+SPECIAL_FEATURES_AMENITY_MAX_WORDS = 50
+# Amenity-list item count when cleaning brochure / semicolon dumps.
 SPECIAL_FEATURES_AMENITY_MAX_ITEMS = 12
-SPECIAL_FEATURES_AMENITY_MAX_WORDS = 80
 # Primary sheet notes at or under this word count are preferred over brochure essays.
 SPECIAL_FEATURES_SHORT_MAX_WORDS = 40
 
+# State of Space: mirror clean/cap treatment; soft prose backstop stays ~250
+# while messy OCR prefers compact fit-out status tags (Kitt template style).
+STATE_OF_SPACE_MAX_WORDS = 250
+STATE_OF_SPACE_SHORT_MAX_WORDS = 40
+PROSE_FIELD_MAX_WORDS = SPECIAL_FEATURES_MAX_WORDS
+
 _SENTENCE_END_RE = re.compile(r"[.!?]+(?=\s+|$)")
+# Compact fit-out / availability status phrases (Kitt State of Space style).
+_STATE_OF_SPACE_STATUS_RE = re.compile(
+    r"(?i)\b("
+    r"fully\s+fitted|partially\s+fitted|"
+    r"fit[\s\-]*outs?\s+underway|fitouts?\s+underway|"
+    r"cat\s*[ab]\s*[-–—]?\s*(?:custom\s+)?fit\s*outs?(?:\s+opportunity)?|"
+    r"cat\s*[ab]\s*(?:fit\s*out|fitted)|"
+    r"custom\s+fit\s*out\s+opportunity|"
+    r"plug\s*(?:and|&)\s*play|"
+    r"available\s+(?:now|immediately)|immediate(?:\s+availability)?|"
+    r"vacant\s+possession|coming\s+soon|under\s+offer"
+    r")\b"
+)
 
 # Semicolon after a conjunction/preposition → mid-phrase PDF break.
 _CONJ_SEMI_RE = re.compile(
@@ -151,13 +167,13 @@ def titlecase_area(s):
     return " ".join(words)
 
 
-def cap_special_features(text, max_words=SPECIAL_FEATURES_MAX_WORDS):
-    """Cap Special Features to about *max_words*, ending on a complete sentence.
+def cap_prose_field(text, max_words=PROSE_FIELD_MAX_WORDS):
+    """Cap long prose to about *max_words* on a complete boundary.
 
-    Short values pass through unchanged. For long brochure amenity/description
-    dumps, prefer the last sentence boundary at or before *max_words*. If no
-    sentence ends under the limit, fall back to a soft word cap with an
-    ellipsis (never mid-word).
+    Short values pass through unchanged. Prefer the last complete sentence
+    *or* the last complete ``;``-separated amenity item at or before
+    *max_words* (whichever keeps more content). If neither boundary fits,
+    fall back to a soft word cap with an ellipsis (never mid-word).
     """
     if text is None:
         return ""
@@ -168,6 +184,8 @@ def cap_special_features(text, max_words=SPECIAL_FEATURES_MAX_WORDS):
     if len(words) <= max_words:
         return text
 
+    candidates = []
+
     best_end = None
     for match in _SENTENCE_END_RE.finditer(text):
         end = match.end()
@@ -175,23 +193,70 @@ def cap_special_features(text, max_words=SPECIAL_FEATURES_MAX_WORDS):
             best_end = end
         else:
             break
-
     if best_end is not None:
-        return text[:best_end].rstrip()
+        candidates.append(text[:best_end].rstrip())
 
-    # No sentence boundary under the limit — soft word cut, never mid-word.
+    amenity_prefix = _cap_at_amenity_item_boundary(text, max_words)
+    if amenity_prefix:
+        candidates.append(amenity_prefix)
+
+    if candidates:
+        # Keep the richest complete prefix under the limit.
+        return max(candidates, key=lambda s: (len(s.split()), len(s)))
+
+    # No complete boundary under the limit — soft word cut, never mid-word.
     capped = " ".join(words[:max_words]).rstrip(".,;:!? ")
     return f"{capped}..."
 
 
-def is_useful_primary_special_features(text):
+def _cap_at_amenity_item_boundary(text, max_words):
+    """Return the longest ``; ``-joined prefix of complete amenity items ≤ max_words."""
+    if ";" not in text:
+        return None
+    parts = [p.strip() for p in text.split(";") if p.strip()]
+    if len(parts) < 2:
+        return None
+    kept = []
+    for part in parts:
+        trial = "; ".join(kept + [part])
+        if len(trial.split()) <= max_words:
+            kept.append(part)
+        else:
+            break
+    if not kept or len(kept) >= len(parts):
+        # Nothing dropped at an item boundary (first item alone may exceed).
+        return None
+    return "; ".join(kept)
+
+
+def cap_special_features(text, max_words=SPECIAL_FEATURES_MAX_WORDS):
+    """Cap Special Features; see ``cap_prose_field``."""
+    return cap_prose_field(text, max_words=max_words)
+
+
+def cap_state_of_space(text, max_words=STATE_OF_SPACE_MAX_WORDS):
+    """Cap State of Space; see ``cap_prose_field``."""
+    return cap_prose_field(text, max_words=max_words)
+
+
+def is_useful_primary_prose_field(text, *, max_words=SPECIAL_FEATURES_SHORT_MAX_WORDS):
     """True when a short primary/source-sheet value should win over brochure essays."""
     text = "" if text is None else str(text).strip()
     if not text:
         return False
     if looks_like_ocr_layout_noise(text):
         return False
-    return len(text.split()) <= SPECIAL_FEATURES_SHORT_MAX_WORDS
+    return len(text.split()) <= max_words
+
+
+def is_useful_primary_special_features(text):
+    """True when a short primary Special Features value should win over brochure essays."""
+    return is_useful_primary_prose_field(text, max_words=SPECIAL_FEATURES_SHORT_MAX_WORDS)
+
+
+def is_useful_primary_state_of_space(text):
+    """True when a short primary State of Space value should win over brochure essays."""
+    return is_useful_primary_prose_field(text, max_words=STATE_OF_SPACE_SHORT_MAX_WORDS)
 
 
 def looks_like_long_or_messy_features(text):
@@ -250,15 +315,16 @@ def looks_like_ocr_layout_noise(text):
     return False
 
 
-def clean_special_features(text, *, force_amenity_list=False):
-    """Clean Special Features into a short `; `-joined amenity list when messy.
+def clean_prose_or_amenity_field(text, *, force_amenity_list=False, max_words=SPECIAL_FEATURES_MAX_WORDS):
+    """Clean a prose/amenity field into a short `; `-joined list when messy.
 
-    Short useful notes (price drops, desk extras, "Fitted") pass through.
-    Semicolon amenity dumps and forced brochure fills are artifact-cleaned,
-    truncated to ~8–12 items / ~40–80 words, then sentence-capped as a backstop.
-    Brochure OCR layout noise (reversed words, exploded vertical labels,
-    glued sheet headers) is dropped; fills that are mostly garbage go blank.
-    Sentence prose without amenity separators is left for ``cap_special_features``.
+    Short useful notes (price drops, desk extras, "Fitted", "Immediate") pass
+    through. Semicolon amenity dumps and forced brochure fills are
+    artifact-cleaned, truncated to ~12 items / ~50 words, then boundary-capped
+    as a backstop. Brochure OCR layout noise (reversed words, exploded
+    vertical labels, glued sheet headers) is dropped; fills that are mostly
+    garbage go blank. Sentence prose without amenity separators is left for
+    ``cap_prose_field``.
     """
     if text is None:
         return ""
@@ -268,9 +334,90 @@ def clean_special_features(text, *, force_amenity_list=False):
 
     if force_amenity_list or _looks_like_amenity_dump(text) or looks_like_ocr_layout_noise(text):
         cleaned = _amenity_list_from_text(text)
-        return cap_special_features(cleaned)
+        return cap_prose_field(cleaned, max_words=max_words)
 
-    return cap_special_features(text)
+    return cap_prose_field(text, max_words=max_words)
+
+
+def clean_special_features(text, *, force_amenity_list=False):
+    """Clean Special Features into short amenity/spec blurbs (Kitt style)."""
+    return clean_prose_or_amenity_field(
+        text, force_amenity_list=force_amenity_list, max_words=SPECIAL_FEATURES_MAX_WORDS
+    )
+
+
+def extract_state_of_space_status(text):
+    """Return a compact fit-out/availability status if one appears in *text*.
+
+    Normalizes common phrases to Kitt template wording when recognized.
+    """
+    text = "" if text is None else str(text).strip()
+    if not text:
+        return ""
+    match = _STATE_OF_SPACE_STATUS_RE.search(text)
+    if not match:
+        return ""
+    raw = " ".join(match.group(0).split())
+    lower = raw.lower()
+    if re.search(r"fully\s+fitted", lower):
+        return "Fully Fitted"
+    if re.search(r"partially\s+fitted", lower):
+        return "Partially Fitted"
+    if "underway" in lower:
+        return "Fitout Underway"
+    if re.search(r"cat\s*a", lower):
+        if "custom" in lower or "opportunity" in lower:
+            return "CAT A - Custom Fit Out Opportunity"
+        if re.search(r"fitted|fit\s*out", lower):
+            return "CAT A"
+        return "CAT A"
+    if re.search(r"cat\s*b", lower):
+        if "custom" in lower or "opportunity" in lower:
+            return "CAT B - Custom Fit Out Opportunity"
+        if re.search(r"fitted|fit\s*out", lower):
+            return "CAT B"
+        return "CAT B"
+    if re.search(r"plug\s*(?:and|&)\s*play", lower):
+        return "Plug and Play"
+    if re.search(r"available\s+now", lower):
+        return "Available now"
+    if re.search(r"available\s+immediately|immediate(?:\s+availability)?", lower):
+        return "Immediate"
+    if re.search(r"vacant\s+possession", lower):
+        return "Vacant possession"
+    if re.search(r"coming\s+soon", lower):
+        return "Coming soon"
+    if re.search(r"under\s+offer", lower):
+        return "Under offer"
+    return raw[0].upper() + raw[1:] if raw else ""
+
+
+def clean_state_of_space(text, *, force_amenity_list=False):
+    """Clean State of Space into a short availability/condition note.
+
+    Prefers compact status tags (Fully Fitted, Fitout Underway, CAT A …)
+    over amenity-list essays. OCR noise and long brochure dumps without a
+    status phrase are blanked rather than shipped as amenity lists. Short
+    primary notes pass through; remaining prose is soft-capped (~250 words)
+    on a complete sentence boundary.
+    """
+    if text is None:
+        return ""
+    text = " ".join(str(text).split()).strip()
+    if not text:
+        return ""
+
+    # Multi-column / vertical OCR is not salvageable into a status tag.
+    if looks_like_ocr_layout_noise(text):
+        return ""
+
+    status = extract_state_of_space_status(text)
+    messy = force_amenity_list or _looks_like_amenity_dump(text)
+    if messy:
+        # Status tag wins; otherwise do not dump amenities into this column.
+        return status
+    # Short notes (Immediate, Cat A, Fully Fitted) and light condition prose.
+    return cap_prose_field(text, max_words=STATE_OF_SPACE_MAX_WORDS)
 
 
 def _looks_like_amenity_dump(text):
