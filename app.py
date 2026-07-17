@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
@@ -555,6 +555,44 @@ def _download_url(batch_id, filename):
     return f"{scheme}://{request.host}/api/download/{quote(batch_id)}/{quote(filename)}{token_part}"
 
 
+def _ensure_download_access_token(url):
+    """Guarantee /api/download URLs work as bare <img src> / hyperlink targets.
+
+    Gallery HTML is opened by plain browser navigation (Excel click). The
+    gallery page URL itself usually carries ?token=, so the HTML loads, but
+    each <img src> is a separate request that must also include the token —
+    _guard 404s tokenless /api/* when ACCESS_TOKEN is set. Candidate paths
+    (tests, merge/normalize edge cases, relative /api/download/…) can omit
+    it; rewrite those before writing gallery HTML. External CDN URLs are
+    left unchanged.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return text
+    parsed = urlparse(text)
+    path = parsed.path or ""
+    if not parsed.scheme and path.startswith("/api/download/"):
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+        text = f"{scheme}://{request.host}{path}"
+        if parsed.query:
+            text = f"{text}?{parsed.query}"
+        parsed = urlparse(text)
+    if "/api/download/" not in (parsed.path or ""):
+        return text
+    if not ACCESS_TOKEN:
+        return text
+    qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() != "token"]
+    qs.append(("token", ACCESS_TOKEN))
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(qs), "")
+    )
+
+
+def _gallery_image_srcs(image_urls):
+    """Absolute, tokenized srcs for every gallery image (CDN URLs unchanged)."""
+    return [_ensure_download_access_token(url) for url in image_urls if str(url or "").strip()]
+
+
 def _attach_pdf_images(records, source_path, pages_text, batch_dir, batch_id, name):
     """Fills High Res Images (and, where a real one is found, Floor Plan)
     for records whose Building can be matched to page(s) of the source PDF
@@ -678,7 +716,9 @@ def _attach_pdf_images(records, source_path, pages_text, batch_dir, batch_id, na
             else:
                 gallery_state["count"] += 1
                 gallery_filename = f"{name}_gallery{gallery_state['count']}.html"
-                gallery_html = pdf_images.build_gallery_html(building or name, photo_urls)
+                gallery_html = pdf_images.build_gallery_html(
+                    building or name, _gallery_image_srcs(photo_urls)
+                )
                 (batch_dir / gallery_filename).write_text(gallery_html, encoding="utf-8")
                 jobs.append((f"{batch_id}/{gallery_filename}", batch_dir / gallery_filename))
                 gallery_url_by_photos[photos_key] = _download_url(batch_id, gallery_filename)
@@ -1176,7 +1216,11 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     # data URIs. Inlining every MetSpace/UNION embed ballooned
                     # gallery HTML and kept a second copy of each JPEG in RSS
                     # on the free tier; sync upload makes these durable.
-                    gallery_html = pdf_images.build_gallery_html(record.get("Building") or name, valid)
+                    # _gallery_image_srcs re-applies ?token= so bare browser
+                    # <img> requests pass _guard when ACCESS_TOKEN is set.
+                    gallery_html = pdf_images.build_gallery_html(
+                        record.get("Building") or name, _gallery_image_srcs(valid)
+                    )
                     gallery_path.write_text(gallery_html, encoding="utf-8")
                     if gallery_path.exists() and gallery_path.stat().st_size and gallery_html.count("<img") >= len(valid):
                         jobs.append((f"{batch_id}/{gallery_filename}", gallery_path))

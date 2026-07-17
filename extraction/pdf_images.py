@@ -741,15 +741,27 @@ def build_gallery_html(title, image_urls):
     stacked together — used when a listing has more than one real photo,
     since a spreadsheet cell can only hold one hyperlink. No JS, no
     external assets — just <img> tags pointing at each image's own
-    already-hosted download URL."""
+    already-hosted download URL. Callers must pass absolute URLs that
+    already include ?token= when ACCESS_TOKEN gates /api/download."""
     import html as _html
 
     safe_title = _html.escape(title or "Photos")
-    imgs_html = "\n".join(
-        f'<img src="{_html.escape(url)}" alt="Photo {i + 1}" '
-        f'style="max-width:100%; height:auto; display:block; margin-bottom:16px; border-radius:6px;">'
-        for i, url in enumerate(image_urls)
-    )
+    parts = []
+    for i, url in enumerate(image_urls):
+        if not str(url or "").strip():
+            continue
+        label = f"Photo {i + 1}"
+        parts.append(
+            f'<figure style="margin:0 0 16px;">'
+            f'<img src="{_html.escape(url)}" alt="{label}" '
+            f'style="max-width:100%; height:auto; display:block; border-radius:6px;" '
+            f'onerror="this.style.display=\'none\';'
+            f'this.nextElementSibling.style.display=\'block\';">'
+            f'<p style="display:none;color:#c44;margin:8px 0 0;">'
+            f'{label} failed to load</p>'
+            f"</figure>"
+        )
+    imgs_html = "\n".join(parts)
     return (
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
         f"<title>{safe_title} — Photos</title>\n"

@@ -1167,6 +1167,42 @@ def test_gallery_uses_absolute_download_urls_not_data_uris(tmp_path):
     assert "api/download/batch/Example_brochure_r1_bbbb.jpg" in gallery
 
 
+def test_gallery_img_srcs_include_access_token_when_set(tmp_path, monkeypatch):
+    """Hosted batch imgs in gallery HTML must carry ?token= for bare browser loads."""
+    monkeypatch.setattr(app_module, "ACCESS_TOKEN", "secret-token")
+    photo_a = _photo_jpeg(1)
+    photo_b = _photo_jpeg(2)
+    (tmp_path / "Example_brochure_r1_aaaa.jpg").write_bytes(photo_a)
+    (tmp_path / "Example_brochure_r1_bbbb.jpg").write_bytes(photo_b)
+    # Deliberately omit ?token= — the bug case when candidates lack it.
+    url_a = "https://service.test/api/download/batch/Example_brochure_r1_aaaa.jpg"
+    url_b = "https://service.test/api/download/batch/Example_brochure_r1_bbbb.jpg"
+    cdn = "https://cdn.example/photos/lobby.jpg"
+    record = {
+        "Building": "Market Place",
+        "_source_high_res_candidates": [url_a, url_b, cdn],
+        "_high_res_candidates": [url_a, url_b, cdn],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        jobs = app_module._finalize_high_res_images(
+            [record], tmp_path, "batch", "Example",
+            image_validator=lambda url, cache=None, **_kw: {
+                "ok": True, "url": url, "status": "VALID_IMAGE",
+                "content_hash": image_content_hash(
+                    photo_a if "aaaa" in url else photo_b if "bbbb" in url else url.encode()
+                ),
+            },
+        )
+    assert len(jobs) == 1
+    gallery = jobs[0][1].read_text(encoding="utf-8")
+    assert gallery.count("<img") == 3
+    assert gallery.count("token=secret-token") == 2
+    assert "cdn.example/photos/lobby.jpg" in gallery
+    assert "cdn.example" in gallery and "token=secret-token" not in gallery.split("cdn.example")[1].split('"')[0]
+    assert app_module._ensure_download_access_token(url_a).endswith("?token=secret-token")
+    assert app_module._ensure_download_access_token(cdn) == cdn
+
+
 def test_materialize_and_finalize_queue_gallery_and_sibling_uploads(tmp_path):
     """MetSpace-style embeds: upload jobs must include photo siblings + gallery HTML."""
     photo_a = AssetCandidate(
