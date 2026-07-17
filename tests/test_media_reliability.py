@@ -1492,7 +1492,11 @@ def test_finalize_soft_accept_under_deadline_rejects_floorplan_named_url(tmp_pat
 
 
 def test_enrichment_seeds_high_res_when_budget_skips_unique_box_urls():
-    """Floor Plan seed alone must not leave High Res blank under deadline."""
+    """Floor Plan seed alone must not leave High Res blank under deadline.
+
+    Provider-neutral: uses synthetic Box share URLs (any spreadsheet with
+    hosted document links), not a UNION-specific rule path.
+    """
     from extraction.brochure import _usable_high_res_seed_url
 
     props = []
@@ -1507,9 +1511,9 @@ def test_enrichment_seeds_high_res_when_budget_skips_unique_box_urls():
                     "Brochure PDF": box,
                     "Floor Plan": box,
                 }),
-                "union.xlsx",
-                "UNION",
-                "rule:UNION",
+                "availability.xlsx",
+                "Example Landlord",
+                "llm",
             )
         )
 
@@ -1573,3 +1577,5 @@ def test_usable_high_res_seed_rewrites_box_and_drive():
     drive = "https://drive.google.com/file/d/FILEID123/view"
     assert "drive.usercontent.google.com" in _usable_high_res_seed_url(drive)
     assert _is_brochure_media_seed_url("https://cdn.test/office.jpg") is False
+    assert _is_brochure_media_seed_url("https://property.example.test/offices/example-house") is True
+    assert _is_brochure_media_seed_url("https://cms.example.test/assets/uuid-aaaa-bbbb") is False

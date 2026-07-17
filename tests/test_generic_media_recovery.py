@@ -172,3 +172,111 @@ def test_dropbox_hosted_document_gets_direct_download_candidate():
     candidates = _hosted_document_candidates(None, url)
     assert candidates
     assert "dl=1" in candidates[0].url
+
+
+def test_budget_skip_seeds_high_res_for_drive_and_property_pages():
+    """Under enrichment deadline, any brochure URL keeps High Res non-blank.
+
+    Covers Drive (MetSpace/WP+) and plain property pages (Knotel/GPE) —
+    not only Box/UNION static PDFs.
+    """
+    from extraction.brochure import enrich_properties
+    from extraction.models import Property
+    from extraction.schema import normalize_record
+
+    drive = "https://drive.google.com/file/d/FILEIDDRIVE99/view"
+    page = "https://property.example.test/offices/example-house"
+    props = [
+        Property.from_record(
+            normalize_record({
+                "Building": "Drive House, 1 Example Street",
+                "Property Postcode": "EC1A 1AA",
+                "Brochure PDF": drive,
+                "Floor Plan": drive,
+            }),
+            "sheet.xlsx",
+            "Example Provider",
+            "llm",
+        ),
+        Property.from_record(
+            normalize_record({
+                "Building": "Page House, 2 Example Street",
+                "Property Postcode": "EC1A 1BB",
+                "Brochure PDF": page,
+            }),
+            "mail.eml",
+            "Example Provider",
+            "llm",
+        ),
+    ]
+    enrich_properties(
+        props,
+        fetcher=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+        extractor=lambda *a, **k: None,
+        deadline=time.monotonic() - 1,
+    )
+    assert "drive.usercontent.google.com" in (props[0].values.get("High Res Images") or "")
+    assert props[1].values.get("High Res Images") == page
+
+
+def test_finalize_keeps_featured_photo_and_property_page_fallback(tmp_path):
+    """Last-row style listing: featured photo survives deadline; page is seed."""
+    featured = "https://cms.example.test/assets/featured-token-xyz"
+    page = "https://property.example.test/buildings/example-tower"
+    record = {
+        "Building": "Example Tower",
+        "Brochure PDF": page,
+        "High Res Images": featured,
+        "_source_high_res_candidates": [featured],
+        "_high_res_candidates": [featured, page],
+    }
+    past = time.monotonic() - 1
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "SHOULD_NOT_RUN"},
+            deadline=past,
+        )
+    assert record.get("High Res Images") == featured
+    assert int(record.get("_high_res_image_count") or 0) >= 1
+
+
+def test_finalize_falls_back_to_property_page_when_photos_rejected(tmp_path):
+    """When featured photo fails validation, Brochure PDF page stays in High Res."""
+    featured = "https://cdn.example.test/photo.jpg"
+    page = "https://property.example.test/buildings/example-tower"
+    record = {
+        "Building": "Example Tower",
+        "Brochure PDF": page,
+        "High Res Images": featured,
+        "_high_res_candidates": [featured, page],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
+        )
+    assert record["High Res Images"] == page
+    assert any(item.status == "HIGH_RES_BROCHURE_SEEDED" for item in record["_link_diagnostics"])
+
+
+def test_brochure_media_seed_helpers_are_provider_neutral():
+    from extraction.brochure import _is_brochure_media_seed_url as brochure_seed
+    from extraction.brochure import _usable_high_res_seed_url
+
+    assert brochure_seed("https://app.box.com/shared/static/x.pdf")
+    assert brochure_seed("https://drive.google.com/file/d/ABC/view")
+    assert brochure_seed("https://www.dropbox.com/s/abc/file.pdf?dl=0")
+    assert brochure_seed("https://files.example.test/packs/brochure.pdf")
+    assert brochure_seed("https://listing.example.test/property/12-market")
+    assert not brochure_seed("https://cdn.example.test/office.jpg")
+    assert not brochure_seed("https://cms.example.test/assets/uuid-photo")
+    assert "shared/static" in _usable_high_res_seed_url("https://app.box.com/s/abcshareid")
+    assert app_module._is_brochure_media_seed_url("https://listing.example.test/property/12-market")
+    assert not app_module._is_brochure_media_seed_url("https://cms.example.test/assets/uuid-photo")

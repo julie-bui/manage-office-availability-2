@@ -826,8 +826,10 @@ def _is_replaceable_viewer_url(url):
 def _is_brochure_media_seed_url(url):
     """True for brochure/document URLs used as High Res click-through seeds.
 
-    Matches extraction.brochure seeding: Box/Drive/Dropbox/.pdf links keep
-    High Res non-blank when photo extraction cannot finish every unique URL.
+    Matches extraction.brochure seeding: Box/Drive/Dropbox/.pdf and any
+    non-image http(s) brochure/property page keep High Res non-blank when
+    photo extraction cannot finish every unique URL. Image-like CMS/CDN
+    URLs are never treated as seeds.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -845,6 +847,9 @@ def _is_brochure_media_seed_url(url):
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
         return True
     if path.endswith(".pdf"):
+        return True
+    scheme = (parsed.scheme or "").lower()
+    if scheme in {"http", "https"} and not html_images.is_image_like_url(text):
         return True
     return False
 
@@ -865,6 +870,7 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
     gallery_url_by_candidates = {}
     gallery_count = 0
     validation_cache = {}
+    from extraction.brochure import _usable_high_res_seed_url
 
     def _finalize_photo_need(record):
         cands = list(record.get("_high_res_candidates") or [])
@@ -891,8 +897,13 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             raw_candidates = source_candidates + list(raw_candidates or [])
         existing_image = str(record.get("High Res Images") or "")
         brochure_seed = existing_image if _is_brochure_media_seed_url(existing_image) else ""
+        if not brochure_seed:
+            brochure_pdf = str(record.get("Brochure PDF") or "").strip()
+            if brochure_pdf and _is_brochure_media_seed_url(brochure_pdf):
+                brochure_seed = _usable_high_res_seed_url(brochure_pdf) or brochure_pdf
         if not raw_candidates and existing_image and ".html" not in existing_image.lower():
-            if brochure_seed:
+            if _is_brochure_media_seed_url(existing_image):
+                record["High Res Images"] = existing_image
                 record["_high_res_image_count"] = 0
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic(
@@ -904,7 +915,17 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                 continue
             raw_candidates = [existing_image]
         if not raw_candidates:
-            if not existing_image:
+            if brochure_seed:
+                record["High Res Images"] = brochure_seed
+                record["_high_res_image_count"] = 0
+                record.setdefault("_link_diagnostics", []).append(
+                    LinkDiagnostic(
+                        "HIGH_RES_BROCHURE_SEEDED",
+                        final_url=brochure_seed,
+                        detail="Preserved brochure document URL as High Res fallback (no photo candidates).",
+                    )
+                )
+            elif not existing_image:
                 record["_high_res_image_count"] = 0
                 record.setdefault("_link_diagnostics", []).append(
                     LinkDiagnostic("NO_IMAGES_DISCOVERED", detail="No property-photo candidates reached media finalisation.")

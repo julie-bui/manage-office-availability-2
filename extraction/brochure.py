@@ -20,6 +20,7 @@ import requests
 
 from .assets import classify_candidate, classify_candidates, is_blank_or_empty_image, normalize_url
 from .address import extract_postcode
+from .html_images import is_image_like_url
 from .identity import IdentityDecision, compare_property_identity, property_key
 from .models import (
     AssetCandidate,
@@ -739,6 +740,9 @@ def _is_brochure_media_seed_url(url: str) -> bool:
 
     These keep the cell clickable when full PDF photo extraction cannot
     finish every unique URL, but they are not property photographs.
+    Provider-neutral: Box/Drive/Dropbox/.pdf plus any non-image http(s)
+    brochure or property page (Knotel/GPE listing pages, spreadsheet
+    document links). Image-like CMS/CDN URLs stay photos, never seeds.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -756,6 +760,9 @@ def _is_brochure_media_seed_url(url: str) -> bool:
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
         return True
     if path.endswith(".pdf"):
+        return True
+    scheme = (parsed.scheme or "").lower()
+    if scheme in {"http", "https"} and not is_image_like_url(text):
         return True
     return False
 
@@ -788,11 +795,11 @@ def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
     brochure link in High Res so the cell stays usable. Real photo embeds
     replace this seed when a later fetch succeeds. Never seed after an
     identity conflict — that brochure does not belong to this listing.
+
+    Always stash the seed on `_high_res_candidates` even when a featured
+    photo already exists, so finalize can fall back if soft-accept rejects
+    that photo under deadline (Knotel last-row / sparse email galleries).
     """
-    if _source_photo_count(prop) > 0:
-        return
-    if prop.values.get("_brochure_embedded_assets"):
-        return
     conflict = {
         "LINK_IDENTITY_HARD_CONFLICT",
         "LINK_IDENTITY_AMBIGUOUS",
@@ -805,15 +812,20 @@ def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
     seed = _usable_high_res_seed_url(brochure_url)
     if not seed:
         return
+    candidates = list(prop.values.get("_high_res_candidates") or [])
+    if seed not in candidates:
+        # Photos stay first; seed is a finalize fallback, not a gallery pad.
+        prop.values["_high_res_candidates"] = [
+            c for c in candidates if c and c != seed
+        ] + [seed]
+    if _source_photo_count(prop) > 0:
+        return
+    if prop.values.get("_brochure_embedded_assets"):
+        return
     existing = str(prop.values.get("High Res Images") or "").strip()
     if existing and not _is_brochure_media_seed_url(existing):
         return
     prop.values["High Res Images"] = seed
-    candidates = list(prop.values.get("_high_res_candidates") or [])
-    if seed not in candidates:
-        prop.values["_high_res_candidates"] = [seed] + [
-            c for c in candidates if c and c != seed
-        ]
     _record_diagnostic(
         prop,
         "HIGH_RES_BROCHURE_SEEDED",
