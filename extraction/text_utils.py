@@ -35,6 +35,8 @@ _STATE_OF_SPACE_STATUS_RE = re.compile(
     r"cat\s*[ab]\s*(?:fit\s*out|fitted)|"
     r"custom\s+fit\s*out\s+opportunity|"
     r"cat\s*[ab]\b|"
+    # Bare "Fitted" (UNION Current Spec) — after CAT A/B so "Cat A fitted" wins.
+    r"fitted|"
     r"plug\s*(?:and|&)\s*play|"
     r"available\s+(?:now|immediately)|immediate(?:\s+availability)?|"
     r"vacant\s+possession|coming\s+soon|under\s+offer"
@@ -472,6 +474,8 @@ def extract_state_of_space_status(text):
         if re.search(r"fitted|fit\s*out", lower):
             return "CAT B"
         return "CAT B"
+    if re.search(r"\bfitted\b", lower):
+        return "Fitted"
     if re.search(r"plug\s*(?:and|&)\s*play", lower):
         return "Plug and Play"
     if re.search(r"available\s+now", lower):
@@ -507,7 +511,112 @@ def clean_state_of_space(text, *, force_amenity_list=False):
     if looks_like_ocr_layout_noise(text):
         return ""
 
-    return extract_state_of_space_status(text)
+    # Same peel rules as reclassify so bare "fitted" inside amenity prose
+    # does not become a State of Space tag.
+    status, _remainder = _partition_status_and_amenities(text)
+    return status
+
+
+def _is_pure_status_phrase(text):
+    """True when *text* is only a fit-out/availability status tag (no amenities)."""
+    text = " ".join(str(text or "").split()).strip()
+    if not text:
+        return False
+    if _STATE_OF_SPACE_STATUS_RE.fullmatch(text):
+        return True
+    status = extract_state_of_space_status(text)
+    if not status:
+        return False
+    return re.sub(r"\W+", "", text.lower()) == re.sub(r"\W+", "", status.lower())
+
+
+def _partition_status_and_amenities(text):
+    """Split fit-out status tags from amenity/description text.
+
+    Returns ``(status_tag, remainder)``:
+    - Pure status (``Fitted``, ``CAT A``) → ``(tag, "")``
+    - ``Fitted; Bike store`` → ``("Fitted", "Bike store")``
+    - Description mentioning strong status → ``(tag, full_text)``
+    - Amenity-only → ``("", text)``
+    """
+    text = " ".join(str(text or "").split()).strip()
+    if not text:
+        return "", ""
+
+    if ";" in text:
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        status = ""
+        amenities = []
+        for part in parts:
+            tag = extract_state_of_space_status(part)
+            if tag and _is_pure_status_phrase(part):
+                if not status:
+                    status = tag
+            else:
+                amenities.append(part)
+        return status, "; ".join(amenities)
+
+    tag = extract_state_of_space_status(text)
+    if not tag:
+        return "", text
+    if _is_pure_status_phrase(text):
+        return tag, ""
+    # Longer blurb with a strong status (Fully Fitted, CAT A, …) — expose the
+    # tag and keep the description. Bare "fitted" inside amenity phrases
+    # ("newly fitted kitchenette") is not a State of Space signal.
+    match = _STATE_OF_SPACE_STATUS_RE.search(text)
+    raw = (match.group(0) if match else "").strip()
+    if re.fullmatch(r"(?i)fitted", raw):
+        return "", text
+    return tag, text
+
+
+def reclassify_special_features_and_state_of_space(special_features, state_of_space):
+    """Route short fit-out status tags to State of Space; keep amenities in SF.
+
+    UNION Current Spec values like ``Fitted`` / ``CAT A`` often land in Special
+    Features; Kitts puts those in State of Space. Longer amenity/description
+    text stays in Special Features. When a cell mixes both (``Fitted; Bike
+    store``), SoS gets the status and SF keeps the amenity remainder.
+    """
+    sf_in = " ".join(str(special_features or "").split()).strip()
+    sos_in = " ".join(str(state_of_space or "").split()).strip()
+
+    status_from_sf, rest_from_sf = _partition_status_and_amenities(sf_in)
+    sos = clean_state_of_space(sos_in)
+
+    if not sos and sos_in:
+        status_from_sos, rest_from_sos = _partition_status_and_amenities(sos_in)
+        if status_from_sos:
+            sos = status_from_sos
+            if rest_from_sos and rest_from_sos != sos_in:
+                rest_from_sf = "; ".join(p for p in (rest_from_sf, rest_from_sos) if p)
+            elif rest_from_sos == sos_in and not sf_in:
+                rest_from_sf = rest_from_sos
+        elif not extract_state_of_space_status(sos_in):
+            rest_from_sf = "; ".join(p for p in (rest_from_sf, sos_in) if p)
+
+    if not sos and status_from_sf:
+        sos = status_from_sf
+
+    if status_from_sf:
+        if rest_from_sf == sf_in:
+            sf = clean_special_features(sf_in)
+        elif rest_from_sf:
+            sf = clean_special_features(rest_from_sf)
+        else:
+            sf = ""
+    else:
+        sf = clean_special_features(sf_in)
+
+    if sf and _is_pure_status_phrase(sf):
+        peeled = extract_state_of_space_status(sf)
+        if peeled:
+            if not sos:
+                sos = peeled
+            sf = ""
+
+    return sf, sos
 
 
 # Brochure/PDF footers and nav chrome must never land in Min. Term

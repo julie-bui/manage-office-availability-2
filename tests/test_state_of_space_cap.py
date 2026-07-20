@@ -57,6 +57,56 @@ def test_extract_state_of_space_status_kitt_phrases():
         == "CAT A - Custom Fit Out Opportunity"
     )
     assert extract_state_of_space_status("Partially fitted desks") == "Partially Fitted"
+    assert extract_state_of_space_status("Fitted") == "Fitted"
+    assert extract_state_of_space_status("CAT A") == "CAT A"
+    assert clean_state_of_space("Fitted") == "Fitted"
+
+
+def test_reclassify_moves_status_tags_from_special_features_to_state_of_space():
+    from extraction.text_utils import reclassify_special_features_and_state_of_space
+
+    assert reclassify_special_features_and_state_of_space("Fitted", "") == ("", "Fitted")
+    assert reclassify_special_features_and_state_of_space("CAT A", "") == ("", "CAT A")
+    assert reclassify_special_features_and_state_of_space("Fully Fitted", "") == (
+        "",
+        "Fully Fitted",
+    )
+    assert reclassify_special_features_and_state_of_space("Fitted; Bike store", "") == (
+        "Bike store",
+        "Fitted",
+    )
+    # Real amenity prose mentioning bare "fitted" stays in Special Features only.
+    sf, sos = reclassify_special_features_and_state_of_space(
+        "Newly fitted kitchenette with bike storage", ""
+    )
+    assert "kitchenette" in sf.lower()
+    assert sos == ""
+    # Strong multi-word status inside a blurb still fills State of Space.
+    sf2, sos2 = reclassify_special_features_and_state_of_space(
+        "Fully fitted floor with terrace and meeting rooms", ""
+    )
+    assert "terrace" in sf2.lower()
+    assert sos2 == "Fully Fitted"
+    # Existing SoS wins; pure status in SF is cleared.
+    assert reclassify_special_features_and_state_of_space("Fitted", "CAT A") == ("", "CAT A")
+    # Price-drop notes are not status tags.
+    sf3, sos3 = reclassify_special_features_and_state_of_space("Price drop: now £120 psf", "")
+    assert sf3
+    assert sos3 == ""
+
+
+def test_normalize_record_reclassifies_union_current_spec_style_values():
+    fitted = normalize_record({"Building": "Example", "Special Features": "Fitted"})
+    assert fitted["Special Features"] == ""
+    assert fitted["State of Space"] == "Fitted"
+    cat_a = normalize_record({"Building": "Example", "Special Features": "CAT A"})
+    assert cat_a["Special Features"] == ""
+    assert cat_a["State of Space"] == "CAT A"
+    mixed = normalize_record(
+        {"Building": "Example", "Special Features": "Fitted; Bike store"}
+    )
+    assert mixed["Special Features"] == "Bike store"
+    assert mixed["State of Space"] == "Fitted"
 
 
 def test_cap_prose_field_shared_by_state_of_space():

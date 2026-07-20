@@ -25,13 +25,16 @@ LLM fallback path gets the same recovery without a UNION-only rule.
 """
 import re
 
+from extraction.text_utils import reclassify_special_features_and_state_of_space
 from extraction.xlsx_links import associate_row_links, _normalize_for_matching
 
 _HEADER_ALIASES = {
     "Building": (("city",), ("building",), ("address",), ("property",)),
     "Floor/Unit": (("floor",), ("unit",)),
-    # Some area tabs use "Category" instead of "Current Spec".
-    "Special Features": (("current", "spec"), ("spec",), ("fit", "out"), ("category",)),
+    # Current Spec / Category are fit-out status tags (Fitted, CAT A) — Kitts
+    # State of Space — not amenity blurbs. Reclassified in parse() so mixed
+    # values can still spill real description text into Special Features.
+    "State of Space": (("current", "spec"), ("spec",), ("fit", "out"), ("category",), ("state", "space")),
     "Size (sq ft)": (("size",), ("sq", "ft"), ("sqft",)),
     "Min. Term": (("minimum", "term"), ("min", "term"), ("term",)),
     "Marketing Price (Based on Min Term) PCM": (("monthly", "rate"), ("pcm",), ("per", "month")),
@@ -82,6 +85,13 @@ def parse(content):
                 continue
             if _looks_like_header(row):
                 continue
+            # Current Spec is usually a status tag (Fitted / CAT A); reclassify
+            # so State of Space gets the tag and Special Features stays blank
+            # unless the cell also held real amenity/description text.
+            spec = _cell(row, columns.get("State of Space"))
+            special_features, state_of_space = reclassify_special_features_and_state_of_space(
+                spec, ""
+            )
             record = {
                 "Area": area,
                 "Building": building,
@@ -95,7 +105,8 @@ def parse(content):
                 "Marketing Price (Based on Min Term) PSF": _cell(
                     row, columns.get("Marketing Price (Based on Min Term) PSF")
                 ),
-                "Special Features": _cell(row, columns.get("Special Features")),
+                "Special Features": special_features,
+                "State of Space": state_of_space,
                 "Contacts": "UNION",
             }
             records.append(record)

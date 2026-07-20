@@ -203,6 +203,9 @@ def test_useful_primary_preferred_over_long_brochure_essay_without_conflict():
     primary = normalize_record(
         {"Building": "Example House", "Brochure PDF": BROCHURE, "Special Features": "Fitted; Bike store"}
     )
+    # Status tag moves to State of Space; amenity remainder stays in Special Features.
+    assert primary["State of Space"] == "Fitted"
+    assert primary["Special Features"] == "Bike store"
     prop = Property.from_record(primary, "primary.eml", "Example", "rule:test")
     long_essay = (
         "ING; SUPERB NATURAL LIGHT; bright and; efficient; S; A; 0 3; 0 4; "
@@ -221,7 +224,8 @@ def test_useful_primary_preferred_over_long_brochure_essay_without_conflict():
         fetcher=lambda url: (b"brochure", "application/pdf"),
         extractor=lambda payload, content_type, source: result,
     )[0]
-    assert enriched.values["Special Features"] == "Fitted; Bike store"
+    assert enriched.values["Special Features"] == "Bike store"
+    assert enriched.values["State of Space"] == "Fitted"
     assert not any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
 
 
@@ -229,6 +233,8 @@ def test_useful_primary_preferred_over_ocr_layout_noise_fill():
     primary = normalize_record(
         {"Building": "Example House", "Brochure PDF": BROCHURE, "Special Features": "Fitted"}
     )
+    assert primary["State of Space"] == "Fitted"
+    assert primary["Special Features"] == ""
     prop = Property.from_record(primary, "primary.xlsx", "UNION", "rule:UNION")
     result = BrochureExtraction(
         BROCHURE,
@@ -243,7 +249,11 @@ def test_useful_primary_preferred_over_ocr_layout_noise_fill():
         fetcher=lambda url: (b"brochure", "application/pdf"),
         extractor=lambda payload, content_type, source: result,
     )[0]
-    assert enriched.values["Special Features"] == "Fitted"
+    # Pure status left SF blank — OCR junk tokens must not ship; SoS keeps Fitted.
+    features = enriched.values.get("Special Features") or ""
+    for junk in ("ecaps", "noinU", "morf", "Currentfloortype", "dr3", "d; n; 2"):
+        assert junk not in features
+    assert enriched.values["State of Space"] == "Fitted"
     assert not any(issue.stage == "brochure_conflict_resolution" for issue in enriched.issues)
 
 

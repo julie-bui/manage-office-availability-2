@@ -80,7 +80,10 @@ def test_union_detects_filename_even_without_intro_blurb():
     assert len(records) == 2
     assert records[0]["Building"] == "55 Goswell Road"
     assert records[0]["Area"] == "Clerkenwell & Farringdon"
+    assert records[0]["State of Space"] == "Fitted"
+    assert records[0]["Special Features"] == ""
     assert records[1]["Building"] == "109-111 Farringdon Road"
+    assert records[1]["State of Space"] == "Fitted"
     from extraction.rules import try_rules
 
     rule, via_try = try_rules(content)
