@@ -118,7 +118,18 @@ def validate_property(prop: Property) -> Property:
         prop.add_issue(issue)
 
     if brochure and floorplan and normalize_url(str(brochure)) == normalize_url(str(floorplan)):
-        prop.add_issue(ValidationIssue("Floor Plan", "Floor plan duplicates the brochure URL.", Severity.ERROR, floorplan))
+        # Soft-skip / no-bitmap path intentionally reuses the brochure URL as a
+        # Floor Plan click-through — info only, not a hard conflict.
+        prop.add_issue(
+            ValidationIssue(
+                "Floor Plan",
+                "Floor plan currently matches the brochure URL (document click-through fallback).",
+                Severity.INFO,
+                floorplan,
+                "Upgrade host memory to ≥2GB to extract a real floor-plan image from the PDF when available.",
+                "brochure_enrichment",
+            )
+        )
     if brochure and images and normalize_url(str(brochure)) == normalize_url(str(images)):
         prop.add_issue(ValidationIssue("High Res Images", "Property image field duplicates the brochure URL.", Severity.ERROR, images))
     if floorplan and images and normalize_url(str(floorplan)) == normalize_url(str(images)):

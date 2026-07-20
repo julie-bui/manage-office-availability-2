@@ -1562,7 +1562,8 @@ def test_enrichment_does_not_seed_high_res_with_box_document_when_budget_skips()
         assert prop.values.get("Floor Plan")
 
 
-def test_finalize_clears_brochure_high_res_and_floor_plan_document_urls(tmp_path):
+def test_finalize_keeps_brochure_floor_plan_document_fallback(tmp_path):
+    """Box Floor Plan click-through survives finalize when no plan image exists."""
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     record = {
         "Building": "Example House",
@@ -1580,11 +1581,11 @@ def test_finalize_clears_brochure_high_res_and_floor_plan_document_urls(tmp_path
             image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
         )
     assert not record.get("High Res Images")
-    assert not record.get("Floor Plan")
+    assert record["Floor Plan"] == "https://app.box.com/s/examplebrochure"
     assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
     statuses = {item.status for item in record["_link_diagnostics"]}
     assert "HIGH_RES_DOCUMENT_PLACEHOLDER_CLEARED" in statuses or "NO_IMAGES_DISCOVERED" in statuses
-    assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" in statuses
+    assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" not in statuses
 
 
 def test_finalize_keeps_floorplan_pdf_fallback_when_no_bitmap(tmp_path):
@@ -1612,7 +1613,7 @@ def test_finalize_keeps_floorplan_pdf_fallback_when_no_bitmap(tmp_path):
     assert not app_module._is_brochure_media_seed_url(record["High Res Images"])
 
 
-def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
+def test_finalize_keeps_brochure_floor_plan_when_photo_replaces_high_res(tmp_path):
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     photo = "https://cdn.test/office.jpg"
     record = {
@@ -1633,9 +1634,33 @@ def test_finalize_replaces_brochure_seed_with_real_photo(tmp_path):
         )
     assert record["High Res Images"] == photo
     assert "box.com" not in (record.get("High Res Images") or "")
-    # Floor Plan document placeholder cleared when no real plan image exists.
-    assert not record.get("Floor Plan")
+    # Floor Plan keeps the brochure click-through when no plan image exists.
+    assert record.get("Floor Plan") == "https://app.box.com/s/examplebrochure"
     assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
+
+
+def test_finalize_preserves_metspace_email_floor_plan_image(tmp_path):
+    """mcusercontent Floor Plan must survive finalize even when Brochure is list-manage."""
+    plan = "https://mcusercontent.com/53e32083f03d0f8f854aea227/images/5df50ebd-470f-ceba-fa1f-aeb0ac63172f.jpg"
+    brochure = "https://us.list-manage.com/Q6gnhZazI8v?e=095cb98613&c2id=a206dcecbc185bd9a5d5a46b47a3996f"
+    record = {
+        "Building": "9-10 Market Place",
+        "Brochure PDF": brochure,
+        "Floor Plan": plan,
+        "High Res Images": brochure,
+        "_high_res_candidates": [brochure],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "MetSpace",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
+        )
+    assert record["Floor Plan"] == plan
+    assert not record.get("High Res Images")
+    assert record["Brochure PDF"] == brochure
 
 
 def test_finalize_keeps_real_floor_plan_image_and_gallery(tmp_path):

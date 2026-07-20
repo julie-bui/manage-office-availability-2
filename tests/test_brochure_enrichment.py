@@ -404,6 +404,38 @@ def test_html_brochure_extracts_contacts_term_state_and_postcode():
     assert "Floor/Unit" not in result.fields
 
 
+def test_brochure_rejects_min_term_footer_junk():
+    """Knotel-style footer chrome must never fill Min. Term (all providers)."""
+    from extraction.brochure import _extract_fields
+    from extraction.schema import normalize_record
+    from extraction.text_utils import clean_min_term, is_min_term_junk
+
+    for junk in (
+        "Copyright © 2025 Knotel",
+        "Terms of Use",
+        "Unit Details",
+        "Copyright 2025 Knotel; Terms of Use; Unit Details",
+    ):
+        assert is_min_term_junk(junk)
+        assert clean_min_term(junk) == ""
+        assert normalize_record({"Min. Term": junk})["Min. Term"] == ""
+
+    # Bare "Term" heading previously swallowed "Terms of Use" as Min. Term.
+    fields = _extract_fields(
+        "Amenities\nBike storage\nTerm\nTerms of Use\nUnit Details\nCopyright © 2025 Knotel\n",
+        "https://knotel.example/listing",
+    )
+    assert "Min. Term" not in fields or not fields["Min. Term"].value
+
+    # Real terms still extract.
+    assert clean_min_term("Minimum term 24 months") == "24 months"
+    good = _extract_fields(
+        "Lease terms\nMinimum term 12 months\n",
+        "https://property.example/listing",
+    )
+    assert good["Min. Term"].value == "12 months"
+
+
 def test_brochure_fills_blank_safe_fields_with_provenance():
     html = b"""<html><body>
       <h2>Amenities</h2><p>Cycle storage</p>

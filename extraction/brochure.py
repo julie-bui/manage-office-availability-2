@@ -37,9 +37,11 @@ from .models import (
     ValidationIssue,
 )
 from .text_utils import (
+    clean_min_term,
     clean_special_features,
     clean_state_of_space,
     extract_state_of_space_status,
+    is_min_term_junk,
     is_useful_primary_special_features,
     is_useful_primary_state_of_space,
     looks_like_long_or_messy_features,
@@ -288,7 +290,7 @@ _FALLBACK_FEATURE_HEADINGS = frozenset(
 )
 _HEADING_RE = re.compile(
     r"^(description|specification|amenities|features|sustainability|epc|"
-    r"lease terms|minimum term|min term|term|availability|available|"
+    r"lease terms|minimum term|min term|\bterm\b|availability|available|"
     r"state of space|condition|contacts|contact|get in touch|enquire|enquiries|"
     r"service charge|business rates|rates|rent|pricing)\s*:?(.*)$",
     re.I,
@@ -881,7 +883,8 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     Plan for nested bitmap hunting. Dedicated .pdf links may still be kept as
     a click-through fallback when no hosted plan image was extracted.
     CMS floor-plan modal HTML endpoints are also unfinished — follow them to
-    resolve the hosted plan image/PDF.
+    resolve the hosted plan image/PDF. Mailchimp list-manage brochure
+    trackers (MetSpace → Drive) are unfinished document shells too.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -900,6 +903,8 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
         return True
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if "list-manage.com" in host:
         return True
     if path.endswith(".pdf") or "export=download" in query:
         return True
@@ -1009,6 +1014,10 @@ def _is_hosted_document_download(url: str) -> bool:
 
     Plain `.pdf` hrefs on property sites are optional (Knotel) and may be
     skipped when the HTML page already has a photo gallery.
+
+    Mailchimp list-manage click trackers (MetSpace Brochure PDF) resolve to
+    Google Drive PDFs — treat them as hosted documents so ≤1.2GB soft-skip
+    avoids downloading those embeds (email Floor Plan images still survive).
     """
     parsed = urlparse(url or "")
     host = (parsed.hostname or "").lower()
@@ -1017,6 +1026,8 @@ def _is_hosted_document_download(url: str) -> bool:
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
         return True
     if _is_box_host(host):
+        return True
+    if "list-manage.com" in host:
         return True
     return False
 
@@ -1236,8 +1247,9 @@ def _extract_fields(text: str, source_document: str):
             else:
                 preferred_features.append(value)
         elif field == "Min. Term" and value:
-            term = _normalize_min_term(value) or value
-            fields[field] = _evidence(term, source_document, 0.72)
+            term = clean_min_term(value) or _normalize_min_term(value)
+            if term and not is_min_term_junk(term):
+                fields[field] = _evidence(term, source_document, 0.72)
         elif field == "Contacts" and value:
             contact = _normalize_contact_text(value)
             if contact:
@@ -1348,6 +1360,11 @@ def _brochure_floor_tokens(text: str) -> set:
 
 
 def _normalize_min_term(value: str) -> str:
+    if is_min_term_junk(value):
+        return ""
+    cleaned = clean_min_term(value)
+    if cleaned:
+        return cleaned
     match = _MIN_TERM_RE.search(value or "")
     if not match:
         loose = re.search(r"\b(\d+)\s*(months?|years?|yrs?)\b", value or "", re.I)
@@ -1361,6 +1378,8 @@ def _normalize_min_term(value: str) -> str:
     if parts:
         cleaned = " ".join(str(parts[0]).split()).lower()
         cleaned = cleaned.replace("yrs", "years").replace("yr", "year")
+        if is_min_term_junk(cleaned):
+            return ""
         if re.match(r"^\d+\s*(months?|years?)$", cleaned):
             return cleaned
         if cleaned.isdigit():
@@ -1370,9 +1389,11 @@ def _normalize_min_term(value: str) -> str:
 
 
 def _find_min_term(text: str) -> str:
+    if is_min_term_junk(text):
+        return ""
     match = _MIN_TERM_RE.search(text or "")
     if not match:
-        return ""
+        return clean_min_term(text)
     return _normalize_min_term(match.group(0))
 
 
@@ -1588,6 +1609,8 @@ def _is_brochure_media_seed_url(url: str) -> bool:
         return True
     if path.endswith(".pdf"):
         return True
+    if "list-manage.com" in host:
+        return True
     scheme = (parsed.scheme or "").lower()
     if scheme in {"http", "https"} and not is_image_like_url(text):
         return True
@@ -1733,14 +1756,49 @@ def _promote_brochure_pdf_cell(prop: Property, extraction: BrochureExtraction) -
 
 
 def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
-    """No-op: brochure/document URLs must not become High Res cell values.
+    """No-op for High Res; seed Floor Plan document click-through on soft-skip.
 
-    High Res / Floor Plan final cells are real extracted images or hosted
-    gallery HTML only. Brochure PDF keeps the document URL. Enrichment still
-    fetches aggressively; when budget/RSS skips a unique PDF the High Res
-    cell stays blank rather than showing a Box/Drive/.pdf click-through.
+    High Res cells stay blank without extracted photos (never put a
+    Box/Drive/brochure PDF into High Res). Floor Plan gets the brochure /
+    Box / Drive / list-manage URL when no hosted plan image exists so the
+    cell stays clickable after ≤1.2GB soft-skip. MetSpace email
+    mcusercontent Floor Plan images are preserved.
     """
-    return
+    _seed_floor_plan_document_fallback(prop, brochure_url)
+
+
+def _seed_floor_plan_document_fallback(prop: Property, brochure_url: str) -> None:
+    """Set Floor Plan to the brochure/document URL when no plan image exists.
+
+    Shared soft-skip / budget-skip path for all providers. Never overwrites a
+    hosted plan image (e.g. MetSpace mcusercontent) or a keepable website
+    floorplan.pdf fallback.
+    """
+    url = str(brochure_url or "").strip()
+    if not url:
+        return
+    existing = str(prop.values.get("Floor Plan") or "").strip()
+    if existing:
+        # Keep real plan images and dedicated website floorplan.pdf links.
+        if not _is_viewer_floorplan_url(existing):
+            return
+        if _is_floor_plan_pdf_fallback_url(existing):
+            return
+    prop.values["Floor Plan"] = url
+    try:
+        _record_diagnostic(
+            prop,
+            "FLOOR_PLAN_DOCUMENT_FALLBACK",
+            url,
+            detail=(
+                "Floor Plan set to brochure/document URL because PDF embed "
+                "extraction was skipped or produced no plan image. Upgrade "
+                "host memory to ≥2GB (4GB+ recommended) for real Floor Plan "
+                "bitmaps and High Res embeds from Box/Drive PDFs."
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _floor_plan_already_seeded(prop: Property) -> bool:
@@ -1973,8 +2031,10 @@ def enrich_properties(
         return properties
 
     # Dual-path memory policy (Railway Hobby is often capped at 1GB):
-    # ≤1.2GB → soft-skip Box/Drive/Dropbox PDF embeds BEFORE fetch so the
-    # worker survives; Brochure PDF cell links stay. HTML galleries still run.
+    # ≤1.2GB → soft-skip Box/Drive/Dropbox/list-manage PDF embeds BEFORE fetch
+    # so the worker survives; Brochure PDF links stay; Floor Plan falls back
+    # to the brochure/document URL when no plan image exists; High Res stays
+    # blank without photos. HTML galleries still run.
     # ≥2GB (or ENRICHMENT_HIGH_MEMORY=1) → full nested PDF / floor-plan embeds.
     if _skip_heavy_pdf_embeds():
         kept = []
@@ -1982,8 +2042,10 @@ def enrich_properties(
         detail = (
             f"Skipped PDF embed download on small host "
             f"(host_ram={_HOST_RAM_MB:.0f} MiB ≤ {_SMALL_HOST_RAM_MB:.0f} MiB). "
-            f"Brochure PDF link preserved. Upgrade Railway memory to ≥2GB "
-            f"(4GB+ recommended) for Union floor plans / High Res embeds."
+            f"Brochure PDF link preserved; Floor Plan falls back to the "
+            f"document URL when no plan image exists; High Res stays blank. "
+            f"Upgrade Railway memory to ≥2GB (4GB+ recommended) for Union / "
+            f"MetSpace Drive floor-plan bitmaps and High Res embeds."
         )
         for brochure_url in pending:
             if _is_hosted_document_download(brochure_url):
@@ -2000,7 +2062,7 @@ def enrich_properties(
                             "Linked PDF embed extraction was skipped because this host has ≤1.2GB RAM.",
                             Severity.INFO,
                             brochure_url,
-                            "Upgrade the Railway plan/memory to ≥2GB (4GB+ for Union) to extract floor plans and High Res from Box/Drive PDFs.",
+                            "Upgrade the Railway plan/memory to ≥2GB (4GB+ for Union) to extract floor plans and High Res from Box/Drive PDFs. Floor Plan may show the brochure link as a click-through fallback.",
                             "linked_source_enrichment",
                         )
                     )

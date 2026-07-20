@@ -510,6 +510,47 @@ def clean_state_of_space(text, *, force_amenity_list=False):
     return extract_state_of_space_status(text)
 
 
+# Brochure/PDF footers and nav chrome must never land in Min. Term
+# (confirmed real 2026-07: Knotel "Copyright © 2025 Knotel", "Terms of Use",
+# "Unit Details" under a bare "Term" heading).
+_MIN_TERM_JUNK_RE = re.compile(
+    r"(?i)\b("
+    r"copyright|all\s+rights\s+reserved|terms?\s+of\s+use|privacy\s+policy|"
+    r"cookie\s+policy|unit\s+details|cookie\s+settings|legal\s+notice"
+    r")\b"
+)
+_MIN_TERM_VALUE_RE = re.compile(
+    r"(?i)\b(\d+)\s*(months?|years?|yrs?)\b|\b(rolling|flexible|monthly|quarterly)\b"
+)
+
+
+def is_min_term_junk(text) -> bool:
+    """True for footer/nav chrome that must never fill Min. Term."""
+    value = " ".join(str(text or "").split()).strip()
+    if not value:
+        return True
+    return bool(_MIN_TERM_JUNK_RE.search(value))
+
+
+def clean_min_term(text) -> str:
+    """Keep a real lease term only; reject copyright/footer/nav chrome.
+
+    Accepts values like ``24 months``, ``12 months``, ``rolling``. Returns
+    empty when the text is footer junk or has no recognizable term.
+    """
+    value = " ".join(str(text or "").split()).strip()
+    if not value or is_min_term_junk(value):
+        return ""
+    match = _MIN_TERM_VALUE_RE.search(value)
+    if not match:
+        return ""
+    if match.group(1) and match.group(2):
+        unit = match.group(2).lower().replace("yrs", "years").replace("yr", "year")
+        return f"{match.group(1)} {unit}"
+    label = (match.group(3) or "").lower()
+    return label[:1].upper() + label[1:] if label else ""
+
+
 def _looks_like_amenity_dump(text):
     parts = [p.strip() for p in text.split(";") if p.strip()]
     if len(parts) < 3:

@@ -217,6 +217,9 @@ def test_small_host_skips_box_pdf_before_fetch(monkeypatch):
     brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
     assert fetched == []
     assert prop.values.get("Brochure PDF") == "https://app.box.com/shared/static/abc123.pdf"
+    # Soft-skip Floor Plan fallback: brochure/Box URL when no plan image.
+    assert prop.values.get("Floor Plan") == "https://app.box.com/shared/static/abc123.pdf"
+    assert not (prop.values.get("High Res Images") or "")
     skipped = [
         d
         for d in prop.link_diagnostics
@@ -224,6 +227,40 @@ def test_small_host_skips_box_pdf_before_fetch(monkeypatch):
     ]
     assert skipped
     assert any("≤1.2GB" in (i.message or "") for i in prop.issues)
+
+
+def test_small_host_skips_list_manage_preserves_email_floor_plan(monkeypatch):
+    """MetSpace: soft-skip list-manage→Drive; keep mcusercontent Floor Plan."""
+    monkeypatch.setattr(brochure, "_HOST_RAM_MB", 1024.0)
+    monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", False)
+    monkeypatch.setattr(brochure, "_rss_mb", lambda: 180.0)
+    fetched = []
+    plan = "https://mcusercontent.com/53e32083f03d0f8f854aea227/images/5df50ebd-470f-ceba-fa1f-aeb0ac63172f.jpg"
+    brochure_url = "https://us.list-manage.com/Q6gnhZazI8v?e=095cb98613"
+
+    def fetch(url, deadline=None):
+        fetched.append(url)
+        return BrochureResource(b"%PDF-1.4 drive", "application/pdf", url, url)
+
+    prop = Property.from_record(
+        normalize_record(
+            {
+                "Building": "9-10 Market Place",
+                "Property Postcode": "W1W 8AQ",
+                "Brochure PDF": brochure_url,
+                "Floor Plan": plan,
+            }
+        ),
+        "metspace.eml",
+        "MetSpace",
+        "rule:MetSpace",
+    )
+    brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
+    assert fetched == []
+    assert prop.values.get("Floor Plan") == plan
+    assert not (prop.values.get("High Res Images") or "")
+    assert prop.values.get("Brochure PDF") == brochure_url
+    assert any(d.status == "LINK_ENRICHMENT_SKIPPED" for d in prop.link_diagnostics)
 
 
 def test_high_memory_host_fetches_box_pdf_full_extract(monkeypatch):

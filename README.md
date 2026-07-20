@@ -416,10 +416,12 @@ handle that request. **Keep `--workers 1` on Railway/Render** — brochure
 PDF enrichment (UNION Box / Drive) is memory-heavy, and each worker has
 its own RSS. Prefer **≥2GB RAM** (4GB+ recommended) for UNION-style sheets
 with many unique Box PDFs. On Railway Hobby the plan memory max is often
-**1GB** — code auto-detects that and soft-skips Box/Drive PDF embeds before
-fetch (Brochure PDF links stay; High Res / Floor Plan embeds stay blank)
-so the worker does not SIGKILL. Upgrade the Railway plan to raise Memory
-above 1GB for full Union media. Keep `--workers 1` on Railway/Render.
+**1GB** — code auto-detects that and soft-skips Box/Drive/list-manage PDF
+embeds before fetch (Brochure PDF links stay; Floor Plan falls back to the
+brochure/document URL when no plan image exists; High Res stays blank without
+photos; MetSpace email Floor Plan images are preserved) so the worker does not
+SIGKILL. Upgrade the Railway plan to raise Memory to **≥2GB** (4GB+ recommended)
+for full Union/MetSpace Drive media. Keep `--workers 1` on Railway/Render.
 
 ## Adding a new source
 

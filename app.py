@@ -853,8 +853,8 @@ def _is_replaceable_viewer_url(url):
     UNION pre-fills Floor Plan with app.box.com/s/… (and sometimes
     /shared/static/….pdf) and Workplace Plus / MetSpace use Drive viewers —
     those block materialising a real plan bitmap unless overwritten here.
-    Brochure PDF keeps the document URL. When no bitmap exists, a direct
-    .pdf Floor Plan click-through may remain (see _clear_document_media_placeholders).
+    Brochure PDF keeps the document URL. When no bitmap exists, a document
+    click-through may remain (see _clear_document_media_placeholders).
     """
     text = str(url or "").strip()
     if not text:
@@ -873,6 +873,8 @@ def _is_replaceable_viewer_url(url):
     if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
         return True
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if "list-manage.com" in host:
         return True
     if path.endswith(".pdf") or "export=download" in query:
         return True
@@ -910,6 +912,35 @@ def _is_floor_plan_pdf_fallback_url(url):
     return True
 
 
+def _is_floor_plan_document_fallback_url(url):
+    """True for a keepable Floor Plan click-through when no plan image exists.
+
+    Includes dedicated website floorplan.pdf links and Box/Drive/Dropbox /
+    list-manage brochure shells kept after ≤1.2GB soft-skip.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return False
+    if _is_floor_plan_pdf_fallback_url(text):
+        return True
+    if "/api/download/" in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or parsed.netloc or "").lower()
+    if "box.com" in host:
+        return True
+    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
+        return True
+    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
+        return True
+    if "list-manage.com" in host:
+        return True
+    return False
+
+
 def _is_brochure_media_seed_url(url):
     """True for brochure/document URLs that must not remain as High Res/Floor Plan.
 
@@ -935,6 +966,8 @@ def _is_brochure_media_seed_url(url):
         return True
     if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
         return True
+    if "list-manage.com" in host:
+        return True
     if path.endswith(".pdf"):
         return True
     scheme = (parsed.scheme or "").lower()
@@ -944,12 +977,14 @@ def _is_brochure_media_seed_url(url):
 
 
 def _clear_document_media_placeholders(records):
-    """Strip brochure/document URLs from High Res; keep Floor Plan .pdf fallbacks.
+    """Strip brochure/document URLs from High Res; keep Floor Plan document fallbacks.
 
-    Brochure PDF is the only column that may keep Box/Drive viewer shells.
-    High Res must be a hosted image or gallery HTML (never a brochure PDF).
-    Floor Plan prefers a real plan image; when none exists, a dedicated
-    website/brochure floorplan.pdf click-through is kept rather than blanked.
+    Brochure PDF is the only column that may keep Box/Drive viewer shells as
+    the primary document link. High Res must be a hosted image or gallery HTML
+    (never a brochure PDF). Floor Plan prefers a real plan image; when none
+    exists, a dedicated website floorplan.pdf or Box/Drive/list-manage
+    brochure click-through is kept rather than blanked (≤1.2GB soft-skip).
+    Hosted plan images (e.g. MetSpace mcusercontent) are never cleared.
     """
     for record in records:
         high_res = str(record.get("High Res Images") or "").strip()
@@ -964,8 +999,8 @@ def _clear_document_media_placeholders(records):
                 )
             )
         floor_plan = str(record.get("Floor Plan") or "").strip()
-        if floor_plan and _is_floor_plan_pdf_fallback_url(floor_plan):
-            # Old-way fallback: dedicated floorplan.pdf when no bitmap was extracted.
+        if floor_plan and _is_floor_plan_document_fallback_url(floor_plan):
+            # Soft-skip / no-bitmap fallback: keep Box/Drive/list-manage/.pdf.
             continue
         if floor_plan and (
             _is_brochure_media_seed_url(floor_plan) or _is_replaceable_viewer_url(floor_plan)
