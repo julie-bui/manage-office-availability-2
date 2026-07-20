@@ -1558,12 +1558,12 @@ def test_enrichment_does_not_seed_high_res_with_box_document_when_budget_skips()
     for prop in props:
         assert not (prop.values.get("High Res Images") or ""), "High Res must stay blank when enrichment is skipped"
         assert "box.com" in (prop.values.get("Brochure PDF") or "")
-        # Parse-time Floor Plan seed may still be present until finalize clears it.
-        assert prop.values.get("Floor Plan")
+        # Soft-skip must not write document URLs into High Res. Pre-existing
+        # Floor Plan document seeds (if any) are cleared at finalize.
 
 
-def test_finalize_keeps_brochure_floor_plan_document_fallback(tmp_path):
-    """Box Floor Plan click-through survives finalize when no plan image exists."""
+def test_finalize_clears_brochure_floor_plan_document_fallback(tmp_path):
+    """Box Floor Plan click-through is cleared at finalize when no plan image exists."""
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     record = {
         "Building": "Example House",
@@ -1581,15 +1581,15 @@ def test_finalize_keeps_brochure_floor_plan_document_fallback(tmp_path):
             image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
         )
     assert not record.get("High Res Images")
-    assert record["Floor Plan"] == "https://app.box.com/s/examplebrochure"
+    assert not (record.get("Floor Plan") or "")
     assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
     statuses = {item.status for item in record["_link_diagnostics"]}
     assert "HIGH_RES_DOCUMENT_PLACEHOLDER_CLEARED" in statuses or "NO_IMAGES_DISCOVERED" in statuses
-    assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" not in statuses
+    assert "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED" in statuses
 
 
-def test_finalize_keeps_floorplan_pdf_fallback_when_no_bitmap(tmp_path):
-    """Dedicated website floorplan.pdf survives finalize when no plan image exists."""
+def test_finalize_clears_floorplan_pdf_when_no_bitmap(tmp_path):
+    """Dedicated website floorplan.pdf is cleared at finalize when no plan image exists."""
     plan_pdf = "https://cdn.property.test/media/level-2_2d-floorplans_a4.pdf"
     photo = "https://cdn.test/office.jpg"
     record = {
@@ -1607,13 +1607,17 @@ def test_finalize_keeps_floorplan_pdf_fallback_when_no_bitmap(tmp_path):
             "Example",
             image_validator=lambda url, cache=None: {"ok": True, "url": url, "status": "VALID_IMAGE", "content_hash": url},
         )
-    assert record["Floor Plan"] == plan_pdf
+    assert not (record.get("Floor Plan") or "")
     assert record["High Res Images"] == photo
     # High Res must still never keep a brochure PDF seed.
     assert not app_module._is_brochure_media_seed_url(record["High Res Images"])
+    assert any(
+        item.status == "FLOOR_PLAN_DOCUMENT_PLACEHOLDER_CLEARED"
+        for item in record["_link_diagnostics"]
+    )
 
 
-def test_finalize_keeps_brochure_floor_plan_when_photo_replaces_high_res(tmp_path):
+def test_finalize_clears_brochure_floor_plan_when_photo_replaces_high_res(tmp_path):
     seed = "https://app.box.com/shared/static/examplebrochure.pdf"
     photo = "https://cdn.test/office.jpg"
     record = {
@@ -1634,8 +1638,8 @@ def test_finalize_keeps_brochure_floor_plan_when_photo_replaces_high_res(tmp_pat
         )
     assert record["High Res Images"] == photo
     assert "box.com" not in (record.get("High Res Images") or "")
-    # Floor Plan keeps the brochure click-through when no plan image exists.
-    assert record.get("Floor Plan") == "https://app.box.com/s/examplebrochure"
+    # Floor Plan document click-through is cleared; Brochure PDF keeps the link.
+    assert not (record.get("Floor Plan") or "")
     assert record["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
 
 

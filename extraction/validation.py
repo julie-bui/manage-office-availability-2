@@ -118,15 +118,13 @@ def validate_property(prop: Property) -> Property:
         prop.add_issue(issue)
 
     if brochure and floorplan and normalize_url(str(brochure)) == normalize_url(str(floorplan)):
-        # Soft-skip / no-bitmap path intentionally reuses the brochure URL as a
-        # Floor Plan click-through — info only, not a hard conflict.
         prop.add_issue(
             ValidationIssue(
                 "Floor Plan",
-                "Floor plan currently matches the brochure URL (document click-through fallback).",
-                Severity.INFO,
+                "Floor plan URL duplicates the brochure URL.",
+                Severity.ERROR,
                 floorplan,
-                "Upgrade host memory to ≥2GB to extract a real floor-plan image from the PDF when available.",
+                "Floor Plan must be a hosted plan image; Brochure PDF holds the document link.",
                 "brochure_enrichment",
             )
         )

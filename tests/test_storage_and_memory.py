@@ -217,8 +217,8 @@ def test_small_host_skips_box_pdf_before_fetch(monkeypatch):
     brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
     assert fetched == []
     assert prop.values.get("Brochure PDF") == "https://app.box.com/shared/static/abc123.pdf"
-    # Soft-skip Floor Plan fallback: brochure/Box URL when no plan image.
-    assert prop.values.get("Floor Plan") == "https://app.box.com/shared/static/abc123.pdf"
+    # Soft-skip must not seed Floor Plan with brochure/Box document URLs.
+    assert not (prop.values.get("Floor Plan") or "")
     assert not (prop.values.get("High Res Images") or "")
     skipped = [
         d
@@ -380,8 +380,8 @@ def test_small_host_keeps_html_gallery_skips_nested_pdf(monkeypatch):
     brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
     assert fetched == ["https://property.test/listing"]
     assert len(prop.values.get("_high_res_candidates") or []) >= 5
-    # Soft-skip nested PDFs on 1GB, but still assign the HTML floorplan.pdf link.
-    assert prop.values.get("Floor Plan") == "https://cdn.property.test/floorplan.pdf"
+    # Soft-skip nested PDFs on 1GB; Floor Plan stays blank without a plan image.
+    assert not (prop.values.get("Floor Plan") or "")
 
 
 def test_small_host_follows_floorplan_modal_for_plan_image(monkeypatch):
@@ -565,8 +565,8 @@ def test_small_host_direct_floorplan_image_on_html(monkeypatch):
     assert prop.values.get("Brochure PDF") == brochure_pdf
 
 
-def test_floorplan_pdf_fallback_when_no_bitmap(monkeypatch):
-    """When no plan bitmap is extracted, Floor Plan keeps the website floorplan.pdf."""
+def test_floorplan_pdf_not_seeded_when_no_bitmap(monkeypatch):
+    """When no plan bitmap is extracted, Floor Plan stays blank (PDF is not a fallback)."""
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
     monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)
     monkeypatch.setattr(brochure, "_ENRICHMENT_PARALLEL_RSS_MB", 2800.0)
@@ -639,8 +639,7 @@ def test_floorplan_pdf_fallback_when_no_bitmap(monkeypatch):
         "rule:GPE",
     )
     brochure.enrich_properties([prop], fetcher=fetch, extractor=brochure.extract_brochure)
-    assert prop.values.get("Floor Plan") == plan_pdf
-    # PDF seed must not count as finished — nested brochure still hunted.
+    assert not (prop.values.get("Floor Plan") or "")
     assert not brochure._floor_plan_already_seeded(prop)
 
 
@@ -892,11 +891,11 @@ def test_floorplan_pdf_link_on_page_still_fetches_nested_brochure_for_bitmap(mon
 
     Confirmed real (GPE 2026-07): property pages expose *floorplans*.pdf
     assets. Counting them as has_floorplan_seed skipped the nested brochure
-    bitmap extract. PDF links may still be kept as a Floor Plan click-through
-    fallback when no bitmap is produced (see test_floorplan_pdf_fallback_*).
+    bitmap extract. PDF links are never Floor Plan cell values — only hosted
+    plan images are.
 
     Requires ≥2GB host (high-memory path). On Railway 1GB this nested PDF
-    path soft-skips before fetch — Floor Plan still gets the HTML pdf link.
+    path soft-skips before fetch — Floor Plan stays blank without a bitmap.
     """
     monkeypatch.setattr(brochure, "_HOST_RAM_MB", 4096.0)
     monkeypatch.setattr(brochure, "_ENRICHMENT_HIGH_MEMORY", True)

@@ -45,7 +45,7 @@ def test_union_floor_plan_labeled_box_links_fill_brochure():
         if "155 Fenchurch" in r["Building"] and r["Floor/Unit"] == "7th"
     )
     assert fenchurch["Brochure PDF"].startswith("https://app.box.com/s/")
-    assert fenchurch["Floor Plan"].startswith("https://app.box.com/s/")
+    assert not (fenchurch.get("Floor Plan") or "")
     broadgate = next(
         r for r in (normalize_record(x) for x in records)
         if r["Building"] == "Broadgate Tower"
@@ -53,6 +53,7 @@ def test_union_floor_plan_labeled_box_links_fill_brochure():
         and "split" not in str(r["Floor/Unit"]).lower()
     )
     assert broadgate["Brochure PDF"].startswith("https://app.box.com/s/")
+    assert not (broadgate.get("Floor Plan") or "")
     blank = [normalize_record(r) for r in records if not r.get("Brochure PDF")]
     # The only known source row without a hyperlink at all is "100 Lower
     # Thames Street"; everything else must have a Brochure PDF.

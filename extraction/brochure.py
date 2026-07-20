@@ -880,11 +880,11 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     """True when Floor Plan still points at a document/viewer rather than a bitmap.
 
     Box/Drive/Dropbox/.pdf placeholders must not count as a *finished* Floor
-    Plan for nested bitmap hunting. Dedicated .pdf links may still be kept as
-    a click-through fallback when no hosted plan image was extracted.
-    CMS floor-plan modal HTML endpoints are also unfinished — follow them to
-    resolve the hosted plan image/PDF. Mailchimp list-manage brochure
-    trackers (MetSpace → Drive) are unfinished document shells too.
+    Plan for nested bitmap hunting, and must not remain in the Floor Plan
+    cell after finalize (Brochure PDF keeps the document link). CMS
+    floor-plan modal HTML endpoints are also unfinished — follow them to
+    resolve the hosted plan image. Mailchimp list-manage brochure trackers
+    (MetSpace → Drive) are unfinished document shells too.
     """
     text = str(url or "").strip()
     if not text or "/api/download/" in text:
@@ -913,44 +913,9 @@ def _is_viewer_floorplan_url(url: str) -> bool:
     return False
 
 
-def _is_floor_plan_pdf_fallback_url(url: str) -> bool:
-    """True for a keepable .pdf Floor Plan click-through when no bitmap exists.
-
-    Dedicated *floorplan*.pdf links and other landlord/website PDFs qualify.
-    Box/Drive/Dropbox brochure shells do not — those stay Brochure PDF only.
-    """
-    text = str(url or "").strip()
-    if not text or "/api/download/" in text:
-        return False
-    try:
-        parsed = urlparse(text)
-    except ValueError:
-        return False
-    path = (parsed.path or "").lower()
-    if not path.endswith(".pdf"):
-        return False
-    if _looks_like_floorplan_ref(text):
-        return True
-    host = (parsed.hostname or "").lower()
-    if _is_box_host(host):
-        return False
-    if host in {"drive.google.com", "docs.google.com"} or host.endswith("drive.usercontent.google.com"):
-        return False
-    if "dropbox.com" in host or host.endswith("dropboxusercontent.com"):
-        return False
-    return True
-
-
 def _shareable_floor_plan_value(values) -> str:
-    """Bitmap Floor Plan, or a .pdf click-through fallback — not Box/Drive shells."""
-    plan = str(values.get("Floor Plan") or "").strip()
-    if not plan:
-        return ""
-    if not _is_viewer_floorplan_url(plan):
-        return plan
-    if _is_floor_plan_pdf_fallback_url(plan):
-        return plan
-    return ""
+    """Hosted/bitmap Floor Plan only — never PDF/Box/Drive document shells."""
+    return _usable_floor_plan_value(values)
 
 
 def _hosted_document_candidates(soup, source_document: str, raw_html: bytes = None) -> List[AssetCandidate]:
@@ -1756,49 +1721,15 @@ def _promote_brochure_pdf_cell(prop: Property, extraction: BrochureExtraction) -
 
 
 def _seed_high_res_fallback(prop: Property, brochure_url: str) -> None:
-    """No-op for High Res; seed Floor Plan document click-through on soft-skip.
+    """No-op: High Res and Floor Plan stay blank without extracted media.
 
-    High Res cells stay blank without extracted photos (never put a
-    Box/Drive/brochure PDF into High Res). Floor Plan gets the brochure /
-    Box / Drive / list-manage URL when no hosted plan image exists so the
-    cell stays clickable after ≤1.2GB soft-skip. MetSpace email
-    mcusercontent Floor Plan images are preserved.
+    Soft-skip / budget-skip still preserves Brochure PDF. Never seed Floor
+    Plan with Box/Drive/brochure document URLs — Floor Plan is hosted plan
+    images (JPG/PNG) only. MetSpace email mcusercontent Floor Plan images
+    already on the row are left untouched because this function does not
+    write Floor Plan at all.
     """
-    _seed_floor_plan_document_fallback(prop, brochure_url)
-
-
-def _seed_floor_plan_document_fallback(prop: Property, brochure_url: str) -> None:
-    """Set Floor Plan to the brochure/document URL when no plan image exists.
-
-    Shared soft-skip / budget-skip path for all providers. Never overwrites a
-    hosted plan image (e.g. MetSpace mcusercontent) or a keepable website
-    floorplan.pdf fallback.
-    """
-    url = str(brochure_url or "").strip()
-    if not url:
-        return
-    existing = str(prop.values.get("Floor Plan") or "").strip()
-    if existing:
-        # Keep real plan images and dedicated website floorplan.pdf links.
-        if not _is_viewer_floorplan_url(existing):
-            return
-        if _is_floor_plan_pdf_fallback_url(existing):
-            return
-    prop.values["Floor Plan"] = url
-    try:
-        _record_diagnostic(
-            prop,
-            "FLOOR_PLAN_DOCUMENT_FALLBACK",
-            url,
-            detail=(
-                "Floor Plan set to brochure/document URL because PDF embed "
-                "extraction was skipped or produced no plan image. Upgrade "
-                "host memory to ≥2GB (4GB+ recommended) for real Floor Plan "
-                "bitmaps and High Res embeds from Box/Drive PDFs."
-            ),
-        )
-    except Exception:
-        pass
+    return
 
 
 def _floor_plan_already_seeded(prop: Property) -> bool:
@@ -1865,8 +1796,8 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
     only finish the first few unique brochure URLs before the deadline —
     without this, the bottom half of the sheet stays on a single featured
     email image even though a sibling floor already has a full gallery.
-    Also copies a real Floor Plan (hosted image or .pdf fallback) when siblings
-    still have a Box/Drive viewer placeholder or blank cell.
+    Also copies a real hosted Floor Plan image when siblings still have a
+    Box/Drive viewer placeholder or blank cell.
     """
     by_building = defaultdict(list)
     for prop in properties:
@@ -1918,11 +1849,9 @@ def _share_underfilled_building_photos(properties: List[Property]) -> None:
                     )[:_SOFT_MAX_EMBEDDED_PHOTOS]
             sibling_plan = str(prop.values.get("Floor Plan") or "").strip()
             sibling_shareable = _shareable_floor_plan_value(prop.values)
-            donor_is_image = bool(donor_plan) and not _is_viewer_floorplan_url(donor_plan)
             if donor_plan and (
                 not sibling_plan
                 or (not sibling_shareable and _is_viewer_floorplan_url(sibling_plan))
-                or (donor_is_image and _is_floor_plan_pdf_fallback_url(sibling_plan))
             ):
                 prop.values["Floor Plan"] = donor_plan
 
@@ -2032,9 +1961,9 @@ def enrich_properties(
 
     # Dual-path memory policy (Railway Hobby is often capped at 1GB):
     # ≤1.2GB → soft-skip Box/Drive/Dropbox/list-manage PDF embeds BEFORE fetch
-    # so the worker survives; Brochure PDF links stay; Floor Plan falls back
-    # to the brochure/document URL when no plan image exists; High Res stays
-    # blank without photos. HTML galleries still run.
+    # so the worker survives; Brochure PDF links stay; Floor Plan / High Res
+    # stay blank without extracted images (never seed document URLs into
+    # those columns). HTML galleries and light floorplan HTML still run.
     # ≥2GB (or ENRICHMENT_HIGH_MEMORY=1) → full nested PDF / floor-plan embeds.
     if _skip_heavy_pdf_embeds():
         kept = []
@@ -2042,10 +1971,10 @@ def enrich_properties(
         detail = (
             f"Skipped PDF embed download on small host "
             f"(host_ram={_HOST_RAM_MB:.0f} MiB ≤ {_SMALL_HOST_RAM_MB:.0f} MiB). "
-            f"Brochure PDF link preserved; Floor Plan falls back to the "
-            f"document URL when no plan image exists; High Res stays blank. "
-            f"Upgrade Railway memory to ≥2GB (4GB+ recommended) for Union / "
-            f"MetSpace Drive floor-plan bitmaps and High Res embeds."
+            f"Brochure PDF link preserved; Floor Plan and High Res stay blank "
+            f"without extracted images. Upgrade Railway memory to ≥2GB "
+            f"(4GB+ recommended) for Union / MetSpace Drive floor-plan "
+            f"bitmaps and High Res embeds."
         )
         for brochure_url in pending:
             if _is_hosted_document_download(brochure_url):
@@ -2062,7 +1991,7 @@ def enrich_properties(
                             "Linked PDF embed extraction was skipped because this host has ≤1.2GB RAM.",
                             Severity.INFO,
                             brochure_url,
-                            "Upgrade the Railway plan/memory to ≥2GB (4GB+ for Union) to extract floor plans and High Res from Box/Drive PDFs. Floor Plan may show the brochure link as a click-through fallback.",
+                            "Upgrade the Railway plan/memory to ≥2GB (4GB+ for Union) to extract floor plans and High Res from Box/Drive PDFs.",
                             "linked_source_enrichment",
                         )
                     )
@@ -2485,11 +2414,11 @@ def _retrieve(
             if len(documents) >= 2:
                 break
     # Dedicated *floorplan*.pdf links and light floorplan HTML/modal endpoints
-    # on the property page are not finished Floor Plan cell values, but they
-    # are excellent nested sources for a plan bitmap / click-through when the
-    # brochure pull is thin — follow them alongside Download brochure.
+    # on the property page are not Floor Plan cell values (images only), but
+    # they are excellent nested sources for a plan bitmap when the brochure
+    # pull is thin — follow them alongside Download brochure.
     # Soft-skip still follows lightweight floorplan HTML endpoints (any CMS)
-    # and keeps *floorplans*.pdf as a Floor Plan click-through fallback in _merge.
+    # so hosted plan jpg/png can be resolved without fetching heavy PDFs.
     if need_nested_plans:
         for asset in combined.assets:
             if asset.classification != AssetType.FLOORPLAN or not asset.url:
@@ -2690,9 +2619,8 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
     property_images = [
         a.url for a in prop.assets if a.classification == AssetType.PROPERTY_IMAGE and a.url
     ][:_MAX_PROPERTY_IMAGES]
-    # Prefer hosted/bitmap Floor Plan URLs. Fall back to dedicated .pdf plan
-    # links when nested bitmap extract soft-skipped or failed — never treat
-    # those PDFs as finished for has_floorplan_seed.
+    # Prefer hosted/bitmap Floor Plan URLs only — never seed .pdf / Box /
+    # Drive document URLs into Floor Plan (Brochure PDF holds those).
     image_floorplans = [
         a.url
         for a in prop.assets
@@ -2700,31 +2628,12 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
         and a.url
         and not _is_viewer_floorplan_url(a.url)
     ]
-    brochure_norm = normalize_url(str(prop.values.get("Brochure PDF") or "")) or ""
-
-    def _pdf_plan_rank(url: str) -> tuple:
-        low = (url or "").lower()
-        named = 0 if any(token in low for token in ("floorplan", "floor-plan", "floor_plan", "floor plan")) else 1
-        return (named, low)
-
-    pdf_floorplan_fallbacks = sorted(
-        {
-            a.url
-            for a in prop.assets
-            if a.classification == AssetType.FLOORPLAN
-            and a.url
-            and _is_floor_plan_pdf_fallback_url(a.url)
-            and (normalize_url(a.url) or a.url) != brochure_norm
-        },
-        key=_pdf_plan_rank,
-    )
     has_embedded_plan = any(
         a.classification == AssetType.FLOORPLAN and a.content
         for a in (prop.values.get("_brochure_embedded_assets") or [])
     )
     existing_images = str(prop.values.get("High Res Images") or "")
-    # Brochure/PDF seeds are click-through fallbacks, not photos — real
-    # property images must replace them (UNION High Res coverage path).
+    # Brochure/PDF seeds are not photos — real property images must replace them.
     if _is_brochure_media_seed_url(existing_images):
         existing_images = ""
         prop.values["High Res Images"] = ""
@@ -2766,14 +2675,10 @@ def _merge(prop: Property, extraction: BrochureExtraction) -> None:
             # Primary xlsx_links often pre-fills Box/Drive viewer URLs at
             # confidence 1.0 — still replace them with a real plan asset URL.
             _set_value(prop, "Floor Plan", plan_evidence)
-    elif not has_embedded_plan and pdf_floorplan_fallbacks:
-        # No bitmap URL and no embedded plan bytes — keep website floorplan.pdf
-        # (or similar) so the cell is not blank after soft-skip / extract fail.
-        plan_evidence = _evidence(pdf_floorplan_fallbacks[0], extraction.source_document, 0.75)
-        if not existing_plan:
-            _apply(prop, "Floor Plan", plan_evidence)
-        elif _is_viewer_floorplan_url(existing_plan) and not _is_floor_plan_pdf_fallback_url(existing_plan):
-            _set_value(prop, "Floor Plan", plan_evidence)
+    elif existing_plan and _is_viewer_floorplan_url(existing_plan) and not has_embedded_plan:
+        # No bitmap URL and no embedded plan bytes — clear document/viewer
+        # placeholders so Floor Plan stays blank (Brochure PDF retains the link).
+        prop.values["Floor Plan"] = ""
     # Building-level text fills (contacts, features, term, postcode, …).
     for field, evidence in extraction.fields.items():
         if field in _UNIT_SPECIFIC_FIELDS or field in _ADDRESS_LOCKED_FIELDS:

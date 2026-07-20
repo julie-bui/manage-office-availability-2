@@ -781,17 +781,17 @@ def check_xlsx_links_for_llm_fallback(failures):
 
     local_failures = []
     expected = [
-        ("Brochure PDF", "https://example.com/107-4th", "https://example.com/107-4th"),
-        ("Brochure PDF", "https://example.com/107-1st", "https://example.com/107-1st"),
-        # FLOOR PLAN-labeled landlord links fill Floor Plan AND Brochure PDF
-        # (shared xlsx_links.associate_row_links dual-fill).
-        ("Floor Plan", "https://example.com/155-plan", "https://example.com/155-plan"),
-        ("Brochure PDF", "https://example.com/nexus", "https://example.com/nexus"),
+        ("Brochure PDF", "https://example.com/107-4th", None),
+        ("Brochure PDF", "https://example.com/107-1st", None),
+        # FLOOR PLAN-labeled landlord document links fill Brochure PDF only
+        # (Floor Plan is hosted plan images only).
+        ("Brochure PDF", "https://example.com/155-plan", None),
+        ("Brochure PDF", "https://example.com/nexus", None),
         (None, None, None),
         (
             "Brochure PDF",
             "https://www.theworkplacecompany.co.uk/offices-to-rent/london/1-valentine-place",
-            "https://www.theworkplacecompany.co.uk/offices-to-rent/london/1-valentine-place",
+            None,
         ),
     ]
     for record, (field, url, also_floor_or_brochure) in zip(records, expected):
@@ -804,9 +804,13 @@ def check_xlsx_links_for_llm_fallback(failures):
             continue
         if record.get(field) != url:
             local_failures.append(f"{record['Building']!r} ({record['Floor/Unit']}): expected {field} {url!r}, got {record.get(field)!r}")
+        # Document/brochure links must not seed Floor Plan.
+        if field == "Brochure PDF" and (record.get("Floor Plan") or ""):
+            local_failures.append(
+                f"{record['Building']!r} ({record['Floor/Unit']}): Floor Plan must stay blank for "
+                f"document brochure seeds, got {record.get('Floor Plan')!r}"
+            )
         if also_floor_or_brochure is not None:
-            # Brochure-only rows now also seed Floor Plan with the same
-            # replaceable viewer URL; FLOOR PLAN-labeled rows dual-fill Brochure.
             if field == "Floor Plan":
                 if record.get("Brochure PDF") != also_floor_or_brochure:
                     local_failures.append(
@@ -821,9 +825,9 @@ def check_xlsx_links_for_llm_fallback(failures):
 
     if not local_failures:
         print(
-            "OK  xlsx_links: 2 same-building rows each get their OWN link, a floor-plan link dual-fills "
-            "Brochure PDF, a real double-space mismatch resolved, a linkless row left blank, a Canva "
-            "candidate skipped in favor of the real company domain"
+            "OK  xlsx_links: 2 same-building rows each get their OWN link, a floor-plan document link "
+            "fills Brochure PDF only, a real double-space mismatch resolved, a linkless row left blank, "
+            "a Canva candidate skipped in favor of the real company domain"
         )
     failures.extend(local_failures)
 

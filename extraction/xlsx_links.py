@@ -20,7 +20,7 @@ fetches the landlord PDF. That dual-fill lives here so dedicated rules
 """
 import re
 
-from .html_images import is_floorplan_link, is_low_trust_link_domain
+from .html_images import is_floorplan_link, is_image_like_url, is_low_trust_link_domain
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -42,11 +42,11 @@ def associate_row_links(links):
 
     Returns (floorplan_url_or_None, brochure_url_or_None).
 
-    Floor-plan-labeled cells still populate Floor Plan, and their URL is
-    ALSO a Brochure PDF candidate — hosts often put the only landlord
-    PDF behind "FLOOR PLAN" with no separate brochure label. Other
-    hyperlinks (CLICK HERE, Landlord Brochure, Website, …) are brochure
-    candidates regardless of display text: a per-row spreadsheet link
+    Floor-plan-labeled cells populate Floor Plan only when the URL looks like
+    a hosted image; their URL is ALWAYS a Brochure PDF candidate — hosts often
+    put the only landlord PDF behind "FLOOR PLAN" with no separate brochure
+    label. Other hyperlinks (CLICK HERE, Landlord Brochure, Website, …) are
+    brochure candidates regardless of display text: a per-row spreadsheet link
     column has little of the unrelated-link noise that email bodies have.
 
     When several brochure candidates exist, prefer domains that are not
@@ -59,7 +59,7 @@ def associate_row_links(links):
         if not url:
             continue
         if is_floorplan_link(display_text):
-            if floorplan_url is None:
+            if floorplan_url is None and is_image_like_url(url):
                 floorplan_url = url
             brochure_candidates.append(url)
         else:
@@ -122,11 +122,8 @@ def enrich_records(records, row_links):
             record["Floor Plan"] = floorplan_url
         if brochure_url and not record.get("Brochure PDF"):
             record["Brochure PDF"] = brochure_url
-        # Same replaceable-viewer Floor Plan seed as the UNION rule: a
-        # brochure-only row still gets a Floor Plan cell that enrichment
-        # can overwrite with a real plan image.
-        if brochure_url and not record.get("Floor Plan"):
-            record["Floor Plan"] = brochure_url
+        # Floor Plan is hosted plan images only — never seed brochure/Box
+        # document URLs into Floor Plan (Brochure PDF holds those).
 
 
 def _best_brochure_candidate(urls):

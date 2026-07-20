@@ -291,10 +291,11 @@ def _collect(html_items, building=""):
                     images.append(b)
         elif kind == "link":
             if floorplan_url is None and is_floorplan_link(a):
-                floorplan_url = b
-                # Document-style floor-plan links (Box/Drive shares) dual-fill
-                # Brochure PDF; pixel-classified floorplan *images* do not.
-                if is_brochure_link(a, b) or _DOCUMENT_URL_RE.search(b or "") or not is_image_like_url(b):
+                # Hosted plan images only in Floor Plan; document-style
+                # floor-plan links (Box/Drive/.pdf) dual-fill Brochure PDF.
+                if is_image_like_url(b):
+                    floorplan_url = b
+                elif is_brochure_link(a, b) or _DOCUMENT_URL_RE.search(b or "") or not is_image_like_url(b):
                     seed_candidates.insert(0, b)
             elif brochure_url is None and is_brochure_link(a, b):
                 brochure_url = b

@@ -19,12 +19,15 @@ from extraction.models import AssetCandidate, AssetType
 from extraction.xlsx_links import associate_row_links, enrich_records as enrich_xlsx
 
 
-def test_xlsx_floor_plan_label_dual_fills_brochure_without_provider_rule():
-    """Hidden 'FLOOR PLAN' hyperlinks seed Brochure PDF via shared helper."""
+def test_xlsx_floor_plan_label_fills_brochure_without_provider_rule():
+    """Hidden 'FLOOR PLAN' hyperlinks seed Brochure PDF via shared helper.
+
+    Document/viewer URLs must not populate Floor Plan (images only).
+    """
     floorplan, brochure = associate_row_links(
         [("FLOOR PLAN", "https://files.example.test/s/landlord-share")]
     )
-    assert floorplan == "https://files.example.test/s/landlord-share"
+    assert floorplan is None
     assert brochure == "https://files.example.test/s/landlord-share"
 
     click_floor, click_brochure = associate_row_links(
@@ -45,7 +48,7 @@ def test_xlsx_floor_plan_label_dual_fills_brochure_without_provider_rule():
             }
         ],
     )
-    assert records[0]["Floor Plan"] == "https://files.example.test/s/row-share"
+    assert not (records[0].get("Floor Plan") or "")
     assert records[0]["Brochure PDF"] == "https://files.example.test/s/row-share"
 
     click_records = [
@@ -60,9 +63,9 @@ def test_xlsx_floor_plan_label_dual_fills_brochure_without_provider_rule():
             }
         ],
     )
-    # Brochure-only rows seed Floor Plan with the same replaceable viewer URL.
+    # Brochure-only rows keep Brochure PDF; Floor Plan stays blank without a plan image.
     assert click_records[0]["Brochure PDF"] == "https://files.example.test/s/click-only"
-    assert click_records[0]["Floor Plan"] == "https://files.example.test/s/click-only"
+    assert not (click_records[0].get("Floor Plan") or "")
 
 
 def test_html_sparse_photo_seeds_brochure_from_listing_cta():
@@ -104,7 +107,7 @@ def test_html_building_name_anchor_seeds_brochure_when_label_is_not_brochure():
     assert records[0]["Brochure PDF"] == "https://drive.example.test/viewer/abc"
 
 
-def test_html_floor_plan_document_link_dual_fills_brochure_not_image_url():
+def test_html_floor_plan_document_link_fills_brochure_not_floor_plan():
     html_items = [
         ("image", "", "https://cdn.example.test/photos/reception.jpg"),
         ("link", "FLOOR PLAN", "https://app.box.com/s/abc123share"),
@@ -118,8 +121,8 @@ def test_html_floor_plan_document_link_dual_fills_brochure_not_image_url():
         enrich_records(records, html_items)
     finally:
         html_images.is_floorplan_image_url = original
-    assert records[0]["Floor Plan"] == "https://app.box.com/s/abc123share"
     assert records[0]["Brochure PDF"] == "https://app.box.com/s/abc123share"
+    assert not (records[0].get("Floor Plan") or "")
 
 
 def test_image_like_urls_without_extension_and_unknown_cdn_hosts():

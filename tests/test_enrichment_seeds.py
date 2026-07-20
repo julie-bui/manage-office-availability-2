@@ -170,7 +170,7 @@ def test_resolve_source_date_reads_filename_month_day():
     )
 
 
-def test_union_seeds_floor_plan_from_brochure_click_here():
+def test_union_does_not_seed_floor_plan_from_brochure_click_here():
     content = {
         "filename": "UNION - Availability - June 26 - City.xlsx",
         "sheet_names": ["City"],
@@ -190,4 +190,4 @@ def test_union_seeds_floor_plan_from_brochure_click_here():
     }
     records = union.parse(content)
     assert records[0]["Brochure PDF"] == "https://app.box.com/s/examplebrochure"
-    assert records[0]["Floor Plan"] == "https://app.box.com/s/examplebrochure"
+    assert not (records[0].get("Floor Plan") or "")
