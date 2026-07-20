@@ -272,15 +272,26 @@ def evaluate_image_bytes(payload: bytes, url: str = "", content_type: str = "") 
     """Shared decode/size/blank checks for remote validation and local batch assets."""
     if not payload:
         return {"ok": False, "status": "IMAGE_BLANK_OR_EMPTY", "url": url, "content_hash": image_content_hash(b"")}
+    # Cap before decode. Oversize listing photos (confirmed real: Knotel
+    # Directus hero JPEGs > 8MB) arrive via Range as a truncated prefix —
+    # still decode that prefix rather than rejecting as IMAGE_TOO_LARGE /
+    # NOT_AN_IMAGE and blanking High Res.
     if len(payload) > MAX_VALIDATION_BYTES:
-        return {"ok": False, "status": "IMAGE_TOO_LARGE", "url": url}
+        payload = payload[:MAX_VALIDATION_BYTES]
     content_hash = image_content_hash(payload)
     try:
-        from PIL import Image
+        from PIL import Image, ImageFile
 
-        with Image.open(BytesIO(payload)) as image:
-            width, height = image.size
-            image.load()
+        # Truncated Range responses of otherwise-valid JPEGs must still
+        # yield dimensions for High Res validation (see Knotel Noel Street).
+        previous_truncated = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                width, height = image.size
+                image.load()
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = previous_truncated
     except Exception as exc:
         return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "detail": str(exc), "content_hash": content_hash}
     if width < MIN_PROPERTY_IMAGE_WIDTH or height < MIN_PROPERTY_IMAGE_HEIGHT:
@@ -355,9 +366,13 @@ def _fetch_and_evaluate(url: str, timeout: float, requester: Callable) -> dict:
     else:
         payload = response.content
     if len(payload) > MAX_VALIDATION_BYTES:
-        return {"ok": False, "status": "IMAGE_TOO_LARGE", "url": url}
-    if not content_type.startswith("image/"):
-        return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "content_type": content_type}
+        payload = payload[:MAX_VALIDATION_BYTES]
+    # Prefer magic/decode over Content-Type alone — some CDNs omit image/*
+    # or return octet-stream for /assets/{uuid} photos.
+    if content_type and not content_type.startswith("image/"):
+        magic_ok = payload[:3] == b"\xff\xd8\xff" or payload[:8] == b"\x89PNG\r\n\x1a\n" or payload[:4] == b"RIFF"
+        if not magic_ok:
+            return {"ok": False, "status": "NOT_AN_IMAGE", "url": url, "content_type": content_type}
     final_url = normalize_url(response.url or url) or url
     result = evaluate_image_bytes(payload, url=final_url, content_type=content_type)
     result["unstable"] = bool(_UNSTABLE_RE.search(response.url or url))

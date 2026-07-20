@@ -1028,6 +1028,91 @@ def test_soft_accept_does_not_pad_gallery_with_dead_urls(tmp_path):
     assert record["_high_res_image_count"] == 1
 
 
+def test_oversized_jpeg_truncated_prefix_still_validates():
+    """Knotel Directus heroes can exceed MAX_VALIDATION_BYTES; a truncated
+    Range prefix must still decode as a valid property photo, not NOT_AN_IMAGE.
+    """
+    from extraction.assets import MAX_VALIDATION_BYTES
+
+    # Build a JPEG larger than the validation cap by tiling a photo.
+    tile = image_bytes((1600, 1200))
+    huge = tile
+    while len(huge) <= MAX_VALIDATION_BYTES:
+        # Re-encode a larger canvas so the file itself exceeds the cap.
+        big = Image.new("RGB", (4000, 3000), (30, 40, 50))
+        pixels = big.load()
+        for y in range(0, 3000, 3):
+            for x in range(0, 4000, 3):
+                pixels[x, y] = ((x * 7) % 256, (y * 11) % 256, (x + y) % 256)
+        buf = BytesIO()
+        big.save(buf, format="JPEG", quality=95)
+        huge = buf.getvalue()
+        if len(huge) > MAX_VALIDATION_BYTES:
+            break
+    assert len(huge) > MAX_VALIDATION_BYTES
+    truncated = huge[:MAX_VALIDATION_BYTES]
+    # Without truncated-load tolerance this used to be NOT_AN_IMAGE and
+    # blanked Knotel High Res for Noel Street.
+    result = evaluate_image_bytes(
+        truncated,
+        url="https://knotel.directus.app/assets/54997ba3-d568-4c00-bcd7-aa8c182500c2",
+        content_type="image/jpeg",
+    )
+    assert result["ok"] is True
+    assert result["status"] == "VALID_IMAGE"
+    assert result["width"] >= 320 and result["height"] >= 200
+
+
+def test_finalize_soft_accepts_source_directus_when_validator_says_not_an_image(tmp_path):
+    """Featured Directus /assets URLs must soft-accept, not blank High Res."""
+    source = "https://knotel.directus.app/assets/54997ba3-d568-4c00-bcd7-aa8c182500c2"
+    record = {
+        "Building": "Noel Street, Waverley House 7-12 Noel St, London W1F 8GQ",
+        "Floor/Unit": "7th Floor",
+        "High Res Images": source,
+        "_source_high_res_candidates": [source],
+        "_high_res_candidates": [source],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Knotel",
+            image_validator=lambda *_a, **_k: {
+                "ok": False,
+                "status": "NOT_AN_IMAGE",
+                "detail": "image file is truncated",
+            },
+        )
+    assert record["High Res Images"] == source
+    assert record["_high_res_image_count"] >= 1
+
+
+def test_finalize_keeps_last_good_photo_when_all_candidates_rejected(tmp_path):
+    """Even non-source brochure candidates that all reject must not erase a
+    pre-existing image-like High Res URL."""
+    featured = "https://cdn.property.test/media/featured-office.jpg"
+    record = {
+        "Building": "Lone Floor House",
+        "High Res Images": featured,
+        "_high_res_candidates": [
+            "https://cdn.property.test/media/extra1.jpg",
+            "https://cdn.property.test/media/extra2.jpg",
+        ],
+    }
+    with app_module.app.test_request_context("/process", base_url="https://service.test"):
+        app_module._finalize_high_res_images(
+            [record],
+            tmp_path,
+            "batch",
+            "Example",
+            image_validator=lambda *_a, **_k: {"ok": False, "status": "NOT_AN_IMAGE"},
+        )
+    assert record["High Res Images"] == featured
+    assert record["_high_res_image_count"] == 1
+
+
 def test_materialize_reclassifies_floorplan_bitmap_out_of_high_res(tmp_path):
     # Near-white diagram should be treated as Floor Plan, not High Res.
     plan = Image.new("RGB", (800, 600), (250, 250, 250))

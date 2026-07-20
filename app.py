@@ -1112,16 +1112,31 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
                     if deadline is not None:
                         validator_kwargs["deadline"] = deadline
                     result = image_validator(candidate, **validator_kwargs)
+                    # Hard rejects are visually-wrong assets. NOT_AN_IMAGE /
+                    # IMAGE_TOO_LARGE still soft-accept when the URL itself is
+                    # image-like (Directus /assets/{uuid}): confirmed real
+                    # Knotel Noel Street — >8MB hero JPEG truncated by the
+                    # validation Range cap and previously blanked High Res.
                     hard_reject = {
                         "IMAGE_BLANK_OR_EMPTY",
                         "IMAGE_TOO_SMALL",
                         "IMAGE_IS_FLOORPLAN",
-                        "NOT_AN_IMAGE",
                     }
+                    soft_ok_statuses = {
+                        "NOT_AN_IMAGE",
+                        "IMAGE_TOO_LARGE",
+                        "LINK_TIMED_OUT",
+                        "LINK_EXPIRED_OR_INACCESSIBLE",
+                    }
+                    status = result.get("status")
                     if (
                         not result.get("ok")
-                        and result.get("status") not in hard_reject
                         and not valid
+                        and status not in hard_reject
+                        and (
+                            status not in soft_ok_statuses
+                            or _accept_image_url_under_deadline(candidate)
+                        )
                     ):
                         result = {"ok": True, "url": candidate, "status": "VALID_SOURCE_IMAGE"}
             elif cached is not None:
@@ -1202,9 +1217,44 @@ def _finalize_high_res_images(records, batch_dir, batch_id, name, image_validato
             if status == "IMAGE_IS_FLOORPLAN" and _is_replaceable_viewer_url(str(record.get("Floor Plan") or "")):
                 record["Floor Plan"] = candidate
         if not valid:
-            record["High Res Images"] = ""
-            record["_high_res_image_count"] = 0
-            diagnostics.append(LinkDiagnostic("IMAGES_DISCOVERED_BUT_REJECTED", detail=f"0 of {len(candidates)} candidate(s) passed validation"))
+            # Prefer keeping the last known good photo over blanking the
+            # cell. Confirmed real (2026-07, Knotel Noel Street): source
+            # Directus featured URL was present pre-finalize, every
+            # candidate then failed validation (oversized JPEG), and
+            # clearing left High Res empty despite a live asset URL.
+            keep = ""
+            for candidate in [existing_image, *source_candidates, *candidates]:
+                text = str(candidate or "").strip()
+                if not text or ".html" in text.lower():
+                    continue
+                if _is_brochure_media_seed_url(text):
+                    continue
+                if _FLOORPLAN_URL_RE.search(text):
+                    continue
+                if floor_plan_url and normalize_url(text) == floor_plan_url:
+                    continue
+                if _accept_image_url_under_deadline(text):
+                    keep = text
+                    break
+            if keep:
+                record["High Res Images"] = keep
+                record["_high_res_image_count"] = 1
+                diagnostics.append(
+                    LinkDiagnostic(
+                        "DIRECT_IMAGE_ASSIGNED",
+                        final_url=keep,
+                        detail="Kept last good source/featured photo after validation rejected all candidates.",
+                    )
+                )
+            else:
+                record["High Res Images"] = ""
+                record["_high_res_image_count"] = 0
+                diagnostics.append(
+                    LinkDiagnostic(
+                        "IMAGES_DISCOVERED_BUT_REJECTED",
+                        detail=f"0 of {len(candidates)} candidate(s) passed validation",
+                    )
+                )
             continue
 
         if len(candidates) > len(valid) and len(valid) >= MAX_HIGH_RES_IMAGES:
