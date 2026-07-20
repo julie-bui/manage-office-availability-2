@@ -72,23 +72,28 @@ def test_union_detects_filename_even_without_intro_blurb():
                 ],
                 ["", "55 Goswell Road", "3rd (South)", "Fitted", "624", "2 Years", "8840", "170", "CLICK HERE"],
                 ["", "109-111 Farringdon Road", "3rd (Front)", "Fitted", "1030", "3 Years", "14162.5", "165", "CLICK HERE"],
+                ["", "33 Kingsway", "1st", "Fitted (2nd hand)", "6580", "3 Years", "84991", "155", "CLICK HERE"],
             ]
         ],
     }
     assert union.detect(content)
     records = union.parse(content)
-    assert len(records) == 2
+    assert len(records) == 3
     assert records[0]["Building"] == "55 Goswell Road"
     assert records[0]["Area"] == "Clerkenwell & Farringdon"
     assert records[0]["State of Space"] == "Fitted"
     assert records[0]["Special Features"] == ""
     assert records[1]["Building"] == "109-111 Farringdon Road"
     assert records[1]["State of Space"] == "Fitted"
+    assert records[2]["Building"] == "33 Kingsway"
+    assert records[2]["Floor/Unit"] == "1st"
+    assert records[2]["State of Space"] == "Fitted (2nd hand)"
+    assert records[2]["Special Features"] == ""
     from extraction.rules import try_rules
 
     rule, via_try = try_rules(content)
     assert rule == "UNION"
-    assert len(via_try) == 2
+    assert len(via_try) == 3
 
 
 def test_union_parses_clerkernwell_sheet_from_full_pack():

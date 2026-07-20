@@ -75,6 +75,17 @@ def test_reclassify_moves_status_tags_from_special_features_to_state_of_space():
         "Bike store",
         "Fitted",
     )
+    # Status + short parenthetical note (UNION Current Spec) stays intact in SoS.
+    assert reclassify_special_features_and_state_of_space("Fitted (2nd hand)", "") == (
+        "",
+        "Fitted (2nd hand)",
+    )
+    assert reclassify_special_features_and_state_of_space(
+        "Fully Fitted (furnished)", ""
+    ) == ("", "Fully Fitted (furnished)")
+    assert reclassify_special_features_and_state_of_space(
+        "Fitted (2nd hand); Bike store", ""
+    ) == ("Bike store", "Fitted (2nd hand)")
     # Real amenity prose mentioning bare "fitted" stays in Special Features only.
     sf, sos = reclassify_special_features_and_state_of_space(
         "Newly fitted kitchenette with bike storage", ""
@@ -93,6 +104,22 @@ def test_reclassify_moves_status_tags_from_special_features_to_state_of_space():
     sf3, sos3 = reclassify_special_features_and_state_of_space("Price drop: now £120 psf", "")
     assert sf3
     assert sos3 == ""
+
+
+def test_status_with_parenthetical_note_is_state_of_space():
+    from extraction.text_utils import _is_pure_status_phrase
+
+    assert _is_pure_status_phrase("Fitted (2nd hand)")
+    assert extract_state_of_space_status("Fitted (2nd hand)") == "Fitted (2nd hand)"
+    assert clean_state_of_space("Fitted (2nd hand)") == "Fitted (2nd hand)"
+    assert extract_state_of_space_status("Fully Fitted (2nd hand)") == (
+        "Fully Fitted (2nd hand)"
+    )
+    record = normalize_record(
+        {"Building": "33 Kingsway", "Special Features": "Fitted (2nd hand)"}
+    )
+    assert record["Special Features"] == ""
+    assert record["State of Space"] == "Fitted (2nd hand)"
 
 
 def test_normalize_record_reclassifies_union_current_spec_style_values():

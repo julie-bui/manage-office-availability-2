@@ -42,6 +42,9 @@ _STATE_OF_SPACE_STATUS_RE = re.compile(
     r"vacant\s+possession|coming\s+soon|under\s+offer"
     r")\b"
 )
+# Trailing short note after a status tag: "Fitted (2nd hand)", "Fully Fitted (furnished)".
+# Length-capped so long amenity blurbs in parentheses stay out of State of Space.
+_STATUS_PAREN_NOTE_RE = re.compile(r"\s*(\([^)]{1,40}\))\s*$")
 
 # Semicolon after a conjunction/preposition → mid-phrase PDF break.
 _CONJ_SEMI_RE = re.compile(
@@ -443,18 +446,29 @@ def _description_fallback_from_features(text):
     return " ".join(kept)
 
 
-def extract_state_of_space_status(text):
-    """Return a compact fit-out/availability status if one appears in *text*.
+def _split_status_parenthetical(text):
+    """Split a trailing short note: ``Fitted (2nd hand)`` → ``("Fitted", "(2nd hand)")``.
 
-    Normalizes common phrases to Kitt template wording when recognized.
+    Returns ``(core, note)`` with *note* empty when there is no trailing
+    parenthetical (or the cell is parentheses-only).
     """
-    text = "" if text is None else str(text).strip()
+    text = " ".join(str(text or "").split()).strip()
     if not text:
-        return ""
-    match = _STATE_OF_SPACE_STATUS_RE.search(text)
+        return "", ""
+    match = _STATUS_PAREN_NOTE_RE.search(text)
     if not match:
+        return text, ""
+    core = text[: match.start()].strip()
+    if not core:
+        return text, ""
+    return core, match.group(1).strip()
+
+
+def _canonical_status_tag(raw):
+    """Normalize a matched status phrase to Kitt template wording."""
+    raw = " ".join(str(raw or "").split()).strip()
+    if not raw:
         return ""
-    raw = " ".join(match.group(0).split())
     lower = raw.lower()
     if re.search(r"fully\s+fitted", lower):
         return "Fully Fitted"
@@ -491,6 +505,48 @@ def extract_state_of_space_status(text):
     return raw[0].upper() + raw[1:] if raw else ""
 
 
+def _is_status_core_only(core):
+    """True when *core* is only a recognized status tag (no amenity prose)."""
+    core = " ".join(str(core or "").split()).strip()
+    if not core:
+        return False
+    if _STATE_OF_SPACE_STATUS_RE.fullmatch(core):
+        return True
+    match = _STATE_OF_SPACE_STATUS_RE.search(core)
+    if not match:
+        return False
+    tag = _canonical_status_tag(match.group(0))
+    if not tag:
+        return False
+    return re.sub(r"\W+", "", core.lower()) == re.sub(r"\W+", "", tag.lower())
+
+
+def extract_state_of_space_status(text):
+    """Return a compact fit-out/availability status if one appears in *text*.
+
+    Normalizes common phrases to Kitt template wording when recognized.
+    Pure status cells with a short parenthetical note keep the full wording
+    (``Fitted (2nd hand)``) rather than stripping to bare ``Fitted``.
+    """
+    text = "" if text is None else str(text).strip()
+    if not text:
+        return ""
+    text = " ".join(text.split()).strip()
+    core, note = _split_status_parenthetical(text)
+    # Whole cell is status + short note — keep both in State of Space.
+    if note and _is_status_core_only(core):
+        tag = _canonical_status_tag(
+            _STATE_OF_SPACE_STATUS_RE.search(core).group(0)
+            if _STATE_OF_SPACE_STATUS_RE.search(core)
+            else core
+        )
+        return f"{tag} {note}" if tag else ""
+    match = _STATE_OF_SPACE_STATUS_RE.search(text)
+    if not match:
+        return ""
+    return _canonical_status_tag(match.group(0))
+
+
 def clean_state_of_space(text, *, force_amenity_list=False):
     """Clean State of Space to a Kitt status tag only — else blank.
 
@@ -518,11 +574,17 @@ def clean_state_of_space(text, *, force_amenity_list=False):
 
 
 def _is_pure_status_phrase(text):
-    """True when *text* is only a fit-out/availability status tag (no amenities)."""
+    """True when *text* is only a fit-out/availability status tag (no amenities).
+
+    Includes status + short parenthetical notes (``Fitted (2nd hand)``).
+    """
     text = " ".join(str(text or "").split()).strip()
     if not text:
         return False
     if _STATE_OF_SPACE_STATUS_RE.fullmatch(text):
+        return True
+    core, note = _split_status_parenthetical(text)
+    if note and _is_status_core_only(core):
         return True
     status = extract_state_of_space_status(text)
     if not status:
@@ -535,6 +597,7 @@ def _partition_status_and_amenities(text):
 
     Returns ``(status_tag, remainder)``:
     - Pure status (``Fitted``, ``CAT A``) → ``(tag, "")``
+    - Status + note (``Fitted (2nd hand)``) → ``("Fitted (2nd hand)", "")``
     - ``Fitted; Bike store`` → ``("Fitted", "Bike store")``
     - Description mentioning strong status → ``(tag, full_text)``
     - Amenity-only → ``("", text)``
@@ -574,10 +637,11 @@ def _partition_status_and_amenities(text):
 def reclassify_special_features_and_state_of_space(special_features, state_of_space):
     """Route short fit-out status tags to State of Space; keep amenities in SF.
 
-    UNION Current Spec values like ``Fitted`` / ``CAT A`` often land in Special
-    Features; Kitts puts those in State of Space. Longer amenity/description
-    text stays in Special Features. When a cell mixes both (``Fitted; Bike
-    store``), SoS gets the status and SF keeps the amenity remainder.
+    UNION Current Spec values like ``Fitted`` / ``CAT A`` / ``Fitted (2nd hand)``
+    often land in Special Features; Kitts puts those in State of Space. Longer
+    amenity/description text stays in Special Features. When a cell mixes both
+    (``Fitted; Bike store``), SoS gets the status and SF keeps the amenity
+    remainder.
     """
     sf_in = " ".join(str(special_features or "").split()).strip()
     sos_in = " ".join(str(state_of_space or "").split()).strip()
